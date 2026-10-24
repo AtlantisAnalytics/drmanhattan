@@ -4,10 +4,14 @@
 //! header : "WMKPACK\0" (8) | format u16 = 1 | pack_id (16)              = 26 bytes
 //! record : marker u32 = 0x574D4B52 | kind u8 | compression u8 | unit_hash (32)
 //!          | raw_len u64 | stored_len u64 | header_crc32c u32 | payload
-//! footer : count u64 | count x (unit_hash 32 | offset u64) | pack_blake3 (32) | "WMKPEND\0"
+//! footer : count u64 | count x (unit_hash 32 | offset u64) | pack_blake3 (32)
+//!          | footer_offset u64 | "WMKPEND\0" (8)
 //! ```
 //!
 //! The CRC32C covers the 50 bytes from `kind` through `stored_len`.
+//! `footer_offset` is the file offset where the footer starts and `pack_blake3`
+//! covers `[0, footer_offset)`. The footer is end-anchored so a sealed pack is
+//! recognised from its last 16 bytes, independent of any mid-file damage.
 
 use crate::compress::{self, Compression};
 use crate::error::{Error, Result};
@@ -26,6 +30,11 @@ const FILE_HEADER_LEN: u64 = 26;
 const CRC_SPAN: usize = 50;
 /// Marker + CRC span + CRC.
 const RECORD_HEADER_LEN: usize = 4 + CRC_SPAN + 4;
+/// count (8) + pack_blake3 (32) + footer_offset (8) + magic (8): footer with no entries.
+const FOOTER_FIXED_LEN: u64 = 8 + 32 + 8 + 8;
+
+/// Upper bound on a unit's raw and stored length (fastcdc's maximum chunk size).
+pub const MAX_UNIT_LEN: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -73,7 +82,9 @@ pub struct SealedPack {
 #[derive(Debug)]
 pub struct PackScan {
     pub id: Id,
-    /// (offset of the record marker, header) for each valid record, in order.
+    /// (offset of the record marker, header) for each valid record. For an
+    /// unsealed pack: the sequential prefix. For a sealed pack: every indexed
+    /// record that validates, in index order.
     pub records: Vec<(u64, RecordHeader)>,
     pub sealed: bool,
     /// End of the valid prefix: the file length if sealed, else the offset
@@ -81,12 +92,37 @@ pub struct PackScan {
     pub valid_len: u64,
     /// `Some` only when sealed: whether the stored pack hash matches.
     pub blake3_ok: Option<bool>,
+    /// Sealed packs only: offsets of records that failed validation (sorted).
+    pub damaged: Vec<u64>,
 }
 
 /// `<packs_dir>/<last 2 hex chars of id>/<id hyphenated>.pack`
 pub fn pack_path(packs_dir: &Path, id: Id) -> PathBuf {
     let s = id.to_string();
     packs_dir.join(&s[s.len() - 2..]).join(format!("{s}.pack"))
+}
+
+/// Length invariants every record must satisfy.
+fn check_sizes(
+    compression: Compression,
+    raw_len: u64,
+    stored_len: u64,
+) -> std::result::Result<(), String> {
+    if raw_len > MAX_UNIT_LEN {
+        return Err(format!("raw_len {raw_len} exceeds {MAX_UNIT_LEN}"));
+    }
+    if stored_len > MAX_UNIT_LEN {
+        return Err(format!("stored_len {stored_len} exceeds {MAX_UNIT_LEN}"));
+    }
+    match compression {
+        Compression::None if stored_len != raw_len => Err(format!(
+            "uncompressed record has stored_len {stored_len} != raw_len {raw_len}"
+        )),
+        Compression::Zstd if stored_len >= raw_len => Err(format!(
+            "zstd record has stored_len {stored_len} >= raw_len {raw_len}"
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn encode_record_header(h: &RecordHeader) -> [u8; RECORD_HEADER_LEN] {
@@ -102,28 +138,41 @@ fn encode_record_header(h: &RecordHeader) -> [u8; RECORD_HEADER_LEN] {
     b
 }
 
-/// Parse and validate a record header. `Err(reason)` on bad marker, CRC, kind or compression.
-fn decode_record_header(b: &[u8; RECORD_HEADER_LEN]) -> std::result::Result<RecordHeader, String> {
+enum HeaderError {
+    /// Bad marker, CRC or lengths: damage or a torn tail.
+    Invalid(String),
+    /// Valid CRC but a kind or compression this build does not know.
+    Unsupported(String),
+}
+
+fn decode_record_header(
+    b: &[u8; RECORD_HEADER_LEN],
+) -> std::result::Result<RecordHeader, HeaderError> {
     let marker = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
     if marker != RECORD_MARKER {
-        return Err(format!("bad record marker {marker:#010x}"));
+        return Err(HeaderError::Invalid(format!(
+            "bad record marker {marker:#010x}"
+        )));
     }
     let crc = u32::from_le_bytes([b[54], b[55], b[56], b[57]]);
     if crc != crc32c::crc32c(&b[4..4 + CRC_SPAN]) {
-        return Err("record header CRC mismatch".into());
+        return Err(HeaderError::Invalid("record header CRC mismatch".into()));
     }
-    let kind = UnitKind::from_u8(b[4]).ok_or_else(|| format!("unknown unit kind {}", b[4]))?;
-    let compression =
-        Compression::from_u8(b[5]).ok_or_else(|| format!("unknown compression {}", b[5]))?;
+    let kind = UnitKind::from_u8(b[4])
+        .ok_or_else(|| HeaderError::Unsupported(format!("unsupported unit kind {}", b[4])))?;
+    let compression = Compression::from_u8(b[5])
+        .ok_or_else(|| HeaderError::Unsupported(format!("unsupported compression {}", b[5])))?;
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&b[6..38]);
-    Ok(RecordHeader {
+    let h = RecordHeader {
         kind,
         compression,
         unit_hash: Hash32(hash),
         raw_len: u64_at(b, 38),
         stored_len: u64_at(b, 46),
-    })
+    };
+    check_sizes(h.compression, h.raw_len, h.stored_len).map_err(HeaderError::Invalid)?;
+    Ok(h)
 }
 
 fn u64_at(b: &[u8], at: usize) -> u64 {
@@ -145,6 +194,8 @@ pub struct PackWriter {
     hasher: blake3::Hasher,
     len: u64,
     entries: Vec<(Hash32, u64)>,
+    /// Set on any I/O error: file, hasher and index may then disagree.
+    failed: bool,
 }
 
 impl PackWriter {
@@ -153,6 +204,8 @@ impl PackWriter {
         let path = pack_path(packs_dir, id);
         let parent = path.parent().unwrap_or(packs_dir).to_path_buf();
         std::fs::create_dir_all(&parent).map_err(|e| Error::io(&parent, e))?;
+        // Make the fanout dir's own directory entry durable.
+        fsync_dir(packs_dir)?;
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -169,16 +222,28 @@ impl PackWriter {
             hasher: blake3::Hasher::new(),
             len: 0,
             entries: Vec::new(),
+            failed: false,
         };
         w.write_hashed(&header)?;
         fsync_dir(&parent)?;
         Ok(w)
     }
 
+    fn poisoned(&self) -> Error {
+        Error::Corrupt(format!(
+            "pack writer poisoned by earlier I/O error: {}",
+            self.path.display()
+        ))
+    }
+
     fn write_hashed(&mut self, bytes: &[u8]) -> Result<()> {
-        self.file
-            .write_all(bytes)
-            .map_err(|e| Error::io(&self.path, e))?;
+        if self.failed {
+            return Err(self.poisoned());
+        }
+        if let Err(e) = self.file.write_all(bytes) {
+            self.failed = true;
+            return Err(Error::io(&self.path, e));
+        }
         self.hasher.update(bytes);
         self.len += bytes.len() as u64;
         Ok(())
@@ -186,6 +251,9 @@ impl PackWriter {
 
     /// Append a record; returns the offset of its marker.
     pub fn append(&mut self, h: &RecordHeader, payload: &[u8]) -> Result<u64> {
+        if self.failed {
+            return Err(self.poisoned());
+        }
         if h.stored_len != payload.len() as u64 {
             return Err(Error::Corrupt(format!(
                 "stored_len {} != payload length {}",
@@ -193,6 +261,7 @@ impl PackWriter {
                 payload.len()
             )));
         }
+        check_sizes(h.compression, h.raw_len, h.stored_len).map_err(Error::Corrupt)?;
         let offset = self.len;
         self.write_hashed(&encode_record_header(h))?;
         self.write_hashed(payload)?;
@@ -200,32 +269,55 @@ impl PackWriter {
         Ok(offset)
     }
 
+    /// Bytes written so far, including the file header.
     pub fn len(&self) -> u64 {
         self.len
     }
 
+    /// True when no records have been appended.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.entries.is_empty()
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.file.sync_all().map_err(|e| Error::io(&self.path, e))
+        if self.failed {
+            return Err(self.poisoned());
+        }
+        if let Err(e) = self.file.sync_all() {
+            self.failed = true;
+            return Err(Error::io(&self.path, e));
+        }
+        Ok(())
+    }
+
+    /// Test seam: swap the file handle for a read-only one so the next write
+    /// fails with a real OS error.
+    #[doc(hidden)]
+    pub fn __break_file_for_test(&mut self) -> Result<()> {
+        self.file = File::open(&self.path).map_err(|e| Error::io(&self.path, e))?;
+        Ok(())
     }
 
     /// Write the footer, then fsync the file and its parent directory.
     pub fn seal(mut self) -> Result<SealedPack> {
+        if self.failed {
+            return Err(self.poisoned());
+        }
+        let footer_offset = self.len;
         let blake3 = Hash32(*self.hasher.finalize().as_bytes());
-        let mut footer = Vec::with_capacity(8 + 40 * self.entries.len() + 40);
+        let mut footer = Vec::with_capacity(8 + 40 * self.entries.len() + 48);
         footer.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
         for (hash, off) in &self.entries {
             footer.extend_from_slice(&hash.0);
             footer.extend_from_slice(&off.to_le_bytes());
         }
         footer.extend_from_slice(&blake3.0);
+        footer.extend_from_slice(&footer_offset.to_le_bytes());
         footer.extend_from_slice(FOOTER_MAGIC);
-        self.file
-            .write_all(&footer)
-            .map_err(|e| Error::io(&self.path, e))?;
+        if let Err(e) = self.file.write_all(&footer) {
+            self.failed = true;
+            return Err(Error::io(&self.path, e));
+        }
         self.len += footer.len() as u64;
         self.sync()?;
         if let Some(parent) = self.path.parent() {
@@ -272,20 +364,38 @@ impl PackReader {
             })
     }
 
+    /// Parse the record header at `pos`, requiring header and payload to fit
+    /// below `limit`. The outer `Err` is an I/O error or an unsupported kind or
+    /// compression; the inner `Err` is a reason the record is invalid or torn.
+    fn parse_record_at(
+        &self,
+        pos: u64,
+        limit: u64,
+    ) -> Result<std::result::Result<RecordHeader, String>> {
+        let body = pos + RECORD_HEADER_LEN as u64;
+        if body > limit {
+            return Ok(Err("truncated record header".into()));
+        }
+        let mut hb = [0u8; RECORD_HEADER_LEN];
+        self.read_exact_at(&mut hb, pos)?;
+        let h = match decode_record_header(&hb) {
+            Ok(h) => h,
+            Err(HeaderError::Invalid(why)) => return Ok(Err(why)),
+            Err(HeaderError::Unsupported(why)) => return Err(self.corrupt(pos, why)),
+        };
+        if body.checked_add(h.stored_len).is_none_or(|end| end > limit) {
+            return Ok(Err("payload extends past end of data".into()));
+        }
+        Ok(Ok(h))
+    }
+
     /// Read and validate a record header and return it with its stored payload.
     pub fn read_record(&self, offset: u64) -> Result<(RecordHeader, Vec<u8>)> {
-        let mut hb = [0u8; RECORD_HEADER_LEN];
-        self.read_exact_at(&mut hb, offset)?;
-        let h = decode_record_header(&hb).map_err(|why| self.corrupt(offset, why))?;
-        let start = offset + RECORD_HEADER_LEN as u64;
-        if start
-            .checked_add(h.stored_len)
-            .is_none_or(|end| end > self.len)
-        {
-            return Err(self.corrupt(offset, "payload extends past end of file"));
-        }
+        let h = self
+            .parse_record_at(offset, self.len)?
+            .map_err(|why| self.corrupt(offset, why))?;
         let mut payload = vec![0u8; h.stored_len as usize];
-        self.read_exact_at(&mut payload, start)?;
+        self.read_exact_at(&mut payload, offset + RECORD_HEADER_LEN as u64)?;
         Ok((h, payload))
     }
 
@@ -306,10 +416,71 @@ impl PackReader {
         }
         Ok(raw)
     }
+
+    /// BLAKE3 of file bytes `[0, end)`.
+    fn hash_prefix(&self, end: u64) -> Result<Hash32> {
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut at = 0u64;
+        while at < end {
+            let want = buf.len().min((end - at) as usize);
+            self.read_exact_at(&mut buf[..want], at)?;
+            hasher.update(&buf[..want]);
+            at += want as u64;
+        }
+        Ok(Hash32(*hasher.finalize().as_bytes()))
+    }
+
+    /// Parse records sequentially from the file header up to `limit`; returns
+    /// the records and the position where parsing stopped.
+    fn parse_sequential(&self, limit: u64) -> Result<(Vec<(u64, RecordHeader)>, u64)> {
+        let mut records = Vec::new();
+        let mut pos = FILE_HEADER_LEN;
+        while pos < limit {
+            match self.parse_record_at(pos, limit)? {
+                Ok(h) => {
+                    records.push((pos, h));
+                    pos += RECORD_HEADER_LEN as u64 + h.stored_len;
+                }
+                Err(_) => break,
+            }
+        }
+        Ok((records, pos))
+    }
+
+    /// If the file ends with a consistent end-anchored footer, return
+    /// `(footer_offset, record_count)`.
+    fn find_footer(&self) -> Result<Option<(u64, u64)>> {
+        if self.len < FILE_HEADER_LEN + FOOTER_FIXED_LEN {
+            return Ok(None);
+        }
+        let mut tail = [0u8; 16];
+        self.read_exact_at(&mut tail, self.len - 16)?;
+        if &tail[8..] != FOOTER_MAGIC {
+            return Ok(None);
+        }
+        let footer_offset = u64_at(&tail, 0);
+        if footer_offset < FILE_HEADER_LEN || footer_offset > self.len - FOOTER_FIXED_LEN {
+            return Ok(None);
+        }
+        let mut cb = [0u8; 8];
+        self.read_exact_at(&mut cb, footer_offset)?;
+        let count = u64::from_le_bytes(cb);
+        let total = count
+            .checked_mul(40)
+            .and_then(|n| n.checked_add(FOOTER_FIXED_LEN))
+            .and_then(|n| n.checked_add(footer_offset));
+        if total != Some(self.len) {
+            return Ok(None);
+        }
+        Ok(Some((footer_offset, count)))
+    }
 }
 
-/// Scan a pack from the start, stopping at the first record that cannot be parsed,
-/// then check whether what remains is a valid footer.
+/// Scan a pack. A pack ending in a consistent end-anchored footer is sealed:
+/// each indexed record is validated individually and damage is reported in
+/// `damaged`. Otherwise it is unsealed and parsing stops at the first torn or
+/// invalid record. Unsupported kinds/compressions and I/O errors are errors.
 pub fn scan(path: &Path) -> Result<PackScan> {
     let r = PackReader::open(path)?;
     let bad = |why: &str| Error::Corrupt(format!("pack {}: {why}", path.display()));
@@ -329,88 +500,53 @@ pub fn scan(path: &Path) -> Result<PackScan> {
     idb.copy_from_slice(&fh[10..26]);
     let id = Id::from_bytes(idb);
 
-    let mut records = Vec::new();
-    let mut pos = FILE_HEADER_LEN;
-    loop {
-        let mut hb = [0u8; RECORD_HEADER_LEN];
-        if pos + RECORD_HEADER_LEN as u64 > r.len || r.file.read_exact_at(&mut hb, pos).is_err() {
-            break;
-        }
-        let Ok(h) = decode_record_header(&hb) else {
-            break;
-        };
-        let end = pos + RECORD_HEADER_LEN as u64;
-        match end.checked_add(h.stored_len) {
-            Some(next) if next <= r.len => {
-                records.push((pos, h));
-                pos = next;
-            }
-            _ => break,
-        }
-    }
-
-    let unsealed = |valid_len| PackScan {
-        id,
-        records: Vec::new(),
-        sealed: false,
-        valid_len,
-        blake3_ok: None,
-    };
-    let Some(blake3_ok) = check_footer(&r, pos, &records)? else {
+    let Some((footer_offset, count)) = r.find_footer()? else {
+        let (records, pos) = r.parse_sequential(r.len)?;
         return Ok(PackScan {
+            id,
             records,
-            ..unsealed(pos)
+            sealed: false,
+            valid_len: pos,
+            blake3_ok: None,
+            damaged: Vec::new(),
         });
     };
+
+    let mut index = vec![0u8; (r.len - footer_offset) as usize];
+    r.read_exact_at(&mut index, footer_offset)?;
+    let mut records = Vec::new();
+    let mut damaged = Vec::new();
+    for i in 0..count as usize {
+        let e = &index[8 + 40 * i..8 + 40 * (i + 1)];
+        let off = u64_at(e, 32);
+        let valid = if off < FILE_HEADER_LEN || off >= footer_offset {
+            None
+        } else {
+            r.parse_record_at(off, footer_offset)?
+                .ok()
+                .filter(|h| h.unit_hash.0[..] == e[..32])
+        };
+        match valid {
+            Some(h) => records.push((off, h)),
+            None => damaged.push(off),
+        }
+    }
+    let (_, stop) = r.parse_sequential(footer_offset)?;
+    if stop != footer_offset {
+        damaged.push(stop);
+    }
+    damaged.sort_unstable();
+    damaged.dedup();
+
+    let at = 8 + 40 * count as usize;
+    let stored = &index[at..at + 32];
+    let blake3_ok = r.hash_prefix(footer_offset)?.0[..] == *stored;
     Ok(PackScan {
         id,
         records,
         sealed: true,
         valid_len: r.len,
         blake3_ok: Some(blake3_ok),
+        damaged,
     })
-}
-
-/// If a valid footer starts at `pos`, return whether the pack hash matches.
-fn check_footer(r: &PackReader, pos: u64, records: &[(u64, RecordHeader)]) -> Result<Option<bool>> {
-    let remaining = r.len - pos;
-    if remaining < 8 + 32 + 8 {
-        return Ok(None);
-    }
-    let mut cb = [0u8; 8];
-    r.read_exact_at(&mut cb, pos)?;
-    let count = u64::from_le_bytes(cb);
-    if count != records.len() as u64 {
-        return Ok(None);
-    }
-    let expected = 40u64
-        .checked_mul(count)
-        .and_then(|n| n.checked_add(8 + 32 + 8));
-    if expected != Some(remaining) {
-        return Ok(None);
-    }
-    let mut footer = vec![0u8; remaining as usize];
-    r.read_exact_at(&mut footer, pos)?;
-    let n = records.len();
-    if &footer[footer.len() - 8..] != FOOTER_MAGIC {
-        return Ok(None);
-    }
-    for (i, (off, h)) in records.iter().enumerate() {
-        let e = &footer[8 + 40 * i..8 + 40 * (i + 1)];
-        if e[..32] != h.unit_hash.0 || u64_at(e, 32) != *off {
-            return Ok(None);
-        }
-    }
-    let stored = &footer[8 + 40 * n..8 + 40 * n + 32];
-
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut at = 0u64;
-    while at < pos {
-        let want = buf.len().min((pos - at) as usize);
-        r.read_exact_at(&mut buf[..want], at)?;
-        hasher.update(&buf[..want]);
-        at += want as u64;
-    }
-    Ok(Some(hasher.finalize().as_bytes() == stored))
 }

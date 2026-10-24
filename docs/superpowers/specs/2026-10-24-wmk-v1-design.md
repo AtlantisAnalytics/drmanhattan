@@ -250,12 +250,14 @@ record : marker u32 = 0x574D4B52 ("WMKR") | kind u8 | compression u8
          | unit_hash (32) | raw_len u64 | stored_len u64
          | header_crc32c u32 (over the preceding header fields) | payload (stored_len)
 footer : (only on seal) record count u64 | [unit_hash, offset u64]* | pack_blake3 (32)
-         | "WMKPEND\0" (8)
+         | footer_offset u64 | "WMKPEND\0" (8)
 ```
 
 - Every record is self-describing, so the catalog can be rebuilt by scanning packs (`recover`).
 - `header_crc32c` lets the scanner detect a torn tail on an unsealed pack and truncate it.
-- `pack_blake3` covers every byte before the footer.
+- `pack_blake3` covers every byte before the footer, i.e. file offsets `[0, footer_offset)`.
+- The footer is end-anchored: `footer_offset` is the file offset where the footer starts. A scanner that finds the trailing magic and a consistent `footer_offset` treats the pack as sealed and validates each indexed record individually, so mid-file corruption in a sealed pack is reported as damage rather than mistaken for a torn tail. A pack without a valid end-anchored footer is unsealed, and its scan stops at the first record that is too short or has a bad marker or CRC.
+- Record sizes are bounded: `raw_len` and `stored_len` are at most 16 MiB; `none` requires `stored_len == raw_len`, and `zstd` requires `stored_len < raw_len`.
 - Unit integrity is checked by recomputing BLAKE3 over the decompressed payload and comparing it with `unit_hash`.
 
 ### 6.3 Snapshot record unit

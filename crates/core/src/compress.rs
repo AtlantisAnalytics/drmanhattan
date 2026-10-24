@@ -46,8 +46,9 @@ pub fn decode(c: Compression, stored: &[u8], raw_len: u64) -> Result<Vec<u8>> {
     let out = match c {
         Compression::None => stored.to_vec(),
         Compression::Zstd => {
-            // Cap output at raw_len + 1 so a bad length cannot blow up memory
-            // but an over-long stream is still detected.
+            // Callers must bound raw_len first (pack::MAX_UNIT_LEN); this cap of
+            // raw_len + 1 only lets an over-long stream be detected, it does
+            // not protect against an unbounded raw_len.
             let cap = usize::try_from(raw_len)
                 .map_err(|_| Error::Corrupt("raw_len too large".into()))?
                 .saturating_add(1);
