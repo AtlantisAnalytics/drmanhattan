@@ -28,6 +28,11 @@ mod tests {
     use super::display_bytes;
 
     #[test]
+    fn display_bytes_escapes() {
+        assert_eq!(display_bytes(b"a\xffb"), "a\\xffb");
+    }
+
+    #[test]
     fn invalid_bytes_are_escaped() {
         assert_eq!(display_bytes(b"a/\xffb\xc3\xa9"), "a/\\xffb\u{e9}");
     }

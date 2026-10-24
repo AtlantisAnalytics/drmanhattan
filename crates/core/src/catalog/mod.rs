@@ -140,6 +140,22 @@ fn unit_from_row(r: &Row<'_>) -> Result<UnitRow> {
     })
 }
 
+/// Repository-wide totals, as reported by `wmk stats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RepoStats {
+    pub snapshots: u64,
+    pub entries: u64,
+    pub contents: u64,
+    pub units: u64,
+    pub packs: u64,
+    /// Sum of file sizes over every readable (ok/unstable) file entry in all snapshots.
+    pub logical_bytes: u64,
+    /// Sum of `content.size`.
+    pub unique_bytes: u64,
+    /// Sum of `unit.stored_size`.
+    pub stored_bytes: u64,
+}
+
 pub struct Catalog {
     pub(crate) conn: Connection,
 }
@@ -383,6 +399,25 @@ impl Catalog {
             [h],
             entry_from_row,
         )
+    }
+
+    /// Repository totals; one aggregate query per field.
+    pub fn stats(&self) -> Result<RepoStats> {
+        let n = |sql: &str| -> Result<u64> {
+            let v: i64 = self.conn.query_row(sql, [], |r| r.get(0))?;
+            u64::try_from(v).map_err(|_| Error::Corrupt(format!("negative total from {sql}")))
+        };
+        Ok(RepoStats {
+            snapshots: n("SELECT count(*) FROM snapshot")?,
+            entries: n("SELECT count(*) FROM entry")?,
+            contents: n("SELECT count(*) FROM content")?,
+            units: n("SELECT count(*) FROM unit")?,
+            packs: n("SELECT count(*) FROM pack")?,
+            logical_bytes: n("SELECT coalesce(sum(size), 0) FROM entry \
+                 WHERE kind = 'file' AND status IN ('ok', 'unstable')")?,
+            unique_bytes: n("SELECT coalesce(sum(size), 0) FROM content")?,
+            stored_bytes: n("SELECT coalesce(sum(stored_size), 0) FROM unit")?,
+        })
     }
 
     pub fn xattrs(&self, entry: Id) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {

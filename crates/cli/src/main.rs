@@ -35,6 +35,22 @@ pub enum Command {
     Verify(cmd::verify::VerifyArgs),
     /// Show path-level differences between a snapshot and a live directory
     Diff(cmd::diff::DiffArgs),
+    /// List snapshots
+    Ls(cmd::ls::LsArgs),
+    /// Browse a snapshot's tree
+    Show(cmd::show::ShowArgs),
+    /// Repository totals and dedup ratios
+    Stats(cmd::stats::StatsArgs),
+    /// Look up an entry id: snapshot, path and content
+    Resolve(cmd::resolve::ResolveArgs),
+    /// Find every entry with a given content hash
+    Find(cmd::find::FindArgs),
+    /// Stream file bytes to stdout
+    ///
+    /// Bytes are verified against the content hash as they stream. A mismatch
+    /// can only be detected after the bytes were written, and written bytes
+    /// cannot be recalled: if the exit code is nonzero, discard the output.
+    Cat(cmd::cat::CatArgs),
 }
 
 /// `verify` found problems (exit code 2).
@@ -80,6 +96,12 @@ fn main() {
         Command::Restore(args) => cmd::restore::run(&cli, args),
         Command::Verify(args) => cmd::verify::run(&cli, args),
         Command::Diff(args) => cmd::diff::run(&cli, args),
+        Command::Ls(args) => cmd::ls::run(&cli, args).map(|()| 0),
+        Command::Show(args) => cmd::show::run(&cli, args).map(|()| 0),
+        Command::Stats(args) => cmd::stats::run(&cli, args).map(|()| 0),
+        Command::Resolve(args) => cmd::resolve::run(&cli, args).map(|()| 0),
+        Command::Find(args) => cmd::find::run(&cli, args).map(|()| 0),
+        Command::Cat(args) => cmd::cat::run(&cli, args).map(|()| 0),
     };
     match result {
         Ok(0) => {}

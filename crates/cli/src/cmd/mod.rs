@@ -1,8 +1,14 @@
+pub mod cat;
 pub mod diff;
+pub mod find;
 pub mod ingest;
 pub mod init;
+pub mod ls;
 pub mod manifest;
+pub mod resolve;
 pub mod restore;
+pub mod show;
+pub mod stats;
 pub mod verify;
 
 use crate::Cli;
