@@ -112,6 +112,7 @@ fn seal_footer_and_hash() {
     assert_eq!(s.records.len(), 3);
     assert_eq!(s.blake3_ok, Some(true));
     assert!(s.damaged.is_empty());
+    assert!(s.index_ok);
     let len = std::fs::metadata(&p).unwrap().len();
     assert_eq!(s.valid_len, len);
     assert_eq!(sealed.size, len);
@@ -160,6 +161,7 @@ fn sealed_flipped_header_reports_damage() {
     let offs: Vec<u64> = s.records.iter().map(|(o, _)| *o).collect();
     assert_eq!(offs, vec![recs[0].0, recs[2].0]);
     assert_eq!(s.blake3_ok, Some(false));
+    assert!(!s.index_ok);
     assert_eq!(s.valid_len, std::fs::metadata(&p).unwrap().len());
     let r = PackReader::open(&p).unwrap();
     let e = r.read_record(recs[1].0).unwrap_err();
@@ -228,7 +230,7 @@ fn torn_footer_is_unsealed() {
 }
 
 #[test]
-fn footer_entry_mismatch_is_damage() {
+fn index_hash_corruption_keeps_records() {
     let t = tempfile::tempdir().unwrap();
     let id = Id::new_v7();
     let mut w = PackWriter::create(t.path(), id).unwrap();
@@ -238,13 +240,62 @@ fn footer_entry_mismatch_is_damage() {
     let sealed = w.seal().unwrap();
     let footer_offset = (sealed.size - (8 + 40 * 3 + 32 + 8 + 8)) as usize;
     let p = pack_path(t.path(), id);
-    // Corrupt the hash of index entry 1.
+    // Corrupt the hash of index entry 1. Every record byte is intact
+    // (blake3_ok), so all three records must still be reported.
     flip(&p, footer_offset + 8 + 40);
     let s = scan(&p).unwrap();
     assert!(s.sealed);
-    assert_eq!(s.records.len(), 2);
-    assert_eq!(s.damaged.len(), 1);
+    assert_eq!(s.records.len(), 3);
+    assert!(s.damaged.is_empty());
+    assert!(!s.index_ok);
     assert_eq!(s.blake3_ok, Some(true));
+}
+
+#[test]
+fn record_missing_from_index_is_still_reported() {
+    let t = tempfile::tempdir().unwrap();
+    let (id, recs) = write_three(t.path(), false);
+    let p = pack_path(t.path(), id);
+    // Hand-seal: footer indexes only records 0 and 2.
+    let mut bytes = std::fs::read(&p).unwrap();
+    let footer_offset = bytes.len() as u64;
+    let blake3 = Hash32::of(&bytes);
+    bytes.extend_from_slice(&2u64.to_le_bytes());
+    for i in [0usize, 2] {
+        bytes.extend_from_slice(&recs[i].1 .0);
+        bytes.extend_from_slice(&recs[i].0.to_le_bytes());
+    }
+    bytes.extend_from_slice(&blake3.0);
+    bytes.extend_from_slice(&footer_offset.to_le_bytes());
+    bytes.extend_from_slice(b"WMKPEND\0");
+    std::fs::write(&p, &bytes).unwrap();
+    let s = scan(&p).unwrap();
+    assert!(s.sealed);
+    let offs: Vec<u64> = s.records.iter().map(|(o, _)| *o).collect();
+    assert_eq!(offs, recs.iter().map(|r| r.0).collect::<Vec<_>>());
+    assert!(s.damaged.is_empty());
+    assert!(!s.index_ok);
+    assert_eq!(s.blake3_ok, Some(true));
+}
+
+#[test]
+fn absurd_footer_count_is_not_sealed() {
+    let t = tempfile::tempdir().unwrap();
+    let id = Id::new_v7();
+    let mut w = PackWriter::create(t.path(), id).unwrap();
+    for u in units() {
+        append_unit(&mut w, &u, false);
+    }
+    let sealed = w.seal().unwrap();
+    let footer_offset = (sealed.size - (8 + 40 * 3 + 32 + 8 + 8)) as usize;
+    let p = pack_path(t.path(), id);
+    let mut bytes = std::fs::read(&p).unwrap();
+    bytes[footer_offset..footer_offset + 8].copy_from_slice(&(1u64 << 56).to_le_bytes());
+    std::fs::write(&p, &bytes).unwrap();
+    let s = scan(&p).unwrap();
+    assert!(!s.sealed);
+    assert_eq!(s.records.len(), 3);
+    assert_eq!(s.valid_len, footer_offset as u64);
 }
 
 #[test]

@@ -82,9 +82,10 @@ pub struct SealedPack {
 #[derive(Debug)]
 pub struct PackScan {
     pub id: Id,
-    /// (offset of the record marker, header) for each valid record. For an
-    /// unsealed pack: the sequential prefix. For a sealed pack: every indexed
-    /// record that validates, in index order.
+    /// (offset of the record marker, header) for each valid record, sorted by
+    /// offset. Unsealed: the sequential prefix. Sealed: the union of the
+    /// records the sequential parse validated and the index entries whose
+    /// record validates on its own.
     pub records: Vec<(u64, RecordHeader)>,
     pub sealed: bool,
     /// End of the valid prefix: the file length if sealed, else the offset
@@ -92,8 +93,14 @@ pub struct PackScan {
     pub valid_len: u64,
     /// `Some` only when sealed: whether the stored pack hash matches.
     pub blake3_ok: Option<bool>,
-    /// Sealed packs only: offsets of records that failed validation (sorted).
+    /// Sealed packs only: sorted offsets where something claims a record but
+    /// no valid record exists (failing index entries, and the sequential stop
+    /// position if it is before the footer).
     pub damaged: Vec<u64>,
+    /// True iff the pack is sealed, the footer index lists exactly the
+    /// sequentially parsed records (same hashes and offsets), and that parse
+    /// reached the footer. Always false for unsealed packs.
+    pub index_ok: bool,
 }
 
 /// `<packs_dir>/<last 2 hex chars of id>/<id hyphenated>.pack`
@@ -292,6 +299,7 @@ impl PackWriter {
 
     /// Test seam: swap the file handle for a read-only one so the next write
     /// fails with a real OS error.
+    #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn __break_file_for_test(&mut self) -> Result<()> {
         self.file = File::open(&self.path).map_err(|e| Error::io(&self.path, e))?;
@@ -466,6 +474,11 @@ impl PackReader {
         let mut cb = [0u8; 8];
         self.read_exact_at(&mut cb, footer_offset)?;
         let count = u64::from_le_bytes(cb);
+        // Every record takes at least a header, so this bounds the index size
+        // (and the allocation for it) by the file's own size.
+        if count > (footer_offset - FILE_HEADER_LEN) / RECORD_HEADER_LEN as u64 {
+            return Ok(None);
+        }
         let total = count
             .checked_mul(40)
             .and_then(|n| n.checked_add(FOOTER_FIXED_LEN))
@@ -509,34 +522,45 @@ pub fn scan(path: &Path) -> Result<PackScan> {
             valid_len: pos,
             blake3_ok: None,
             damaged: Vec::new(),
+            index_ok: false,
         });
     };
 
     let mut index = vec![0u8; (r.len - footer_offset) as usize];
     r.read_exact_at(&mut index, footer_offset)?;
-    let mut records = Vec::new();
+    let (sequential, stop) = r.parse_sequential(footer_offset)?;
+    let mut records = sequential.clone();
     let mut damaged = Vec::new();
+    let mut index_pairs = Vec::with_capacity(count as usize);
     for i in 0..count as usize {
         let e = &index[8 + 40 * i..8 + 40 * (i + 1)];
         let off = u64_at(e, 32);
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&e[..32]);
+        index_pairs.push((Hash32(hash), off));
         let valid = if off < FILE_HEADER_LEN || off >= footer_offset {
             None
         } else {
-            r.parse_record_at(off, footer_offset)?
-                .ok()
-                .filter(|h| h.unit_hash.0[..] == e[..32])
+            r.parse_record_at(off, footer_offset)?.ok()
         };
         match valid {
             Some(h) => records.push((off, h)),
             None => damaged.push(off),
         }
     }
-    let (_, stop) = r.parse_sequential(footer_offset)?;
     if stop != footer_offset {
         damaged.push(stop);
     }
+    records.sort_unstable_by_key(|(off, _)| *off);
+    records.dedup_by_key(|(off, _)| *off);
     damaged.sort_unstable();
     damaged.dedup();
+    let index_ok = stop == footer_offset
+        && index_pairs.len() == sequential.len()
+        && index_pairs
+            .iter()
+            .zip(&sequential)
+            .all(|((hash, off), (soff, h))| off == soff && *hash == h.unit_hash);
 
     let at = 8 + 40 * count as usize;
     let stored = &index[at..at + 32];
@@ -548,5 +572,6 @@ pub fn scan(path: &Path) -> Result<PackScan> {
         valid_len: r.len,
         blake3_ok: Some(blake3_ok),
         damaged,
+        index_ok,
     })
 }
