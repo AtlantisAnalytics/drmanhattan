@@ -18,6 +18,14 @@ impl Compression {
         }
     }
 
+    pub fn parse(s: &str) -> Option<Compression> {
+        match s {
+            "none" => Some(Compression::None),
+            "zstd" => Some(Compression::Zstd),
+            _ => None,
+        }
+    }
+
     pub fn from_u8(v: u8) -> Option<Compression> {
         match v {
             0 => Some(Compression::None),

@@ -53,6 +53,15 @@ impl UnitKind {
         }
     }
 
+    pub fn parse(s: &str) -> Option<UnitKind> {
+        match s {
+            "raw_chunk" => Some(UnitKind::RawChunk),
+            "snapshot_record" => Some(UnitKind::SnapshotRecord),
+            "purge_record" => Some(UnitKind::PurgeRecord),
+            _ => None,
+        }
+    }
+
     pub fn from_u8(v: u8) -> Option<UnitKind> {
         match v {
             0 => Some(UnitKind::RawChunk),

@@ -33,7 +33,8 @@ pub enum CatalogOp {
 pub struct CatalogStats {
     /// Data ops applied (every op except `Commit`).
     pub ops: u64,
-    /// Transactions committed.
+    /// Transactions committed. Only non-empty transactions count: a `Commit`
+    /// with no pending ops does nothing.
     pub commits: u64,
 }
 

@@ -56,31 +56,6 @@ fn bad(what: &str, v: &str) -> Error {
     Error::Corrupt(format!("catalog has unknown {what} {v:?}"))
 }
 
-fn compression_parse(s: &str) -> Option<Compression> {
-    match s {
-        "none" => Some(Compression::None),
-        "zstd" => Some(Compression::Zstd),
-        _ => None,
-    }
-}
-
-fn unit_kind_parse(s: &str) -> Option<UnitKind> {
-    match s {
-        "raw_chunk" => Some(UnitKind::RawChunk),
-        "snapshot_record" => Some(UnitKind::SnapshotRecord),
-        "purge_record" => Some(UnitKind::PurgeRecord),
-        _ => None,
-    }
-}
-
-fn profile_parse(s: &str) -> Option<ProfileKind> {
-    match s {
-        "text" => Some(ProfileKind::Text),
-        "binary" => Some(ProfileKind::Binary),
-        _ => None,
-    }
-}
-
 const SNAPSHOT_COLS: &str = "id, status, source_root, host, tool_version, started_at, \
     completed_at, note, manifest_hash, ext_manifest_hash, source_manifest_hash, record_unit, \
     entry_count, file_bytes, screened_out, label_pattern";
@@ -145,7 +120,7 @@ fn content_from_row(r: &Row<'_>) -> Result<ContentRow> {
         hash: r.get(0)?,
         size: r.get(1)?,
         format,
-        profile: profile_parse(&profile).ok_or_else(|| bad("content profile", &profile))?,
+        profile: ProfileKind::parse(&profile).ok_or_else(|| bad("content profile", &profile))?,
         unit_count: r.get(4)?,
     })
 }
@@ -155,10 +130,10 @@ fn unit_from_row(r: &Row<'_>) -> Result<UnitRow> {
     let compression: String = r.get(4)?;
     Ok(UnitRow {
         hash: r.get(0)?,
-        kind: unit_kind_parse(&kind).ok_or_else(|| bad("unit kind", &kind))?,
+        kind: UnitKind::parse(&kind).ok_or_else(|| bad("unit kind", &kind))?,
         raw_size: r.get(2)?,
         stored_size: r.get(3)?,
-        compression: compression_parse(&compression)
+        compression: Compression::parse(&compression)
             .ok_or_else(|| bad("unit compression", &compression))?,
         pack_id: r.get(5)?,
         pack_offset: r.get(6)?,

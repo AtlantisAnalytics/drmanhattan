@@ -68,6 +68,116 @@ fn setup() -> (tempfile::TempDir, std::path::PathBuf) {
     (tmp, path)
 }
 
+/// True when another connection cannot take the write lock right now.
+fn writer_holds_lock(path: &std::path::Path) -> bool {
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.busy_timeout(std::time::Duration::ZERO).unwrap();
+    match c.execute_batch("BEGIN IMMEDIATE") {
+        Ok(()) => {
+            c.execute_batch("ROLLBACK").unwrap();
+            false
+        }
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            true
+        }
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}
+
+fn wait_until(mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition not reached within 5s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn enum_strings_round_trip() {
+    for c in [Compression::None, Compression::Zstd] {
+        assert_eq!(Compression::parse(c.as_str()), Some(c));
+    }
+    for k in [
+        UnitKind::RawChunk,
+        UnitKind::SnapshotRecord,
+        UnitKind::PurgeRecord,
+    ] {
+        assert_eq!(UnitKind::parse(k.as_str()), Some(k));
+    }
+    for p in [ProfileKind::Text, ProfileKind::Binary] {
+        assert_eq!(ProfileKind::parse(p.as_str()), Some(p));
+    }
+    for (k, n) in [
+        (EntryKind::Dir, 0),
+        (EntryKind::File, 1),
+        (EntryKind::Symlink, 2),
+    ] {
+        assert_eq!(EntryKind::parse(k.as_str()), Some(k));
+        assert_eq!(k.as_u8(), n);
+    }
+    for s in [
+        EntryStatus::Ok,
+        EntryStatus::Unstable,
+        EntryStatus::ScreenedOut,
+        EntryStatus::ScreenError,
+        EntryStatus::Purged,
+    ] {
+        assert_eq!(EntryStatus::parse(s.as_str()), Some(s));
+    }
+    for s in [
+        SnapshotStatus::InProgress,
+        SnapshotStatus::Complete,
+        SnapshotStatus::Failed,
+    ] {
+        assert_eq!(SnapshotStatus::parse(s.as_str()), Some(s));
+    }
+    assert_eq!(Compression::parse("lz4"), None);
+    assert_eq!(UnitKind::parse(""), None);
+    assert_eq!(ProfileKind::parse("Text"), None);
+}
+
+#[test]
+fn open_readonly_missing_path_errors_without_creating() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("nope.sqlite");
+    assert!(Catalog::open_readonly(&path).is_err());
+    assert!(!path.exists());
+}
+
+#[test]
+fn open_rejects_unversioned_db_with_tables() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("c.sqlite");
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch("CREATE TABLE stray(x)").unwrap();
+    }
+    assert!(matches!(Catalog::open(&path), Err(Error::Corrupt(_))));
+}
+
+#[test]
+fn resolve_snapshot_rejects_bad_input() {
+    let (_t, path) = setup();
+    let cat = Catalog::open_readonly(&path).unwrap();
+    assert!(matches!(
+        cat.resolve_snapshot("zzzzzzzz"),
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        cat.resolve_snapshot(&"a".repeat(33)),
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        cat.resolve_snapshot("latest"),
+        Err(Error::NotFound(_))
+    ));
+}
+
 #[test]
 fn schema_has_all_tables() {
     let (_t, path) = setup();
@@ -163,21 +273,15 @@ fn writer_commits_only_on_commit() {
     tx.send(CatalogOp::Commit).unwrap();
     tx.send(CatalogOp::InsertEntry(entry(sid, None, b"", b"")))
         .unwrap();
-    // Wait until the writer has consumed the entry op: a later Commit-free
-    // round trip is unavailable, so poll the writer's progress via a lock-free
-    // check that the snapshot (committed) is visible, then give it time.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // The writer holds SQLite's write lock exactly while a transaction is
+    // open, so wait until a competing BEGIN IMMEDIATE is refused. That proves
+    // the writer applied the entry op without committing it.
+    wait_until(|| writer_holds_lock(&path));
     assert_eq!(count(&path), 0);
     tx.send(CatalogOp::Commit).unwrap();
-    let mut seen = 0;
-    for _ in 0..100 {
-        seen = count(&path);
-        if seen == 1 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert_eq!(seen, 1);
+    // Once the lock is free again the transaction has been committed.
+    wait_until(|| !writer_holds_lock(&path));
+    assert_eq!(count(&path), 1);
     drop(tx);
     assert_eq!(h.join().unwrap().unwrap().commits, 2);
 }
@@ -324,6 +428,9 @@ fn content_units_in_seq_order() {
         .map(|r| r.hash)
         .collect();
     assert_eq!(got, u);
+    let p = cat.pack(pack).unwrap();
+    assert_eq!((p.size, p.sealed, p.blake3), (1, false, None));
+    assert!(matches!(cat.pack(Id::new_v7()), Err(Error::NotFound(_))));
     assert_eq!(cat.content(&ch).unwrap(), crow);
     assert!(cat.has_content(&ch).unwrap());
     assert!(!cat.has_content(&Hash32::of(b"nope")).unwrap());

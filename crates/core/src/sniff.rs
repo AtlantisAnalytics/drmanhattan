@@ -145,6 +145,14 @@ impl ProfileKind {
             ProfileKind::Binary => "binary",
         }
     }
+
+    pub fn parse(s: &str) -> Option<ProfileKind> {
+        match s {
+            "text" => Some(ProfileKind::Text),
+            "binary" => Some(ProfileKind::Binary),
+            _ => None,
+        }
+    }
 }
 
 pub fn profile_kind(f: Format, size: u64) -> ProfileKind {
