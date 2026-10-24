@@ -167,7 +167,7 @@ impl ManifestHasher {
     }
 }
 
-fn hash_file(path: &Path) -> Result<Hash32> {
+pub(crate) fn hash_file(path: &Path) -> Result<Hash32> {
     let f = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)

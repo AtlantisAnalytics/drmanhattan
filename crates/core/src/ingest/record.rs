@@ -745,6 +745,20 @@ fn parse_document(r: &mut impl BufRead) -> Result<SnapshotRecord> {
     })
 }
 
+/// The chunk unit hashes named by the index of the `snapshot_record` unit
+/// `unit`, in document order. Reads only the small index unit.
+pub fn record_chunks(reader: &UnitReader, cat: &Catalog, unit: &Hash32) -> Result<Vec<Hash32>> {
+    let row = cat.unit(unit)?;
+    if row.kind != UnitKind::SnapshotRecord {
+        return Err(corrupt(format!(
+            "unit {unit} is a {} unit",
+            row.kind.as_str()
+        )));
+    }
+    let index: RecordIndex = from_cbor(&reader.read_unit(&row)?[..])?;
+    Ok(index.chunks.into_iter().map(|c| c.0).collect())
+}
+
 /// Read back the snapshot record whose `snapshot_record` unit is `unit`,
 /// verifying every chunk, the document's BLAKE3 and size, and that the
 /// document describes the snapshot the index names.
