@@ -165,7 +165,7 @@ entry(
 content(
   hash BLOB PRIMARY KEY,          -- BLAKE3-256 of the whole file
   size INTEGER NOT NULL,
-  format TEXT,                    -- sniffed: jpeg, png, webp, gif, html, css, js, json, ...
+  format TEXT,                    -- sniffed; closed vocabulary, see below
   profile TEXT NOT NULL,          -- text | binary
   unit_count INTEGER NOT NULL
 )
@@ -238,6 +238,8 @@ purge_log(
 )
 ```
 
+`content.format` is a closed vocabulary. Its only values are `jpeg`, `png`, `webp`, `gif`, `avif`, `heic`, `mp4`, `webm`, `zip`, `gzip`, `bzip2`, `xz`, `zstd`, `seven_z`, `html`, `css`, `js`, `json`, `xml`, `svg`, `txt`, `csv`, `md` and `other`, or NULL. Adding a format is a format change: it requires bumping both the repository's `format_version` (catalog and `wmk.toml`) and the snapshot record `version` (§6.3). The other enum columns are closed too, with the values listed in their comments.
+
 Indexes: `entry(snapshot_id, parent_id)`, `entry(content_hash)`, `content_unit(unit_hash)`, `unit(pack_id, pack_offset)`, `label(scheme, value)`, `media(phash)`.
 
 Identity is kept separate from content. The same image at 40 paths has 40 entries (40 UUIDs), 1 `content` row, and its units stored once.
@@ -267,24 +269,46 @@ footer : (only on seal) record count u64 | [unit_hash, offset u64]* | pack_blake
 
 When an ingest finishes, wmk writes a document (the snapshot record) after every other row of the snapshot is committed. The document is a CBOR sequence (RFC 8742): a concatenation of CBOR items with no framing. It is streamed, so it never has to sit in memory.
 
-Each item is a CBOR map with a text field `t` naming its kind, plus the fields below. Field names are text keys. Ids (16 bytes), hashes (32 bytes), and raw-byte fields (`bin`) are CBOR byte strings. `int` is a CBOR integer, `text` is a CBOR text string, and `?` marks a field that may be CBOR null. Enum fields hold the catalog's strings from §6.1.
+Each item is a CBOR map with a text field `t` naming its kind, plus the fields below. Field names are text keys. Ids (16 bytes), hashes (32 bytes) and raw-byte fields (`bin`) are CBOR byte strings. `text` is a CBOR text string. `?` marks an optional field, whose value may be CBOR null. Integers are CBOR integers that must fit the stated width:
+- `u32`: `version`, `mode`.
+- `u64`: the index's `document_size`.
+- `i64`: every other integer, matching the INTEGER columns of §6.1. These are the times, sizes, counts, `hardlink_group`, `screened_out`, and the screen hit `id`.
 
 Items appear in this order. Within a section, items may appear in any order.
 
 | # | `t` | Count | Fields |
 |---|---|---|---|
-| 1 | `header` | exactly 1 | `version` int (= 1), `snapshot` map: the snapshot row, with every §6.1 column as a field (`id` id, `status` text, `source_root` bin, `host` text, `tool_version` text, `started_at` int, `completed_at` int?, `note` text?, `manifest_hash` hash?, `ext_manifest_hash` hash?, `source_manifest_hash` hash?, `record_unit` hash?, `entry_count` int?, `file_bytes` int?, `screened_out` int, `label_pattern` text?) |
-| 2 | `entry` | one per entry | every §6.1 `entry` column: `id` id, `snapshot_id` id, `parent_id` id?, `name` bin, `path` bin, `kind` text, `mode` int, `mtime_ns` int, `size` int?, `content_hash` hash?, `link_target` bin?, `hardlink_group` int?, `status` text |
-| 3 | `content` | one per distinct content the snapshot references | `hash` hash, `size` int, `format` text?, `profile` text, `unit_count` int, `units` array of hashes in `seq` order (`unit_count` must equal its length) |
+| 1 | `header` | exactly 1 | `version` u32 (= 1), `snapshot` map: the snapshot row, with every §6.1 column as a field (`id` id, `status` text, `source_root` bin, `host` text, `tool_version` text, `started_at` i64, `completed_at` i64?, `note` text?, `manifest_hash` hash?, `ext_manifest_hash` hash?, `source_manifest_hash` hash?, `record_unit` hash?, `entry_count` i64?, `file_bytes` i64?, `screened_out` i64, `label_pattern` text?) |
+| 2 | `entry` | one per entry | every §6.1 `entry` column: `id` id, `snapshot_id` id, `parent_id` id?, `name` bin, `path` bin, `kind` text, `mode` u32, `mtime_ns` i64, `size` i64?, `content_hash` hash?, `link_target` bin?, `hardlink_group` i64?, `status` text |
+| 3 | `content` | one per distinct content the snapshot references | `hash` hash, `size` i64, `format` text?, `profile` text, `unit_count` i64, `units` array of hashes in `seq` order (`unit_count` must equal its length) |
 | 4 | `xattr` | one per xattr row | `entry` id, `name` bin, `value` bin |
-| 5 | `provenance` | optional, one per provenance row | `entry` id, `source` text, `url` text?, `fetched_at` int?, `last_modified` int?, `server_ip` text?, `http_headers` text? |
-| 6 | `screen_hit` | optional, one per screen hit | `id` int, `snapshot_id` id, `entry_id` id, `verdict` text, `screener` text, `list_version` text?, `blake3` hash, `md5` bin?, `sha1` bin?, `sha256` bin?, `detail` text?, `detected_at` int |
+| 5 | `provenance` | optional, one per provenance row | `entry_id` id, `source` text, `url` text?, `fetched_at` i64?, `last_modified` i64?, `server_ip` text?, `http_headers` text? |
+| 6 | `screen_hit` | optional, one per screen hit | `id` i64, `snapshot_id` id, `entry_id` id, `verdict` text, `screener` text, `list_version` text?, `blake3` hash, `md5` bin?, `sha1` bin?, `sha256` bin?, `detail` text?, `detected_at` i64 |
 
-- The header's snapshot row is the final row (`status = complete`, with its hashes and `completed_at`), except that `record_unit` is null: a row cannot contain its own record unit.
-- Sections 5 and 6 are reserved for provenance and screening. v1 writes none, but a v1 reader must accept and return them.
-- Adding any other item kind, or changing any field, requires a new `version`. A reader rejects an unknown kind, an unknown version, or out-of-order items as corruption.
+- **The header row.** The header's snapshot row is the final row (`status = complete`, with its hashes and `completed_at`), except that `record_unit` is null: a row cannot contain its own record unit.
+- **Reserved sections.** Sections 5 and 6 are reserved for provenance and screening. v1 writes none, but a v1 reader must accept them and return them.
+- **Closed vocabularies.** Enum fields hold only the catalog's strings from §6.1. A writer emits only these values, and a reader checks them:
+  - `snapshot.status`
+  - `entry.kind` and `entry.status`
+  - `content.profile`
+  - `content.format`: the closed list in §6.1, or null
+  - `provenance.source` (`wget_layout | jsonl`)
+  - `screen_hit.verdict` (`match | error`)
 
-The document is chunked with the binary profile and stored as ordinary `raw_chunk` units, so a 100M-entry record never exceeds pack limits. A small `snapshot_record` unit then holds the CBOR map `{snapshot_id: id, document_blake3: hash, document_size: int, chunks: [chunk unit hashes]}`, and `snapshot.record_unit` points at it. A reader verifies every chunk, then the document's BLAKE3 and size.
+  An unknown value is corruption.
+- **Strict decoding.**
+  - A writer always writes every field, writing null for an absent optional value.
+  - A reader treats a missing optional field as null, and rejects any of the following as corruption:
+    - a missing required field
+    - an unknown field, in any item or in the header's snapshot map
+    - an unknown item kind
+    - an unknown `version`
+    - out-of-order items
+    - a `content` whose `unit_count` differs from its number of units
+  - A writer that finds `unit_count` and the unit list disagreeing in the catalog fails rather than write such a record.
+- **Versioning.** Adding any other item kind, adding a vocabulary value, or changing any field requires a new `version`.
+
+The document is chunked with the binary profile and stored as ordinary `raw_chunk` units, so a 100M-entry record never exceeds pack limits. A small `snapshot_record` unit then holds the CBOR map `{snapshot_id: id, document_blake3: hash, document_size: u64, chunks: [chunk unit hashes]}`. It is decoded with the same strict rules, and `snapshot.record_unit` points at it. A reader verifies every chunk, then the document's BLAKE3 and size.
 
 This record makes the packs the source of truth. Labels and media are derived data, so they are recomputed rather than recovered.
 

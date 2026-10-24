@@ -19,8 +19,11 @@
 //! a `snapshot_record` unit then holds the CBOR `RecordIndex` naming them.
 //!
 //! The item kinds and their fields are permanent for `VERSION` 1. Adding any
-//! other item kind, or changing a field, requires bumping `VERSION`: a v1
-//! reader rejects an unknown item kind as corrupt.
+//! other item kind, adding a vocabulary value (e.g. a `Format`), or changing
+//! a field requires bumping `VERSION`. Decoding is strict: unknown item
+//! kinds, unknown fields, missing required fields, and unknown enum values
+//! are corruption. Optional fields are always written (null when absent),
+//! and a missing optional field reads as null.
 
 use super::{Halt, Stage};
 use crate::catalog::Catalog;
@@ -64,7 +67,7 @@ pub struct SnapshotRecord {
 /// A `provenance` row (spec §6.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenanceRecord {
-    pub entry: Id,
+    pub entry_id: Id,
     pub source: String,
     pub url: Option<String>,
     pub fetched_at: Option<i64>,
@@ -168,6 +171,7 @@ impl<'de> Deserialize<'de> for B32 {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireSnapshot {
     id: B16,
     status: String,
@@ -188,6 +192,7 @@ struct WireSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireEntry {
     id: B16,
     snapshot_id: B16,
@@ -205,8 +210,9 @@ struct WireEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireProvenance {
-    entry: B16,
+    entry_id: B16,
     source: String,
     url: Option<String>,
     fetched_at: Option<i64>,
@@ -216,6 +222,7 @@ struct WireProvenance {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireScreenHit {
     id: i64,
     snapshot_id: B16,
@@ -232,7 +239,7 @@ struct WireScreenHit {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "t", rename_all = "snake_case")]
+#[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
 enum Item {
     Header {
         version: u32,
@@ -274,6 +281,7 @@ impl Item {
 
 /// Payload of the `snapshot_record` unit.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecordIndex {
     snapshot_id: B16,
     document_blake3: B32,
@@ -378,23 +386,42 @@ impl TryFrom<WireEntry> for EntryRow {
     }
 }
 
-impl From<WireProvenance> for ProvenanceRecord {
-    fn from(p: WireProvenance) -> ProvenanceRecord {
-        ProvenanceRecord {
-            entry: p.entry.0,
+/// The closed vocabularies of §6.1, checked on read (and on write, once a
+/// writer builds these items).
+const PROVENANCE_SOURCES: &[&str] = &["wget_layout", "jsonl"];
+const SCREEN_VERDICTS: &[&str] = &["match", "error"];
+
+fn check_vocab(what: &str, v: &str, allowed: &[&str]) -> Result<()> {
+    if allowed.contains(&v) {
+        Ok(())
+    } else {
+        Err(corrupt(format!("unknown {what} {v:?}")))
+    }
+}
+
+impl TryFrom<WireProvenance> for ProvenanceRecord {
+    type Error = Error;
+
+    fn try_from(p: WireProvenance) -> Result<ProvenanceRecord> {
+        check_vocab("provenance source", &p.source, PROVENANCE_SOURCES)?;
+        Ok(ProvenanceRecord {
+            entry_id: p.entry_id.0,
             source: p.source,
             url: p.url,
             fetched_at: p.fetched_at,
             last_modified: p.last_modified,
             server_ip: p.server_ip,
             http_headers: p.http_headers,
-        }
+        })
     }
 }
 
-impl From<WireScreenHit> for ScreenHitRecord {
-    fn from(h: WireScreenHit) -> ScreenHitRecord {
-        ScreenHitRecord {
+impl TryFrom<WireScreenHit> for ScreenHitRecord {
+    type Error = Error;
+
+    fn try_from(h: WireScreenHit) -> Result<ScreenHitRecord> {
+        check_vocab("screen_hit verdict", &h.verdict, SCREEN_VERDICTS)?;
+        Ok(ScreenHitRecord {
             id: h.id,
             snapshot_id: h.snapshot_id.0,
             entry_id: h.entry_id.0,
@@ -407,19 +434,28 @@ impl From<WireScreenHit> for ScreenHitRecord {
             sha256: h.sha256.map(|b| b.0),
             detail: h.detail,
             detected_at: h.detected_at,
-        }
+        })
     }
 }
 
-fn content_item(c: ContentRow, units: Vec<Hash32>) -> Item {
-    Item::Content {
+/// Fails rather than write a content item no reader would accept.
+fn content_item(c: ContentRow, units: Vec<Hash32>) -> Result<Item> {
+    if usize::try_from(c.unit_count).ok() != Some(units.len()) {
+        return Err(corrupt(format!(
+            "catalog content {} has unit_count {} but {} units",
+            c.hash,
+            c.unit_count,
+            units.len()
+        )));
+    }
+    Ok(Item::Content {
         hash: B32(c.hash),
         size: c.size,
         format: c.format.map(|f| f.as_str().to_string()),
         profile: c.profile.as_str().to_string(),
         unit_count: c.unit_count,
         units: units.into_iter().map(B32).collect(),
-    }
+    })
 }
 
 fn content_row(
@@ -564,7 +600,7 @@ fn write_document(cat: &Catalog, snapshot: &SnapshotRow, path: &Path) -> Result<
         to_cbor(&Item::Entry(e.into()), &mut w, path)
     })?;
     cat.for_each_snapshot_content(snapshot.id, |content, units| {
-        to_cbor(&content_item(content, units), &mut w, path)
+        to_cbor(&content_item(content, units)?, &mut w, path)
     })?;
     cat.for_each_snapshot_xattr(snapshot.id, |entry, name, value| {
         let item = Item::Xattr {
@@ -684,8 +720,8 @@ fn parse_document(r: &mut impl BufRead) -> Result<SnapshotRecord> {
                 units,
             } => contents.push(content_row(hash, size, format, profile, unit_count, units)?),
             Item::Xattr { entry, name, value } => xattrs.push((entry.0, name.0, value.0)),
-            Item::Provenance(p) => provenance.push(p.into()),
-            Item::ScreenHit(h) => screen_hits.push(h.into()),
+            Item::Provenance(p) => provenance.push(ProvenanceRecord::try_from(p)?),
+            Item::ScreenHit(h) => screen_hits.push(ScreenHitRecord::try_from(h)?),
         }
     }
     let snapshot = snapshot.ok_or_else(|| corrupt("empty document"))?;
@@ -749,6 +785,7 @@ pub fn read_record(reader: &UnitReader, cat: &Catalog, unit: &Hash32) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ciborium::Value;
 
     fn snapshot() -> SnapshotRow {
         SnapshotRow {
@@ -823,7 +860,7 @@ mod tests {
         let doc = encode_items(&[
             header(&s),
             Item::Entry(e.clone().into()),
-            content_item(content(&[b"u1", b"u2"]).0, content(&[b"u1", b"u2"]).1),
+            content_item(content(&[b"u1", b"u2"]).0, content(&[b"u1", b"u2"]).1).unwrap(),
             Item::Xattr {
                 entry: B16(e.id),
                 name: Bin(b"user.x".to_vec()),
@@ -846,7 +883,7 @@ mod tests {
             header(&s),
             Item::Entry(e.clone().into()),
             Item::Provenance(WireProvenance {
-                entry: B16(e.id),
+                entry_id: B16(e.id),
                 source: "wget_layout".into(),
                 url: Some("https://example.com/a".into()),
                 fetched_at: Some(-3),
@@ -873,7 +910,7 @@ mod tests {
         assert_eq!(
             rec.provenance,
             vec![ProvenanceRecord {
-                entry: e.id,
+                entry_id: e.id,
                 source: "wget_layout".into(),
                 url: Some("https://example.com/a".into()),
                 fetched_at: Some(-3),
@@ -909,7 +946,21 @@ mod tests {
             unit_count: 3,
             ..row
         };
-        let doc = encode_items(&[header(&s), content_item(bad, units)]);
+        // The writer refuses to emit it ...
+        assert!(matches!(
+            content_item(bad.clone(), units.clone()),
+            Err(Error::Corrupt(_))
+        ));
+        // ... and the reader rejects it if one turns up anyway.
+        let item = Item::Content {
+            hash: B32(bad.hash),
+            size: bad.size,
+            format: None,
+            profile: "text".into(),
+            unit_count: 3,
+            units: units.into_iter().map(B32).collect(),
+        };
+        let doc = encode_items(&[header(&s), item]);
         let err = parse_document(&mut &doc[..]).unwrap_err();
         assert!(
             matches!(&err, Error::Corrupt(m) if m.contains("unit_count")),
@@ -918,12 +969,138 @@ mod tests {
     }
 
     #[test]
+    fn content_without_format_roundtrips() {
+        let s = snapshot();
+        let (row, units) = content(&[b"u1"]);
+        let row = ContentRow {
+            format: None,
+            profile: ProfileKind::Binary,
+            ..row
+        };
+        let doc = encode_items(&[
+            header(&s),
+            content_item(row.clone(), units.clone()).unwrap(),
+        ]);
+        let rec = parse_document(&mut &doc[..]).unwrap();
+        assert_eq!(rec.contents, vec![(row, units)]);
+    }
+
+    /// `item` as a CBOR value, edited by `f`, then encoded after a header.
+    fn edited(s: &SnapshotRow, item: &Item, f: impl FnOnce(&mut Vec<(Value, Value)>)) -> Vec<u8> {
+        let mut v = Value::serialized(item).unwrap();
+        let Value::Map(m) = &mut v else {
+            panic!("items are maps")
+        };
+        f(m);
+        let mut doc = encode_items(&[header(s)]);
+        ciborium::into_writer(&v, &mut doc).unwrap();
+        doc
+    }
+
+    fn content_value() -> Item {
+        let (row, units) = content(&[b"u1"]);
+        content_item(row, units).unwrap()
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        let s = snapshot();
+        let doc = edited(&s, &content_value(), |m| {
+            m.push((Value::Text("extra".into()), Value::Integer(1.into())))
+        });
+        assert!(matches!(
+            parse_document(&mut &doc[..]),
+            Err(Error::Corrupt(_))
+        ));
+        let mut snap = Value::serialized(&header(&s)).unwrap();
+        if let Value::Map(m) = &mut snap {
+            for (k, v) in m.iter_mut() {
+                if k.as_text() == Some("snapshot") {
+                    if let Value::Map(inner) = v {
+                        inner.push((Value::Text("extra".into()), Value::Null));
+                    }
+                }
+            }
+        }
+        let mut doc = Vec::new();
+        ciborium::into_writer(&snap, &mut doc).unwrap();
+        assert!(matches!(
+            parse_document(&mut &doc[..]),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn absent_optional_field_reads_as_null() {
+        let s = snapshot();
+        let doc = edited(&s, &content_value(), |m| {
+            m.retain(|(k, _)| k.as_text() != Some("format"))
+        });
+        let rec = parse_document(&mut &doc[..]).unwrap();
+        assert_eq!(rec.contents[0].0.format, None);
+        // A required field may not be left out.
+        let doc = edited(&s, &content_value(), |m| {
+            m.retain(|(k, _)| k.as_text() != Some("profile"))
+        });
+        assert!(matches!(
+            parse_document(&mut &doc[..]),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_vocabulary_is_rejected() {
+        let s = snapshot();
+        let e = entry(s.id);
+        let prov = Item::Provenance(WireProvenance {
+            entry_id: B16(e.id),
+            source: "carrier_pigeon".into(),
+            url: None,
+            fetched_at: None,
+            last_modified: None,
+            server_ip: None,
+            http_headers: None,
+        });
+        let hit = Item::ScreenHit(WireScreenHit {
+            id: 1,
+            snapshot_id: B16(s.id),
+            entry_id: B16(e.id),
+            verdict: "maybe".into(),
+            screener: "x".into(),
+            list_version: None,
+            blake3: B32(Hash32::of(b"h")),
+            md5: None,
+            sha1: None,
+            sha256: None,
+            detail: None,
+            detected_at: 0,
+        });
+        let (row, units) = content(&[b"u1"]);
+        let bad_format = Item::Content {
+            hash: B32(row.hash),
+            size: row.size,
+            format: Some("bmp".into()),
+            profile: "text".into(),
+            unit_count: 1,
+            units: units.into_iter().map(B32).collect(),
+        };
+        for item in [prov, hit, bad_format] {
+            let doc = encode_items(&[header(&s), item]);
+            let err = parse_document(&mut &doc[..]).unwrap_err();
+            assert!(
+                matches!(&err, Error::Corrupt(m) if m.contains("unknown")),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn misordered_or_damaged_documents_are_corrupt() {
         let s = snapshot();
         let e = entry(s.id);
         let content = || {
             let (row, units) = content(&[]);
-            content_item(row, units)
+            content_item(row, units).unwrap()
         };
         let screen_hit = || {
             Item::ScreenHit(WireScreenHit {
@@ -943,7 +1120,7 @@ mod tests {
         };
         let provenance = || {
             Item::Provenance(WireProvenance {
-                entry: B16(e.id),
+                entry_id: B16(e.id),
                 source: "jsonl".into(),
                 url: None,
                 fetched_at: None,
