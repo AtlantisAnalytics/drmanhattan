@@ -26,6 +26,9 @@ pub struct FileDigest {
 /// Split `r` into content-defined chunks, calling `on_chunk` for each with its
 /// bytes. Returns the whole-stream BLAKE3 and size, computed in the same pass.
 ///
+/// The profile must have passed `Config::validate`; fastcdc panics on
+/// out-of-bounds sizes.
+///
 /// Read errors become `Error::Io` with an empty path; callers that know the
 /// path should re-wrap it.
 pub fn chunk_reader<R: Read>(
@@ -33,6 +36,7 @@ pub fn chunk_reader<R: Read>(
     r: R,
     mut on_chunk: impl FnMut(Chunk, &[u8]) -> Result<()>,
 ) -> Result<FileDigest> {
+    debug_assert!(p.min <= p.avg && p.avg <= p.max, "profile not validated");
     let mut whole = blake3::Hasher::new();
     let mut size = 0u64;
     for item in StreamCDC::new(r, p.min as usize, p.avg as usize, p.max as usize) {
