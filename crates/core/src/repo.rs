@@ -1,3 +1,4 @@
+use crate::catalog::Catalog;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use fs4::{FileExt, TryLockError};
@@ -43,6 +44,7 @@ impl Repo {
         std::fs::create_dir_all(&packs).map_err(|e| Error::io(&packs, e))?;
         let config = Config::default();
         config.save(&root.join(CONFIG_FILE))?;
+        Catalog::open(&root.join(CATALOG_FILE))?;
         Ok(Repo {
             root: root.to_path_buf(),
             config,

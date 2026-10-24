@@ -10,6 +10,10 @@ fn init_creates_layout() {
     assert_eq!(repo.root, root);
     assert!(root.join("wmk.toml").is_file());
     assert!(root.join("packs").is_dir());
+    let cat_path = root.join("catalog.sqlite");
+    assert!(cat_path.is_file());
+    let cat = drmanhattan_core::catalog::Catalog::open_readonly(&cat_path).unwrap();
+    assert!(cat.snapshots().unwrap().is_empty());
     let loaded = Config::load(&root.join("wmk.toml")).unwrap();
     assert_eq!(loaded, Config::default());
     assert_eq!(loaded.chunking.text.avg, 8192);
