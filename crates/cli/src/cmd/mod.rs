@@ -1,6 +1,7 @@
 pub mod ingest;
 pub mod init;
 pub mod manifest;
+pub mod restore;
 
 use crate::Cli;
 use anyhow::{anyhow, Result};

@@ -30,6 +30,8 @@ pub enum Command {
     Ingest(cmd::ingest::IngestArgs),
     /// Compute the manifest hash of a live directory
     Manifest(cmd::manifest::ManifestArgs),
+    /// Rebuild a snapshot byte-exact in a new directory
+    Restore(cmd::restore::RestoreArgs),
 }
 
 /// Map an error to a process exit code. Core errors are 1; later tasks add 2 and 3.
@@ -46,6 +48,7 @@ fn main() {
         Command::Init(args) => cmd::init::run(&cli, args).map(|()| 0),
         Command::Ingest(args) => cmd::ingest::run(&cli, args),
         Command::Manifest(args) => cmd::manifest::run(&cli, args).map(|()| 0),
+        Command::Restore(args) => cmd::restore::run(&cli, args),
     };
     match result {
         Ok(0) => {}
