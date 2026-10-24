@@ -17,4 +17,5 @@ serde_json = "1.0.154"
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
+rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3.27.0"

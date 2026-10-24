@@ -86,6 +86,57 @@ fn verify_and_diff_exit_codes() {
     assert!(String::from_utf8(out.stdout).unwrap().contains("FAILED"));
 }
 
+#[test]
+fn diff_expected_missing_only_exits_0() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    std::fs::create_dir(t.join("src")).unwrap();
+    std::fs::write(t.join("src/a.txt"), b"hello\n").unwrap();
+    std::fs::write(t.join("src/b.txt"), b"withheld\n").unwrap();
+    wmk().current_dir(t).args(["init", "r"]).assert().success();
+    wmk()
+        .current_dir(t)
+        .args(["--repo", "r", "ingest", "src"])
+        .assert()
+        .success();
+    wmk()
+        .current_dir(t)
+        .args(["--repo", "r", "restore", "latest", "out"])
+        .assert()
+        .success();
+    let conn = rusqlite::Connection::open(t.join("r/catalog.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE entry SET status = 'screened_out', content_hash = NULL WHERE path = CAST('b.txt' AS BLOB)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    std::fs::remove_file(t.join("out/b.txt")).unwrap();
+    let out = wmk()
+        .current_dir(t)
+        .args([
+            "--repo",
+            "r",
+            "diff",
+            "latest",
+            "out",
+            "--mtime-precision",
+            "9223372036854775807",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        "=expected-missing b.txt (screened_out)"
+    );
+}
+
 fn walk_packs(dir: &std::path::Path) -> std::path::PathBuf {
     for e in std::fs::read_dir(dir).unwrap() {
         let p = e.unwrap().path();

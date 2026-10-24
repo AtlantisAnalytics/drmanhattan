@@ -311,6 +311,7 @@ dependencies = [
  "clap",
  "drmanhattan-core",
  "predicates",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

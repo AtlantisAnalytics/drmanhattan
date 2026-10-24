@@ -50,6 +50,8 @@ pub struct DiffOptions {
     pub path: Vec<u8>,
     /// Both sides' mtimes are floored to this (0 is treated as 1).
     pub mtime_precision_ns: u64,
+    /// Descend into other filesystems (match how the snapshot was ingested).
+    pub cross_fs: bool,
 }
 
 fn withheld(s: EntryStatus) -> bool {
@@ -158,31 +160,37 @@ pub fn run(repo: &Repo, snapshot: Id, dir: &Path, opts: &DiffOptions) -> Result<
         .collect();
 
     let mut out = Vec::new();
-    walk(dir, &WalkOptions { cross_fs: false }, |item| {
-        let WalkItem::Entry(e) = item else {
-            return Ok(());
-        };
-        match snap.remove(&e.path) {
-            None => {
-                if !under_withheld(&withheld_paths, &e.path) {
-                    out.push(Difference::Extra {
-                        path: e.path.clone(),
-                    });
+    walk(
+        dir,
+        &WalkOptions {
+            cross_fs: opts.cross_fs,
+        },
+        |item| {
+            let WalkItem::Entry(e) = item else {
+                return Ok(());
+            };
+            match snap.remove(&e.path) {
+                None => {
+                    if !under_withheld(&withheld_paths, &e.path) {
+                        out.push(Difference::Extra {
+                            path: e.path.clone(),
+                        });
+                    }
+                }
+                // Present although withheld: nothing to compare, nothing to report.
+                Some(row) if withheld(row.status) => {}
+                Some(row) => {
+                    let abs = if e.path.is_empty() {
+                        dir.to_path_buf()
+                    } else {
+                        dir.join(OsStr::from_bytes(&e.path))
+                    };
+                    compare(&mut out, &row, &e, &abs, precision)?;
                 }
             }
-            // Present although withheld: nothing to compare, nothing to report.
-            Some(row) if withheld(row.status) => {}
-            Some(row) => {
-                let abs = if e.path.is_empty() {
-                    dir.to_path_buf()
-                } else {
-                    dir.join(OsStr::from_bytes(&e.path))
-                };
-                compare(&mut out, &row, &e, &abs, precision)?;
-            }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
 
     for (path, row) in snap {
         if withheld(row.status) {

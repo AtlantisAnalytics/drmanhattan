@@ -87,6 +87,7 @@ fn dopts(precision: u64) -> DiffOptions {
     DiffOptions {
         path: Vec::new(),
         mtime_precision_ns: precision,
+        cross_fs: false,
     }
 }
 
@@ -236,10 +237,132 @@ fn diff_subtree_rebases_path() {
         &DiffOptions {
             path: b"sub".to_vec(),
             mtime_precision_ns: 1,
+            cross_fs: false,
         },
     )
     .unwrap();
     assert_eq!(d, vec![]);
+}
+
+/// Mark entries as withheld directly in the catalog (ingest cannot yet).
+fn withhold(repo: &Repo, paths: &[&[u8]]) {
+    let conn = rusqlite::Connection::open(repo.catalog_path()).unwrap();
+    for p in paths {
+        let n = conn
+            .execute(
+                "UPDATE entry SET status = 'screened_out', content_hash = NULL WHERE path = ?1",
+                [p],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+}
+
+/// Mtimes are floored away so only the structure is compared.
+fn structural() -> DiffOptions {
+    dopts(u64::MAX)
+}
+
+#[test]
+fn diff_withheld_absent_is_expected_missing() {
+    let (tmp, repo, snap) = setup();
+    let out = tmp.path().join("out");
+    restore_to(&repo, snap, &out);
+    withhold(&repo, &[b"t.txt"]);
+    fs::remove_file(out.join("t.txt")).unwrap();
+    let d = diff::run(&repo, snap, &out, &structural()).unwrap();
+    assert_eq!(
+        d,
+        vec![Difference::ExpectedMissing {
+            path: b"t.txt".to_vec(),
+            status: drmanhattan_core::model::EntryStatus::ScreenedOut
+        }]
+    );
+}
+
+#[test]
+fn diff_withheld_present_is_not_reported() {
+    let (tmp, repo, snap) = setup();
+    let out = tmp.path().join("out");
+    restore_to(&repo, snap, &out);
+    withhold(&repo, &[b"t.txt"]);
+    // Present, and even with different content: nothing to compare against.
+    fs::write(out.join("t.txt"), b"anything at all").unwrap();
+    assert_eq!(diff::run(&repo, snap, &out, &structural()).unwrap(), vec![]);
+}
+
+#[test]
+fn diff_under_withheld_dir_is_neither_extra_nor_missing() {
+    let (tmp, repo, snap) = setup();
+    // Absent: the dir is expected missing; its children are not Missing.
+    let out = tmp.path().join("out");
+    restore_to(&repo, snap, &out);
+    withhold(&repo, &[b"sub"]);
+    fs::remove_dir_all(out.join("sub")).unwrap();
+    let d = diff::run(&repo, snap, &out, &structural()).unwrap();
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert!(matches!(&d[0], Difference::ExpectedMissing { path, .. } if path == b"sub"));
+
+    // Present with an unknown child: not Extra.
+    let out2 = tmp.path().join("out2");
+    restore_to(&repo, snap, &out2);
+    fs::create_dir(out2.join("sub")).unwrap();
+    fs::write(out2.join("sub/surprise.txt"), b"?").unwrap();
+    assert_eq!(
+        diff::run(&repo, snap, &out2, &structural()).unwrap(),
+        vec![]
+    );
+}
+
+#[test]
+fn diff_dir_replaced_by_file_cascades_missing() {
+    let (tmp, repo, snap) = setup();
+    let out = tmp.path().join("out");
+    restore_to(&repo, snap, &out);
+    fs::remove_dir_all(out.join("sub")).unwrap();
+    fs::write(out.join("sub"), b"now a file").unwrap();
+    let d = diff::run(&repo, snap, &out, &structural()).unwrap();
+    let got: Vec<(&[u8], &str)> = d
+        .iter()
+        .map(|x| {
+            let k = match x {
+                Difference::KindDiffers { .. } => "kind",
+                Difference::Missing { .. } => "missing",
+                other => panic!("unexpected {other:?}"),
+            };
+            (x.path(), k)
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (&b"sub"[..], "kind"),
+            (b"sub/gone.txt", "missing"),
+            (b"sub/keep.bin", "missing")
+        ]
+    );
+}
+
+#[test]
+fn diff_file_replaced_by_dir_cascades_extra() {
+    let (tmp, repo, snap) = setup();
+    let out = tmp.path().join("out");
+    restore_to(&repo, snap, &out);
+    fs::remove_file(out.join("a.txt")).unwrap();
+    fs::create_dir(out.join("a.txt")).unwrap();
+    fs::write(out.join("a.txt/child"), b"c").unwrap();
+    let d = diff::run(&repo, snap, &out, &structural()).unwrap();
+    assert_eq!(
+        d,
+        vec![
+            Difference::KindDiffers {
+                path: b"a.txt".to_vec()
+            },
+            Difference::Extra {
+                path: b"a.txt/child".to_vec()
+            }
+        ]
+    );
 }
 
 #[test]

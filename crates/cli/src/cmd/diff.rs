@@ -23,10 +23,17 @@ pub struct DiffArgs {
     /// Floor mtimes to this many nanoseconds before comparing (0 and 1 mean exact)
     #[arg(long, default_value_t = 1)]
     pub mtime_precision: u64,
+    /// Descend into other filesystems (use if the snapshot was taken with --cross-fs)
+    #[arg(long)]
+    pub cross_fs: bool,
 }
 
+/// JSON shape of one difference (stable): `{"kind", "path"}` plus, for
+/// `mode` and `mtime`, `"snapshot"` and `"dir"` values (octal mode string /
+/// decimal ns string), and for `expected-missing`, `"status"`. Kinds:
+/// content, mode, mtime, kind, link-target, missing, extra, expected-missing.
 #[derive(Serialize)]
-struct Item {
+struct ItemJson {
     kind: &'static str,
     path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,78 +44,85 @@ struct Item {
     status: Option<&'static str>,
 }
 
-impl Item {
-    fn new(d: &Difference) -> Item {
-        let mut it = Item {
-            kind: "",
-            path: display_bytes(d.path()),
+struct Item<'a>(&'a Difference);
+
+impl Serialize for Item<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let path = display_bytes(self.0.path());
+        let plain = |kind| ItemJson {
+            kind,
+            path: display_bytes(self.0.path()),
             snapshot: None,
             dir: None,
             status: None,
         };
-        match d {
-            Difference::ContentDiffers { .. } => it.kind = "content",
+        let j = match self.0 {
+            Difference::ContentDiffers { .. } => plain("content"),
+            Difference::ModeDiffers { snap, dir, .. } => ItemJson {
+                snapshot: Some(format!("{snap:o}")),
+                dir: Some(format!("{dir:o}")),
+                ..plain("mode")
+            },
+            Difference::MtimeDiffers { snap, dir, .. } => ItemJson {
+                snapshot: Some(snap.to_string()),
+                dir: Some(dir.to_string()),
+                ..plain("mtime")
+            },
+            Difference::KindDiffers { .. } => plain("kind"),
+            Difference::LinkTargetDiffers { .. } => plain("link-target"),
+            Difference::Missing { .. } => plain("missing"),
+            Difference::Extra { .. } => plain("extra"),
+            Difference::ExpectedMissing { status, .. } => ItemJson {
+                status: Some(status.as_str()),
+                ..plain("expected-missing")
+            },
+        };
+        debug_assert_eq!(j.path, path);
+        j.serialize(s)
+    }
+}
+
+impl fmt::Display for Item<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let p = display_bytes(self.0.path());
+        match self.0 {
+            Difference::ContentDiffers { .. } => write!(f, "~content {p}"),
             Difference::ModeDiffers { snap, dir, .. } => {
-                it.kind = "mode";
-                it.snapshot = Some(format!("{snap:o}"));
-                it.dir = Some(format!("{dir:o}"));
+                write!(f, "~mode {p} {snap:o}\u{2192}{dir:o}")
             }
             Difference::MtimeDiffers { snap, dir, .. } => {
-                it.kind = "mtime";
-                it.snapshot = Some(snap.to_string());
-                it.dir = Some(dir.to_string());
+                write!(f, "~mtime {p} {snap}\u{2192}{dir}")
             }
-            Difference::KindDiffers { .. } => it.kind = "kind",
-            Difference::LinkTargetDiffers { .. } => it.kind = "link-target",
-            Difference::Missing { .. } => it.kind = "missing",
-            Difference::Extra { .. } => it.kind = "extra",
+            Difference::KindDiffers { .. } => write!(f, "~kind {p}"),
+            Difference::LinkTargetDiffers { .. } => write!(f, "~link-target {p}"),
+            Difference::Missing { .. } => write!(f, "-missing {p}"),
+            Difference::Extra { .. } => write!(f, "+extra {p}"),
             Difference::ExpectedMissing { status, .. } => {
-                it.kind = "expected-missing";
-                it.status = Some(status.as_str());
+                write!(f, "=expected-missing {p} ({})", status.as_str())
             }
         }
-        it
     }
 }
 
-impl fmt::Display for Item {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let p = &self.path;
-        match self.kind {
-            "content" => write!(f, "~content {p}"),
-            "mode" => write!(
-                f,
-                "~mode {p} {}\u{2192}{}",
-                self.snapshot.as_deref().unwrap_or(""),
-                self.dir.as_deref().unwrap_or("")
-            ),
-            "mtime" => write!(
-                f,
-                "~mtime {p} {}\u{2192}{}",
-                self.snapshot.as_deref().unwrap_or(""),
-                self.dir.as_deref().unwrap_or("")
-            ),
-            "kind" => write!(f, "~kind {p}"),
-            "link-target" => write!(f, "~link-target {p}"),
-            "missing" => write!(f, "-missing {p}"),
-            "extra" => write!(f, "+extra {p}"),
-            _ => write!(f, "=expected-missing {p} ({})", self.status.unwrap_or("")),
-        }
+struct Report<'a>(&'a [Difference]);
+
+impl Serialize for Report<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("Report", 1)?;
+        let items: Vec<Item> = self.0.iter().map(Item).collect();
+        st.serialize_field("differences", &items)?;
+        st.end()
     }
 }
 
-#[derive(Serialize)]
-struct Report {
-    differences: Vec<Item>,
-}
-
-impl fmt::Display for Report {
+impl fmt::Display for Report<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, d) in self.differences.iter().enumerate() {
+        for (i, d) in self.0.iter().enumerate() {
             if i > 0 {
                 writeln!(f)?;
             }
-            write!(f, "{d}")?;
+            write!(f, "{}", Item(d))?;
         }
         Ok(())
     }
@@ -129,17 +143,15 @@ pub fn run(cli: &Cli, args: &DiffArgs) -> Result<i32> {
     let opts = DiffOptions {
         path,
         mtime_precision_ns: args.mtime_precision,
+        cross_fs: args.cross_fs,
     };
     let diffs = diff::run(&repo, snapshot, &args.dir, &opts)?;
     let real = diffs
         .iter()
         .filter(|d| !matches!(d, Difference::ExpectedMissing { .. }))
         .count();
-    let report = Report {
-        differences: diffs.iter().map(Item::new).collect(),
-    };
-    if cli.json || !report.differences.is_empty() {
-        emit(cli.json, &report)?;
+    if cli.json || !diffs.is_empty() {
+        emit(cli.json, &Report(&diffs))?;
     }
     if real > 0 {
         return Err(DiffFound(real).into());
