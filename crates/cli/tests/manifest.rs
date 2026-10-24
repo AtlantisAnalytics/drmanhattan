@@ -14,7 +14,15 @@ fn manifest_prints_core_ext_and_json() {
     let core = wmk().arg("manifest").arg(tmp.path()).output().unwrap();
     assert!(core.status.success());
     let core = String::from_utf8(core.stdout).unwrap().trim().to_string();
-    assert_eq!(core.len(), 64);
+    let lib = drmanhattan_core::manifest::manifest_dir(
+        tmp.path(),
+        &drmanhattan_core::manifest::ManifestOptions {
+            mtime_precision_ns: 1,
+            cross_fs: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(core, lib.core.to_hex());
 
     let ext = wmk()
         .args(["manifest", "--ext"])
@@ -22,7 +30,7 @@ fn manifest_prints_core_ext_and_json() {
         .output()
         .unwrap();
     let ext = String::from_utf8(ext.stdout).unwrap().trim().to_string();
-    assert_eq!(ext.len(), 64);
+    assert_eq!(ext, lib.ext.to_hex());
     assert_ne!(core, ext);
 
     let j = wmk()

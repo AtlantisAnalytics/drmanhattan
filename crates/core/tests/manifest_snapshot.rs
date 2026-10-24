@@ -111,6 +111,10 @@ fn catalog_of(root: &Path, db: &Path, tweak: impl Fn(&mut EntryRow)) -> Id {
         // Live files may carry xattrs (e.g. com.apple.provenance on macOS).
         let abs = root.join(std::ffi::OsStr::from_bytes(&e.path));
         for name in xattr::list(&abs).unwrap_or_default() {
+            // Ingest filters the same list.
+            if drmanhattan_core::manifest::IGNORED_XATTRS.contains(&name.as_bytes()) {
+                continue;
+            }
             if let Ok(Some(v)) = xattr::get(&abs, &name) {
                 tx.send(CatalogOp::InsertXattr(id, name.as_bytes().to_vec(), v))
                     .unwrap();
@@ -162,6 +166,66 @@ fn matches_manifest_dir_whole_and_subtrees() {
         manifest_snapshot(&cat, sid, b"", &opts()).unwrap().entries,
         11
     );
+}
+
+#[test]
+fn withheld_entry_before_hardlink_group_matches_tree_without_it() {
+    let d = tempfile::tempdir().unwrap();
+    let full = d.path().join("full");
+    let without = d.path().join("without");
+    for p in [&full, &without] {
+        std::fs::create_dir(p).unwrap();
+    }
+    let mut t = TreeBuilder::new(&full);
+    t.file(b"0-withheld", b"w")
+        .file(b"x", b"same")
+        .hardlink(b"y", b"x")
+        .mtime(b"", T_ROOT);
+    t.finish();
+    let mut t = TreeBuilder::new(&without);
+    t.file(b"x", b"same")
+        .hardlink(b"y", b"x")
+        .mtime(b"", T_ROOT);
+    t.finish();
+    // Match mtimes of the shared entries so only the withheld entry differs.
+    for n in ["x", "y"] {
+        let m = std::fs::metadata(full.join(n)).unwrap();
+        let ft = filetime::FileTime::from_last_modification_time(&m);
+        filetime::set_file_times(without.join(n), ft, ft).unwrap();
+    }
+    let db = d.path().join("c.sqlite");
+    let sid = catalog_of(&full, &db, |r| {
+        if r.path == b"0-withheld" {
+            r.status = EntryStatus::ScreenedOut;
+        }
+    });
+    let cat = Catalog::open_readonly(&db).unwrap();
+    let got = manifest_snapshot(&cat, sid, b"", &opts()).unwrap();
+    let want = manifest_dir(&without, &opts()).unwrap();
+    assert_eq!(got.entries, want.entries);
+    assert_eq!(got.core, want.core);
+    assert_eq!(got.ext, want.ext);
+}
+
+#[test]
+fn withheld_or_missing_root_path_is_not_found() {
+    let d = tempfile::tempdir().unwrap();
+    let live = d.path().join("live");
+    std::fs::create_dir(&live).unwrap();
+    let mut t = TreeBuilder::new(&live);
+    t.file(b"keep", b"k").file(b"drop", b"d");
+    t.finish();
+    let db = d.path().join("c.sqlite");
+    let sid = catalog_of(&live, &db, |r| {
+        if r.path == b"drop" {
+            r.status = EntryStatus::ScreenedOut;
+        }
+    });
+    let cat = Catalog::open_readonly(&db).unwrap();
+    for p in [&b"drop"[..], b"nope"] {
+        let err = manifest_snapshot(&cat, sid, p, &opts()).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
 }
 
 #[test]

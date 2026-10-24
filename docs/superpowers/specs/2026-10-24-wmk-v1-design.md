@@ -79,6 +79,8 @@ macOS (APFS, including case-insensitive volumes) and Linux (ext4, xfs, btrfs).
 | uid/gid, atime, ctime, ACLs | no | — | — |
 | Sockets, FIFOs, device files | listed in the ingest report, skipped | — | excluded, on both sides |
 
+OS-managed volatile xattrs (`com.apple.provenance`) are neither recorded nor hashed. `com.apple.quarantine` is ordinary data and is recorded.
+
 The same rules apply whether a manifest is computed from a live directory (`wmk manifest`) or from a snapshot. That is what makes the hashes comparable.
 
 ## 5. Repository layout
@@ -290,7 +292,11 @@ The root entry has `path = ""` and is included.
 `ext_manifest_hash` uses the same encoding, followed after each entry by:
 
 - the canonical hardlink group: the canonical-order index (0-based position in the hashed sequence, root = 0) of the group's first entry, as a u64, or `u64::MAX` if the entry is not hard-linked. A group counts only if at least two of its members are inside the tree being hashed; every member of such a group, including the first, carries the first member's index. A file with `nlink > 1` that has a single member in the tree gets `u64::MAX`, because restoring it yields an unlinked file.
-- the sorted xattrs: `name_len | name | value_len | value`
+- the xattrs: `xattr_count u32`, then for each xattr, sorted bytewise by name, `name_len u32 | name | value_len u32 | value`
+
+Exactly, per entry, the ext stream is: the core bytes above, then `hardlink_first u64 | xattr_count u32 | (name_len u32 | name | value_len u32 | value)*`. Entries with no xattrs contribute `xattr_count = 0`.
+
+All integers in §6.4 (core and ext) are little-endian. A `mtime_ns` is first floored to the mtime precision (`m - m.rem_euclid(p)`; precision 0 is treated as 1). An entry that cannot be encoded (a symlink without a target, a file without a content hash, a length over `u32`) is an error, never hashed as a default.
 
 UUIDs, labels, media, provenance, and snapshot metadata are never hashed.
 
@@ -457,7 +463,7 @@ Legal and process note (not a software requirement): the reporting protocol, inc
 
 | Command | Behavior |
 |---|---|
-| `wmk manifest <dir> [--ext] [--mtime-precision <ns>]` | Computes the manifest hash of a live directory using §4 and §6.4 rules, without ingesting |
+| `wmk manifest <dir> [--ext] [--mtime-precision <ns>] [--cross-fs]` | Computes the manifest hash of a live directory using §4 and §6.4 rules, without ingesting. `--cross-fs` descends into other filesystems, to match a source ingested with `--cross-fs` |
 | `wmk verify [<snapshot>] [--quick]` | `--quick`: catalog/pack consistency (every referenced unit exists in a pack at the recorded offset with a valid header). Default: also decompress and BLAKE3 every referenced unit and each sealed pack |
 | `wmk diff <snapshot> <dir> [--path <prefix>] [--mtime-precision <ns>]` | Path-level differences: content, mode, mtime, kind, link target, missing, extra, expected-missing |
 | `wmk recover` | Rebuilds `catalog.sqlite` from packs. Truncates torn tails of unsealed packs, re-indexes all units, replays snapshot and purge records, and recomputes labels |

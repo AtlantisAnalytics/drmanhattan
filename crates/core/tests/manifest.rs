@@ -1,8 +1,10 @@
 mod common;
 
 use common::TreeBuilder;
+use drmanhattan_core::error::Error;
 use drmanhattan_core::ids::Hash32;
-use drmanhattan_core::manifest::{manifest_dir, ManifestHasher, ManifestOptions};
+use drmanhattan_core::manifest::{manifest_dir, ManifestEntry, ManifestHasher, ManifestOptions};
+use drmanhattan_core::model::EntryKind;
 use std::path::Path;
 
 const T_ROOT: i64 = 1_100_000_000_000_000_000;
@@ -76,11 +78,152 @@ fn golden_encoding() {
     s.extend_from_slice(b"../a.txt");
     assert_eq!(Hash32::of(&s), h.core);
 
-    let golden_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/manifest_golden.hex");
-    match std::fs::read_to_string(&golden_path) {
-        Ok(g) => assert_eq!(g.trim(), h.core.to_hex()),
-        Err(_) => std::fs::write(&golden_path, format!("{}\n", h.core.to_hex())).unwrap(),
+    assert_eq!(
+        include_str!("vectors/manifest_golden.hex").trim(),
+        h.core.to_hex()
+    );
+}
+
+/// One-off generator for the committed golden vectors. Only run it when the
+/// encoding is intentionally changed (which breaks every stored hash):
+/// `cargo test -p drmanhattan-core --test manifest -- --ignored --nocapture print_golden`
+#[test]
+#[ignore]
+fn print_golden() {
+    let d = tempfile::tempdir().unwrap();
+    golden_tree(d.path());
+    println!(
+        "manifest_golden.hex: {}",
+        manifest_dir(d.path(), &opts(1)).unwrap().core.to_hex()
+    );
+    println!("manifest_ext_golden.hex: {}", synthetic_ext().0.to_hex());
+}
+
+fn dir_entry<'a>(path: &'a [u8], mode: u32, mtime_ns: i64) -> ManifestEntry<'a> {
+    ManifestEntry {
+        path,
+        kind: EntryKind::Dir,
+        mode,
+        mtime_ns,
+        size: 0,
+        content: None,
+        link_target: None,
+        hardlink_first: None,
+        xattrs: &[],
+    }
+}
+
+/// Synthetic entry list (no filesystem): returns (ext, hand-built stream).
+fn synthetic_ext() -> (Hash32, Vec<u8>) {
+    let hello = Hash32::of(b"hello");
+    let file = |path| ManifestEntry {
+        path,
+        kind: EntryKind::File,
+        mode: 0o644,
+        mtime_ns: T_FILE,
+        size: 5,
+        content: Some(hello),
+        link_target: None,
+        hardlink_first: None,
+        xattrs: &[],
+    };
+    let xattrs = vec![
+        (b"user.b".to_vec(), b"2".to_vec()),
+        (b"user.a".to_vec(), b"11".to_vec()),
+    ];
+    let mut h = ManifestHasher::new(1);
+    h.push(&dir_entry(b"", 0o755, T_ROOT)).unwrap();
+    h.push(&ManifestEntry {
+        hardlink_first: Some(1),
+        ..file(b"f1")
+    })
+    .unwrap();
+    h.push(&ManifestEntry {
+        hardlink_first: Some(1),
+        ..file(b"f2")
+    })
+    .unwrap();
+    h.push(&ManifestEntry {
+        xattrs: &xattrs,
+        ..file(b"g")
+    })
+    .unwrap();
+    let ext = h.finish().ext;
+
+    let mut s = Vec::new();
+    // root
+    u32le(&mut s, 0);
+    s.push(0);
+    u32le(&mut s, 0o755);
+    s.extend_from_slice(&T_ROOT.to_le_bytes());
+    s.extend_from_slice(&u64::MAX.to_le_bytes());
+    u32le(&mut s, 0);
+    let file_bytes = |s: &mut Vec<u8>, name: &[u8], first: u64| {
+        u32le(s, name.len() as u32);
+        s.extend_from_slice(name);
+        s.push(1);
+        u32le(s, 0o644);
+        s.extend_from_slice(&T_FILE.to_le_bytes());
+        s.extend_from_slice(&5u64.to_le_bytes());
+        s.extend_from_slice(&hello.0);
+        s.extend_from_slice(&first.to_le_bytes());
+    };
+    file_bytes(&mut s, b"f1", 1);
+    u32le(&mut s, 0);
+    file_bytes(&mut s, b"f2", 1);
+    u32le(&mut s, 0);
+    file_bytes(&mut s, b"g", u64::MAX);
+    u32le(&mut s, 2);
+    for (n, v) in [(&b"user.a"[..], &b"11"[..]), (b"user.b", b"2")] {
+        u32le(&mut s, n.len() as u32);
+        s.extend_from_slice(n);
+        u32le(&mut s, v.len() as u32);
+        s.extend_from_slice(v);
+    }
+    (ext, s)
+}
+
+#[test]
+fn golden_ext_encoding() {
+    let (ext, stream) = synthetic_ext();
+    assert_eq!(Hash32::of(&stream), ext);
+    assert_eq!(
+        include_str!("vectors/manifest_ext_golden.hex").trim(),
+        ext.to_hex()
+    );
+}
+
+#[test]
+fn push_rejects_incomplete_entries() {
+    let mut h = ManifestHasher::new(1);
+    let mut e = dir_entry(b"s", 0o777, 0);
+    e.kind = EntryKind::Symlink;
+    assert!(matches!(h.push(&e), Err(Error::Corrupt(_))));
+    e.kind = EntryKind::File;
+    assert!(matches!(h.push(&e), Err(Error::Corrupt(_))));
+    assert_eq!(h.finish().entries, 0);
+}
+
+#[test]
+fn ignored_xattr_not_hashed_but_quarantine_is() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    golden_tree(a.path());
+    golden_tree(b.path());
+    let f = b.path().join("a.txt");
+    if xattr::set(&f, "com.apple.provenance", b"x").is_err() {
+        eprintln!("skip: xattrs unsupported");
+        return;
+    }
+    assert_eq!(
+        manifest_dir(a.path(), &opts(1)).unwrap(),
+        manifest_dir(b.path(), &opts(1)).unwrap()
+    );
+    if xattr::set(&f, "com.apple.quarantine", b"q").is_ok() {
+        assert_ne!(
+            manifest_dir(a.path(), &opts(1)).unwrap().ext,
+            manifest_dir(b.path(), &opts(1)).unwrap().ext
+        );
     }
 }
 
@@ -174,7 +317,7 @@ fn precision_zero_is_one_and_floor_is_euclidean() {
     };
     let run = |p: u64, m: i64| {
         let mut h = ManifestHasher::new(p);
-        h.push(&e(m));
+        h.push(&e(m)).unwrap();
         h.finish().core
     };
     assert_eq!(run(0, 7), run(1, 7));

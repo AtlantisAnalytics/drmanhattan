@@ -3,9 +3,10 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::BufReader;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::catalog::Catalog;
@@ -13,6 +14,11 @@ use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::model::{EntryKind, EntryRow, EntryStatus};
 use crate::walk::{walk, WalkEntry, WalkItem, WalkOptions};
+
+/// OS-managed, per-process xattrs that are neither recorded at ingest nor
+/// hashed (spec §4). Ingest must filter with this same list.
+/// `com.apple.quarantine` is deliberately NOT listed: it is meaningful data.
+pub const IGNORED_XATTRS: &[&[u8]] = &[b"com.apple.provenance"];
 
 #[derive(Debug, Clone, Copy)]
 pub struct ManifestOptions {
@@ -79,10 +85,11 @@ pub struct ManifestHasher {
     entries: u64,
 }
 
-fn put_u32(buf: &mut Vec<u8>, v: usize) {
-    // Lengths beyond u32 cannot occur for names, link targets or xattr values
-    // on supported filesystems; saturate rather than panic.
-    buf.extend_from_slice(&u32::try_from(v).unwrap_or(u32::MAX).to_le_bytes());
+fn put_u32(buf: &mut Vec<u8>, v: usize) -> Result<()> {
+    let v = u32::try_from(v)
+        .map_err(|_| Error::Corrupt("manifest field length exceeds u32".to_string()))?;
+    buf.extend_from_slice(&v.to_le_bytes());
+    Ok(())
 }
 
 impl ManifestHasher {
@@ -98,9 +105,12 @@ impl ManifestHasher {
     }
 
     /// Entries must be pushed in canonical order.
-    pub fn push(&mut self, e: &ManifestEntry) {
+    ///
+    /// Fails with `Corrupt` (leaving the hasher unchanged) if a length
+    /// exceeds `u32`, a symlink has no target, or a file has no content hash.
+    pub fn push(&mut self, e: &ManifestEntry) -> Result<()> {
         let mut buf = Vec::with_capacity(e.path.len() + 64);
-        put_u32(&mut buf, e.path.len());
+        put_u32(&mut buf, e.path.len())?;
         buf.extend_from_slice(e.path);
         buf.push(e.kind.as_u8());
         let mode = e.mode & 0o1777;
@@ -114,30 +124,37 @@ impl ManifestHasher {
                 buf.extend_from_slice(&mode.to_le_bytes());
                 buf.extend_from_slice(&mtime.to_le_bytes());
                 buf.extend_from_slice(&e.size.to_le_bytes());
-                buf.extend_from_slice(&e.content.map(|h| h.0).unwrap_or([0; 32]));
+                let c = e.content.ok_or_else(|| {
+                    Error::Corrupt(format!("file entry {:?} has no content hash", e.path))
+                })?;
+                buf.extend_from_slice(&c.0);
             }
             EntryKind::Symlink => {
-                let t = e.link_target.unwrap_or(&[]);
-                put_u32(&mut buf, t.len());
+                let t = e.link_target.ok_or_else(|| {
+                    Error::Corrupt(format!("symlink entry {:?} has no target", e.path))
+                })?;
+                put_u32(&mut buf, t.len())?;
                 buf.extend_from_slice(t);
             }
         }
-        self.core.update(&buf);
-        self.ext.update(&buf);
 
         let mut x = Vec::new();
         x.extend_from_slice(&e.hardlink_first.unwrap_or(u64::MAX).to_le_bytes());
         let mut xs: Vec<&(Vec<u8>, Vec<u8>)> = e.xattrs.iter().collect();
         xs.sort_by(|a, b| a.0.cmp(&b.0));
-        put_u32(&mut x, xs.len());
+        put_u32(&mut x, xs.len())?;
         for (name, value) in xs {
-            put_u32(&mut x, name.len());
+            put_u32(&mut x, name.len())?;
             x.extend_from_slice(name);
-            put_u32(&mut x, value.len());
+            put_u32(&mut x, value.len())?;
             x.extend_from_slice(value);
         }
+
+        self.core.update(&buf);
+        self.ext.update(&buf);
         self.ext.update(&x);
         self.entries += 1;
+        Ok(())
     }
 
     pub fn finish(self) -> ManifestHashes {
@@ -150,7 +167,11 @@ impl ManifestHasher {
 }
 
 fn hash_file(path: &Path) -> Result<Hash32> {
-    let f = File::open(path).map_err(|e| Error::io(path, e))?;
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| Error::io(path, e))?;
     let mut h = blake3::Hasher::new();
     h.update_reader(BufReader::with_capacity(1 << 20, f))
         .map_err(|e| Error::io(path, e))?;
@@ -173,6 +194,9 @@ fn read_xattrs(path: &Path, kind: EntryKind) -> Result<Vec<(Vec<u8>, Vec<u8>)>> 
     };
     let mut out = Vec::new();
     for name in names {
+        if IGNORED_XATTRS.contains(&name.as_bytes()) {
+            continue;
+        }
         match xattr::get(path, &name) {
             Ok(Some(v)) => out.push((name.into_vec(), v)),
             Ok(None) => {}
@@ -251,8 +275,7 @@ fn push_walk_entry(
         link_target: e.link_target.as_deref(),
         hardlink_first,
         xattrs: &xattrs,
-    });
-    Ok(())
+    })
 }
 
 fn included(row: &EntryRow) -> bool {
@@ -303,6 +326,11 @@ pub fn manifest_snapshot(
     opts: &ManifestOptions,
 ) -> Result<ManifestHashes> {
     let start = cat.entry_by_path(snapshot, root_path)?;
+    if !included(&start) {
+        return Err(Error::NotFound(format!(
+            "path {root_path:?} is withheld in snapshot {snapshot}"
+        )));
+    }
 
     let mut counts: HashMap<i64, u32> = HashMap::new();
     traverse(cat, snapshot, start.clone(), |row| {
@@ -362,7 +390,7 @@ pub fn manifest_snapshot(
             link_target: row.link_target.as_deref(),
             hardlink_first,
             xattrs: &xattrs,
-        });
+        })?;
         index += 1;
         Ok(())
     })?;
