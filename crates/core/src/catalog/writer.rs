@@ -78,42 +78,7 @@ fn run(path: PathBuf, rx: Receiver<CatalogOp>) -> Result<CatalogStats> {
 
 fn apply(conn: &Connection, op: CatalogOp) -> Result<()> {
     match op {
-        CatalogOp::UpsertSnapshot(s) => {
-            conn.prepare_cached(
-                "INSERT INTO snapshot(id, status, source_root, host, tool_version, started_at, \
-                 completed_at, note, manifest_hash, ext_manifest_hash, source_manifest_hash, \
-                 record_unit, entry_count, file_bytes, screened_out, label_pattern) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
-                 ON CONFLICT(id) DO UPDATE SET status=excluded.status, \
-                 source_root=excluded.source_root, host=excluded.host, \
-                 tool_version=excluded.tool_version, started_at=excluded.started_at, \
-                 completed_at=excluded.completed_at, note=excluded.note, \
-                 manifest_hash=excluded.manifest_hash, \
-                 ext_manifest_hash=excluded.ext_manifest_hash, \
-                 source_manifest_hash=excluded.source_manifest_hash, \
-                 record_unit=excluded.record_unit, entry_count=excluded.entry_count, \
-                 file_bytes=excluded.file_bytes, screened_out=excluded.screened_out, \
-                 label_pattern=excluded.label_pattern",
-            )?
-            .execute(params![
-                s.id,
-                s.status.as_str(),
-                s.source_root,
-                s.host,
-                s.tool_version,
-                s.started_at,
-                s.completed_at,
-                s.note,
-                s.manifest_hash,
-                s.ext_manifest_hash,
-                s.source_manifest_hash,
-                s.record_unit,
-                s.entry_count,
-                s.file_bytes,
-                s.screened_out,
-                s.label_pattern,
-            ])?;
-        }
+        CatalogOp::UpsertSnapshot(s) => upsert_snapshot(conn, &s)?,
         CatalogOp::InsertEntry(e) => {
             conn.prepare_cached(
                 "INSERT INTO entry(id, snapshot_id, parent_id, name, path, kind, mode, \
@@ -195,5 +160,45 @@ fn apply(conn: &Connection, op: CatalogOp) -> Result<()> {
         }
         CatalogOp::Commit => {}
     }
+    Ok(())
+}
+
+/// Insert or fully replace a snapshot row. Shared by the writer thread's
+/// `UpsertSnapshot` op and `Catalog::upsert_snapshot`.
+pub(super) fn upsert_snapshot(conn: &Connection, s: &SnapshotRow) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO snapshot(id, status, source_root, host, tool_version, started_at, \
+         completed_at, note, manifest_hash, ext_manifest_hash, source_manifest_hash, \
+         record_unit, entry_count, file_bytes, screened_out, label_pattern) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
+         ON CONFLICT(id) DO UPDATE SET status=excluded.status, \
+         source_root=excluded.source_root, host=excluded.host, \
+         tool_version=excluded.tool_version, started_at=excluded.started_at, \
+         completed_at=excluded.completed_at, note=excluded.note, \
+         manifest_hash=excluded.manifest_hash, \
+         ext_manifest_hash=excluded.ext_manifest_hash, \
+         source_manifest_hash=excluded.source_manifest_hash, \
+         record_unit=excluded.record_unit, entry_count=excluded.entry_count, \
+         file_bytes=excluded.file_bytes, screened_out=excluded.screened_out, \
+         label_pattern=excluded.label_pattern",
+    )?
+    .execute(params![
+        s.id,
+        s.status.as_str(),
+        s.source_root,
+        s.host,
+        s.tool_version,
+        s.started_at,
+        s.completed_at,
+        s.note,
+        s.manifest_hash,
+        s.ext_manifest_hash,
+        s.source_manifest_hash,
+        s.record_unit,
+        s.entry_count,
+        s.file_bytes,
+        s.screened_out,
+        s.label_pattern,
+    ])?;
     Ok(())
 }

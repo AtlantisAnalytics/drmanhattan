@@ -392,6 +392,13 @@ impl Catalog {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
     }
+
+    /// Insert or replace a snapshot row directly (autocommit), for writes made
+    /// after the writer thread has finished. Same SQL as
+    /// `CatalogOp::UpsertSnapshot`.
+    pub fn upsert_snapshot(&self, s: &SnapshotRow) -> Result<()> {
+        writer::upsert_snapshot(&self.conn, s)
+    }
 }
 
 fn unsupported_version(v: i64) -> Error {

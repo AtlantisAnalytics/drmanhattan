@@ -26,6 +26,18 @@ pub enum SkipReason {
     OtherFilesystem,
 }
 
+impl SkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkipReason::Socket => "socket",
+            SkipReason::Fifo => "fifo",
+            SkipReason::CharDevice => "char_device",
+            SkipReason::BlockDevice => "block_device",
+            SkipReason::OtherFilesystem => "other_filesystem",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WalkEntry {
     pub depth: u32,

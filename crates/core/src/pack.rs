@@ -28,8 +28,8 @@ const RECORD_MARKER: u32 = 0x574D_4B52;
 const FILE_HEADER_LEN: u64 = 26;
 /// Bytes covered by the CRC: kind, compression, hash, raw_len, stored_len.
 const CRC_SPAN: usize = 50;
-/// Marker + CRC span + CRC.
-const RECORD_HEADER_LEN: usize = 4 + CRC_SPAN + 4;
+/// Bytes of a record before its payload: marker + CRC span + CRC.
+pub const RECORD_HEADER_LEN: usize = 4 + CRC_SPAN + 4;
 /// count (8) + pack_blake3 (32) + footer_offset (8) + magic (8): footer with no entries.
 const FOOTER_FIXED_LEN: u64 = 8 + 32 + 8 + 8;
 

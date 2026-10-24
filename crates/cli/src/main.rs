@@ -26,6 +26,8 @@ pub struct Cli {
 pub enum Command {
     /// Create a new repository
     Init(cmd::init::InitArgs),
+    /// Snapshot a directory into the repository
+    Ingest(cmd::ingest::IngestArgs),
     /// Compute the manifest hash of a live directory
     Manifest(cmd::manifest::ManifestArgs),
 }
@@ -41,11 +43,16 @@ pub fn exit_code(err: &anyhow::Error) -> i32 {
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
-        Command::Init(args) => cmd::init::run(&cli, args),
-        Command::Manifest(args) => cmd::manifest::run(&cli, args),
+        Command::Init(args) => cmd::init::run(&cli, args).map(|()| 0),
+        Command::Ingest(args) => cmd::ingest::run(&cli, args),
+        Command::Manifest(args) => cmd::manifest::run(&cli, args).map(|()| 0),
     };
-    if let Err(err) = result {
-        eprintln!("error: {err}");
-        std::process::exit(exit_code(&err));
+    match result {
+        Ok(0) => {}
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(exit_code(&err));
+        }
     }
 }
