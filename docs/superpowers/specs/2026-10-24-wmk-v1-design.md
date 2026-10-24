@@ -260,18 +260,20 @@ footer : (only on seal) record count u64 | [unit_hash, offset u64]* | pack_blake
 
 ### 6.3 Snapshot record unit
 
-When an ingest finishes, wmk writes one `snapshot_record` unit. It is a zstd-compressed CBOR document containing:
+When an ingest finishes, wmk serializes a CBOR document (the snapshot record) containing:
 
 - the snapshot row
 - every entry, with its UUID
 - the `content → [unit_hash]` lists for contents this snapshot references
 - xattrs, provenance, and screen hits
 
+The document is chunked with the binary profile and stored as ordinary `raw_chunk` units, so a 100M-entry record never exceeds pack limits. A small `snapshot_record` unit then holds `{snapshot_id, document_blake3, document_size, [chunk unit hashes]}`, and `snapshot.record_unit` points at it.
+
 This record makes the packs the source of truth. Labels and media are derived data, so they are recomputed rather than recovered.
 
 ### 6.4 Canonical manifest encoding
 
-`manifest_hash = BLAKE3(encoding)`. The encoding is the sequence of entries sorted bytewise by `path`, where each entry is:
+`manifest_hash = BLAKE3(encoding)`. The encoding is the sequence of entries in **canonical order**: depth-first pre-order, with each directory's children sorted bytewise by name. This order can be produced while streaming. It differs from sorting full paths, because `/` (0x2F) sorts after `-` (0x2D). Each entry is:
 
 ```
 path_len u32 | path bytes | kind u8 (0 dir, 1 file, 2 symlink)
@@ -284,7 +286,7 @@ The root entry has `path = ""` and is included.
 
 `ext_manifest_hash` uses the same encoding, followed after each entry by:
 
-- the canonical hardlink group: the index of the group's lexicographically first path, or `u64::MAX`
+- the canonical hardlink group: the canonical-order index of the group's first entry, as a u64, or `u64::MAX` if the entry is not hard-linked
 - the sorted xattrs: `name_len | name | value_len | value`
 
 UUIDs, labels, media, provenance, and snapshot metadata are never hashed.
@@ -430,7 +432,9 @@ Legal and process note (not a software requirement): the reporting protocol, inc
    - Probe the destination filesystem for case sensitivity and name-byte preservation by creating and checking test files in the parent directory.
    - If any two entries collide on a case-insensitive destination, abort and list the collisions.
    - If any name would not round-trip byte-exact (non-UTF-8 names on APFS, or normalization on HFS+), abort and list the names.
+   - If any restored path would exceed the destination's `PATH_MAX` (from `pathconf`; 1024 on macOS), abort and list the paths.
    - Probe mtime precision and record any expected precision loss.
+   - With `--path <prefix>`, the entry at `prefix` becomes `dest` itself: restoring `train/explicit` to `./val` produces `./val/0001.jpg`. `manifest(dest)` then equals the manifest of that subtree, which is what `diff --path` compares.
 2. **Write.**
    - Write everything into `<dest>.wmk-partial-<snapshot-id>` and rename it to `dest` at the end.
    - Create directories with temporary mode `0o700`.
@@ -585,6 +589,8 @@ Each core module has one job and a narrow interface. For example, `pack` knows n
 ## 15. Error handling principles
 
 - Never modify the source directory.
+- Refuse to ingest when the repo is inside the source tree or the source is inside the repo.
+- An unreadable file (permission denied, or vanished between walk and read) fails the ingest and names the file. v1 never skips it silently.
 - Never overwrite an existing restore destination.
 - Fail closed, both on screening and on any integrity mismatch.
 - Every withheld, skipped, or unstable entry is listed in the command's report. Nothing is dropped silently.
