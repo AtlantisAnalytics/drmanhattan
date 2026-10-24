@@ -26,6 +26,8 @@ pub struct Cli {
 pub enum Command {
     /// Create a new repository
     Init(cmd::init::InitArgs),
+    /// Compute the manifest hash of a live directory
+    Manifest(cmd::manifest::ManifestArgs),
 }
 
 /// Map an error to a process exit code. Core errors are 1; later tasks add 2 and 3.
@@ -40,6 +42,7 @@ fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
         Command::Init(args) => cmd::init::run(&cli, args),
+        Command::Manifest(args) => cmd::manifest::run(&cli, args),
     };
     if let Err(err) = result {
         eprintln!("error: {err}");

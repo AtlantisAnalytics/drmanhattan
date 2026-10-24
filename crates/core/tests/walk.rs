@@ -32,14 +32,32 @@ fn find<'a>(es: &'a [WalkEntry], path: &[u8]) -> &'a WalkEntry {
 fn canonical_order() {
     let d = tempfile::tempdir().unwrap();
     let mut t = TreeBuilder::new(d.path());
-    t.file(b"a/x", b"1")
-        .file(b"a-c", b"2")
-        .file(b"a/y", b"3")
-        .file(b"b", b"4");
+    // Created deliberately out of sorted order. `m` is a nested directory that
+    // is not the first child, and `a-c` sorts after `a` by name even though
+    // `a/x` sorts after `a-c` as a full path.
+    t.file(b"z", b"0")
+        .file(b"m/q", b"1")
+        .file(b"m/b/deep", b"2")
+        .file(b"a-c", b"3")
+        .file(b"a/y", b"4")
+        .file(b"a/x", b"5")
+        .file(b"b", b"6");
     t.finish();
     let es = entries(d.path());
     let paths: Vec<&[u8]> = es.iter().map(|e| e.path.as_slice()).collect();
-    let want: Vec<&[u8]> = vec![b"", b"a", b"a/x", b"a/y", b"a-c", b"b"];
+    let want: Vec<&[u8]> = vec![
+        b"",
+        b"a",
+        b"a/x",
+        b"a/y",
+        b"a-c",
+        b"b",
+        b"m",
+        b"m/b",
+        b"m/b/deep",
+        b"m/q",
+        b"z",
+    ];
     assert_eq!(paths, want);
     assert_eq!(es[0].depth, 0);
     assert_eq!(es[0].kind, EntryKind::Dir);
@@ -118,6 +136,21 @@ fn negative_mtime() {
     t.finish();
     let es = entries(d.path());
     assert_eq!(find(&es, b"old").mtime_ns, -86_400_000_000_000);
+}
+
+#[test]
+fn negative_mtime_with_nsec() {
+    let d = tempfile::tempdir().unwrap();
+    let mut t = TreeBuilder::new(d.path());
+    t.file(b"old", b"x").mtime(b"old", -1_500_000_000);
+    t.finish();
+    let es = entries(d.path());
+    if find(&es, b"old").mtime_ns != -1_500_000_000 {
+        // Filesystems that cannot hold sub-second pre-epoch times round it.
+        eprintln!("skip: filesystem cannot hold negative ns mtime");
+        return;
+    }
+    assert_eq!(find(&es, b"old").mtime_ns, -1_500_000_000);
 }
 
 #[test]

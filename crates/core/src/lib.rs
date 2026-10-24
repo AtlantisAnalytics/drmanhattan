@@ -4,6 +4,7 @@ pub mod compress;
 pub mod config;
 pub mod error;
 pub mod ids;
+pub mod manifest;
 pub mod model;
 pub mod pack;
 pub mod repo;

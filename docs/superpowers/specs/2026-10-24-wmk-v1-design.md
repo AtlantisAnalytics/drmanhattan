@@ -289,7 +289,7 @@ The root entry has `path = ""` and is included.
 
 `ext_manifest_hash` uses the same encoding, followed after each entry by:
 
-- the canonical hardlink group: the canonical-order index of the group's first entry, as a u64, or `u64::MAX` if the entry is not hard-linked
+- the canonical hardlink group: the canonical-order index (0-based position in the hashed sequence, root = 0) of the group's first entry, as a u64, or `u64::MAX` if the entry is not hard-linked. A group counts only if at least two of its members are inside the tree being hashed; every member of such a group, including the first, carries the first member's index. A file with `nlink > 1` that has a single member in the tree gets `u64::MAX`, because restoring it yields an unlinked file.
 - the sorted xattrs: `name_len | name | value_len | value`
 
 UUIDs, labels, media, provenance, and snapshot metadata are never hashed.
