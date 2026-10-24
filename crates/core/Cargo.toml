@@ -11,9 +11,11 @@ test-seams = []
 blake3 = "1.8.7"
 crc32c = "0.6.8"
 fastcdc = "5.0.0"
+filetime = "0.2.29"
 fs4 = { version = "1.1.0", features = ["sync"] }
 hex = "0.4.3"
 infer = "0.22.0"
+libc = "0.2.191"
 rusqlite = { version = "0.41.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"

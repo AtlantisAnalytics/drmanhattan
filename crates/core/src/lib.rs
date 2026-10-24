@@ -8,3 +8,4 @@ pub mod model;
 pub mod pack;
 pub mod repo;
 pub mod sniff;
+pub mod walk;
