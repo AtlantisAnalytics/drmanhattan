@@ -7,14 +7,20 @@
 //! 1. one `header` (`version`, the final snapshot row with `record_unit`
 //!    unset: a row cannot name its own record),
 //! 2. one `entry` per entry,
-//! 3. one `content` per distinct content the snapshot references, with its
-//!    unit hashes in `seq` order,
-//! 4. one `xattr` per xattr row.
+//! 3. one `content` per distinct content the snapshot references: its row
+//!    and its unit hashes in `seq` order,
+//! 4. one `xattr` per xattr row,
+//! 5. one `provenance` per provenance row (optional; Plan 1 writes none),
+//! 6. one `screen_hit` per screen hit (optional; Plan 1 writes none).
 //!
-//! Each item is a CBOR map tagged by its `t` field. Byte strings (names,
-//! paths, ids, hashes) are CBOR byte strings. The document is chunked with
-//! the binary profile into `raw_chunk` units; a `snapshot_record` unit then
-//! holds the CBOR `RecordIndex` naming the chunks.
+//! Each item is a CBOR map tagged by its `t` field; spec §6.3 lists every
+//! field. Byte strings (names, paths, ids, hashes) are CBOR byte strings.
+//! The document is chunked with the binary profile into `raw_chunk` units;
+//! a `snapshot_record` unit then holds the CBOR `RecordIndex` naming them.
+//!
+//! The item kinds and their fields are permanent for `VERSION` 1. Adding any
+//! other item kind, or changing a field, requires bumping `VERSION`: a v1
+//! reader rejects an unknown item kind as corrupt.
 
 use super::{Halt, Stage};
 use crate::catalog::Catalog;
@@ -23,8 +29,11 @@ use crate::compress::encode;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
-use crate::model::{EntryKind, EntryRow, EntryStatus, SnapshotRow, SnapshotStatus, UnitRow};
+use crate::model::{
+    ContentRow, EntryKind, EntryRow, EntryStatus, SnapshotRow, SnapshotStatus, UnitRow,
+};
 use crate::pack::{RecordHeader, UnitKind};
+use crate::sniff::{Format, ProfileKind};
 use crate::unitread::UnitReader;
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
@@ -34,7 +43,8 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Version of the record document format.
+/// Version of the record document format. Bump it for any new item kind
+/// or field change (see the module doc).
 const VERSION: u32 = 1;
 
 /// A decoded snapshot record, held in memory (tests and Plan 1 callers).
@@ -42,8 +52,42 @@ const VERSION: u32 = 1;
 pub struct SnapshotRecord {
     pub snapshot: SnapshotRow,
     pub entries: Vec<EntryRow>,
-    pub contents: Vec<(Hash32, Vec<Hash32>)>,
+    /// Each content row with its unit hashes in `seq` order.
+    pub contents: Vec<(ContentRow, Vec<Hash32>)>,
     pub xattrs: Vec<(Id, Vec<u8>, Vec<u8>)>,
+    /// Empty in Plan 1.
+    pub provenance: Vec<ProvenanceRecord>,
+    /// Empty in Plan 1.
+    pub screen_hits: Vec<ScreenHitRecord>,
+}
+
+/// A `provenance` row (spec §6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenanceRecord {
+    pub entry: Id,
+    pub source: String,
+    pub url: Option<String>,
+    pub fetched_at: Option<i64>,
+    pub last_modified: Option<i64>,
+    pub server_ip: Option<String>,
+    pub http_headers: Option<String>,
+}
+
+/// A `screen_hit` row (spec §6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenHitRecord {
+    pub id: i64,
+    pub snapshot_id: Id,
+    pub entry_id: Id,
+    pub verdict: String,
+    pub screener: String,
+    pub list_version: Option<String>,
+    pub blake3: Hash32,
+    pub md5: Option<Vec<u8>>,
+    pub sha1: Option<Vec<u8>>,
+    pub sha256: Option<Vec<u8>>,
+    pub detail: Option<String>,
+    pub detected_at: i64,
 }
 
 // ---- wire types -----------------------------------------------------------
@@ -161,6 +205,33 @@ struct WireEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct WireProvenance {
+    entry: B16,
+    source: String,
+    url: Option<String>,
+    fetched_at: Option<i64>,
+    last_modified: Option<i64>,
+    server_ip: Option<String>,
+    http_headers: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireScreenHit {
+    id: i64,
+    snapshot_id: B16,
+    entry_id: B16,
+    verdict: String,
+    screener: String,
+    list_version: Option<String>,
+    blake3: B32,
+    md5: Option<Bin>,
+    sha1: Option<Bin>,
+    sha256: Option<Bin>,
+    detail: Option<String>,
+    detected_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Item {
     Header {
@@ -170,6 +241,12 @@ enum Item {
     Entry(WireEntry),
     Content {
         hash: B32,
+        size: i64,
+        /// `Format::as_str`, or null when the catalog has none.
+        format: Option<String>,
+        /// `ProfileKind::as_str`: the chunk profile actually used.
+        profile: String,
+        unit_count: i64,
         units: Vec<B32>,
     },
     Xattr {
@@ -177,6 +254,8 @@ enum Item {
         name: Bin,
         value: Bin,
     },
+    Provenance(WireProvenance),
+    ScreenHit(WireScreenHit),
 }
 
 impl Item {
@@ -187,6 +266,8 @@ impl Item {
             Item::Entry(_) => 1,
             Item::Content { .. } => 2,
             Item::Xattr { .. } => 3,
+            Item::Provenance(_) => 4,
+            Item::ScreenHit(_) => 5,
         }
     }
 }
@@ -297,6 +378,83 @@ impl TryFrom<WireEntry> for EntryRow {
     }
 }
 
+impl From<WireProvenance> for ProvenanceRecord {
+    fn from(p: WireProvenance) -> ProvenanceRecord {
+        ProvenanceRecord {
+            entry: p.entry.0,
+            source: p.source,
+            url: p.url,
+            fetched_at: p.fetched_at,
+            last_modified: p.last_modified,
+            server_ip: p.server_ip,
+            http_headers: p.http_headers,
+        }
+    }
+}
+
+impl From<WireScreenHit> for ScreenHitRecord {
+    fn from(h: WireScreenHit) -> ScreenHitRecord {
+        ScreenHitRecord {
+            id: h.id,
+            snapshot_id: h.snapshot_id.0,
+            entry_id: h.entry_id.0,
+            verdict: h.verdict,
+            screener: h.screener,
+            list_version: h.list_version,
+            blake3: h.blake3.0,
+            md5: h.md5.map(|b| b.0),
+            sha1: h.sha1.map(|b| b.0),
+            sha256: h.sha256.map(|b| b.0),
+            detail: h.detail,
+            detected_at: h.detected_at,
+        }
+    }
+}
+
+fn content_item(c: ContentRow, units: Vec<Hash32>) -> Item {
+    Item::Content {
+        hash: B32(c.hash),
+        size: c.size,
+        format: c.format.map(|f| f.as_str().to_string()),
+        profile: c.profile.as_str().to_string(),
+        unit_count: c.unit_count,
+        units: units.into_iter().map(B32).collect(),
+    }
+}
+
+fn content_row(
+    hash: B32,
+    size: i64,
+    format: Option<String>,
+    profile: String,
+    unit_count: i64,
+    units: Vec<B32>,
+) -> Result<(ContentRow, Vec<Hash32>)> {
+    if usize::try_from(unit_count).ok() != Some(units.len()) {
+        return Err(corrupt(format!(
+            "content {} has unit_count {unit_count} but lists {} units",
+            hash.0,
+            units.len()
+        )));
+    }
+    let format = match format {
+        Some(f) => {
+            Some(Format::from_str(&f).ok_or_else(|| corrupt(format!("unknown format {f:?}")))?)
+        }
+        None => None,
+    };
+    let profile = ProfileKind::parse(&profile)
+        .ok_or_else(|| corrupt(format!("unknown profile {profile:?}")))?;
+    let row = ContentRow {
+        hash: hash.0,
+        size,
+        format,
+        profile,
+        unit_count,
+    };
+    Ok((row, units.into_iter().map(|u| u.0).collect()))
+}
+
 // ---- writing --------------------------------------------------------------
 
 /// Removes the temp document when dropped, on success and on error.
@@ -405,12 +563,8 @@ fn write_document(cat: &Catalog, snapshot: &SnapshotRow, path: &Path) -> Result<
     cat.for_each_entry(snapshot.id, |e| {
         to_cbor(&Item::Entry(e.into()), &mut w, path)
     })?;
-    cat.for_each_snapshot_content(snapshot.id, |hash, units| {
-        let item = Item::Content {
-            hash: B32(hash),
-            units: units.into_iter().map(B32).collect(),
-        };
-        to_cbor(&item, &mut w, path)
+    cat.for_each_snapshot_content(snapshot.id, |content, units| {
+        to_cbor(&content_item(content, units), &mut w, path)
     })?;
     cat.for_each_snapshot_xattr(snapshot.id, |entry, name, value| {
         let item = Item::Xattr {
@@ -497,6 +651,8 @@ fn parse_document(r: &mut impl BufRead) -> Result<SnapshotRecord> {
     let mut entries = Vec::new();
     let mut contents = Vec::new();
     let mut xattrs = Vec::new();
+    let mut provenance = Vec::new();
+    let mut screen_hits = Vec::new();
     let mut section = 0u8;
     loop {
         if r.fill_buf().map_err(from_io)?.is_empty() {
@@ -519,10 +675,17 @@ fn parse_document(r: &mut impl BufRead) -> Result<SnapshotRecord> {
                 snapshot = Some(SnapshotRow::try_from(w)?);
             }
             Item::Entry(w) => entries.push(EntryRow::try_from(w)?),
-            Item::Content { hash, units } => {
-                contents.push((hash.0, units.into_iter().map(|u| u.0).collect()))
-            }
+            Item::Content {
+                hash,
+                size,
+                format,
+                profile,
+                unit_count,
+                units,
+            } => contents.push(content_row(hash, size, format, profile, unit_count, units)?),
             Item::Xattr { entry, name, value } => xattrs.push((entry.0, name.0, value.0)),
+            Item::Provenance(p) => provenance.push(p.into()),
+            Item::ScreenHit(h) => screen_hits.push(h.into()),
         }
     }
     let snapshot = snapshot.ok_or_else(|| corrupt("empty document"))?;
@@ -537,6 +700,8 @@ fn parse_document(r: &mut impl BufRead) -> Result<SnapshotRecord> {
         entries,
         contents,
         xattrs,
+        provenance,
+        screen_hits,
     })
 }
 
@@ -632,6 +797,17 @@ mod tests {
         out
     }
 
+    fn content(units: &[&[u8]]) -> (ContentRow, Vec<Hash32>) {
+        let row = ContentRow {
+            hash: Hash32::of(b"c"),
+            size: 12,
+            format: Some(Format::Html),
+            profile: ProfileKind::Text,
+            unit_count: units.len() as i64,
+        };
+        (row, units.iter().map(|u| Hash32::of(u)).collect())
+    }
+
     fn header(s: &SnapshotRow) -> Item {
         Item::Header {
             version: VERSION,
@@ -647,10 +823,7 @@ mod tests {
         let doc = encode_items(&[
             header(&s),
             Item::Entry(e.clone().into()),
-            Item::Content {
-                hash: B32(Hash32::of(b"c")),
-                units: vec![B32(Hash32::of(b"u1")), B32(Hash32::of(b"u2"))],
-            },
+            content_item(content(&[b"u1", b"u2"]).0, content(&[b"u1", b"u2"]).1),
             Item::Xattr {
                 entry: B16(e.id),
                 name: Bin(b"user.x".to_vec()),
@@ -660,24 +833,129 @@ mod tests {
         let rec = parse_document(&mut &doc[..]).unwrap();
         assert_eq!(rec.snapshot, s);
         assert_eq!(rec.entries, vec![e.clone()]);
-        assert_eq!(
-            rec.contents,
-            vec![(Hash32::of(b"c"), vec![Hash32::of(b"u1"), Hash32::of(b"u2")])]
-        );
+        assert_eq!(rec.contents, vec![content(&[b"u1", b"u2"])]);
         assert_eq!(rec.xattrs, vec![(e.id, b"user.x".to_vec(), big)]);
+        assert!(rec.provenance.is_empty() && rec.screen_hits.is_empty());
+    }
+
+    #[test]
+    fn optional_provenance_and_screen_hit_sections_roundtrip() {
+        let s = snapshot();
+        let e = entry(s.id);
+        let doc = encode_items(&[
+            header(&s),
+            Item::Entry(e.clone().into()),
+            Item::Provenance(WireProvenance {
+                entry: B16(e.id),
+                source: "wget_layout".into(),
+                url: Some("https://example.com/a".into()),
+                fetched_at: Some(-3),
+                last_modified: None,
+                server_ip: Some("192.0.2.1".into()),
+                http_headers: Some("{\"etag\":\"x\"}".into()),
+            }),
+            Item::ScreenHit(WireScreenHit {
+                id: 9,
+                snapshot_id: B16(s.id),
+                entry_id: B16(e.id),
+                verdict: "match".into(),
+                screener: "list-a".into(),
+                list_version: None,
+                blake3: B32(Hash32::of(b"hit")),
+                md5: Some(Bin(vec![1; 16])),
+                sha1: None,
+                sha256: Some(Bin(vec![2; 32])),
+                detail: Some("d".into()),
+                detected_at: 42,
+            }),
+        ]);
+        let rec = parse_document(&mut &doc[..]).unwrap();
+        assert_eq!(
+            rec.provenance,
+            vec![ProvenanceRecord {
+                entry: e.id,
+                source: "wget_layout".into(),
+                url: Some("https://example.com/a".into()),
+                fetched_at: Some(-3),
+                last_modified: None,
+                server_ip: Some("192.0.2.1".into()),
+                http_headers: Some("{\"etag\":\"x\"}".into()),
+            }]
+        );
+        assert_eq!(
+            rec.screen_hits,
+            vec![ScreenHitRecord {
+                id: 9,
+                snapshot_id: s.id,
+                entry_id: e.id,
+                verdict: "match".into(),
+                screener: "list-a".into(),
+                list_version: None,
+                blake3: Hash32::of(b"hit"),
+                md5: Some(vec![1; 16]),
+                sha1: None,
+                sha256: Some(vec![2; 32]),
+                detail: Some("d".into()),
+                detected_at: 42,
+            }]
+        );
+    }
+
+    #[test]
+    fn content_unit_count_must_match() {
+        let s = snapshot();
+        let (row, units) = content(&[b"u1", b"u2"]);
+        let bad = ContentRow {
+            unit_count: 3,
+            ..row
+        };
+        let doc = encode_items(&[header(&s), content_item(bad, units)]);
+        let err = parse_document(&mut &doc[..]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Corrupt(m) if m.contains("unit_count")),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn misordered_or_damaged_documents_are_corrupt() {
         let s = snapshot();
         let e = entry(s.id);
-        let content = || Item::Content {
-            hash: B32(Hash32::of(b"c")),
-            units: Vec::new(),
+        let content = || {
+            let (row, units) = content(&[]);
+            content_item(row, units)
+        };
+        let screen_hit = || {
+            Item::ScreenHit(WireScreenHit {
+                id: 1,
+                snapshot_id: B16(s.id),
+                entry_id: B16(e.id),
+                verdict: "error".into(),
+                screener: "x".into(),
+                list_version: None,
+                blake3: B32(Hash32::of(b"h")),
+                md5: None,
+                sha1: None,
+                sha256: None,
+                detail: None,
+                detected_at: 0,
+            })
+        };
+        let provenance = || {
+            Item::Provenance(WireProvenance {
+                entry: B16(e.id),
+                source: "jsonl".into(),
+                url: None,
+                fetched_at: None,
+                last_modified: None,
+                server_ip: None,
+                http_headers: None,
+            })
         };
         let bad = [
             encode_items(&[Item::Entry(e.clone().into())]),
             encode_items(&[header(&s), content(), Item::Entry(e.clone().into())]),
+            encode_items(&[header(&s), screen_hit(), provenance()]),
             encode_items(&[header(&s), header(&s)]),
             encode_items(&[header(&s), Item::Entry(entry(Id::new_v7()).into())]),
             Vec::new(),

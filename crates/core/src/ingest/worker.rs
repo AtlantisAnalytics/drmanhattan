@@ -18,11 +18,11 @@ use crate::compress::encode;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
-use crate::model::{ContentRow, EntryKind, EntryStatus};
+use crate::model::{ContentRow, EntryStatus};
 use crate::pack::{RecordHeader, UnitKind};
 use crate::sniff::{detect, profile_kind, Format, ProfileKind};
 use crate::walk::{mtime_ns, WalkEntry};
-use crate::xattrs::read_xattrs;
+use crate::xattrs::read_file_xattrs;
 use crossbeam_channel::{Receiver, Sender};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -97,23 +97,27 @@ impl Worker<'_> {
         let (mut file, meta) = open_walked_file(&abs, &entry)?;
         let walked: Stamp = (entry.size, entry.mtime_ns);
         let before = stamp(&meta, &abs)?;
-        let mut pass = self.read_pass(&mut file, before.0, &entry.name, &abs)?;
+        let pass = self.read_pass(&mut file, before.0, &entry.name, &abs)?;
         fail::fail_point!("ingest::after_read");
-        let mut after = fstamp(&file, &abs)?;
-        let mut status = EntryStatus::Ok;
-        if walked != before || before != after {
+        let after = fstamp(&file, &abs)?;
+        let (pass, after, status) = if walked == before && before == after {
+            (pass, after, EntryStatus::Ok)
+        } else {
+            // Free the first read's buffers before reading the file again.
+            drop(pass);
             let before = fstamp(&file, &abs)?;
-            pass = self.read_pass(&mut file, before.0, &entry.name, &abs)?;
+            let pass = self.read_pass(&mut file, before.0, &entry.name, &abs)?;
             fail::fail_point!("ingest::after_read");
-            after = fstamp(&file, &abs)?;
-            if before != after {
-                if !self.allow_unstable {
-                    return Err(Error::Unstable(abs));
-                }
-                status = EntryStatus::Unstable;
+            let after = fstamp(&file, &abs)?;
+            if before == after {
+                (pass, after, EntryStatus::Ok)
+            } else if self.allow_unstable {
+                (pass, after, EntryStatus::Unstable)
+            } else {
+                return Err(Error::Unstable(abs));
             }
-        }
-        let xattrs = read_xattrs(&abs, EntryKind::File)?;
+        };
+        let xattrs = read_file_xattrs(&file, &abs)?;
         let ReadPass {
             head,
             format,

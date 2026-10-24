@@ -10,7 +10,7 @@ use drmanhattan_core::ids::Hash32;
 use drmanhattan_core::ingest::record::read_record;
 use drmanhattan_core::ingest::{self, IngestOptions, IngestReport};
 use drmanhattan_core::manifest::{manifest_dir, ManifestOptions};
-use drmanhattan_core::model::{EntryRow, SnapshotStatus};
+use drmanhattan_core::model::{ContentRow, EntryRow, SnapshotStatus};
 use drmanhattan_core::repo::Repo;
 use drmanhattan_core::unitread::{UnitReader, DEFAULT_CACHE_BYTES};
 use drmanhattan_core::walk::SkipReason;
@@ -80,6 +80,49 @@ fn hardlinks_grouped() {
     let live = manifest_dir(&src, &mopts()).unwrap();
     let s = cat.snapshot(r.snapshot).unwrap();
     assert_eq!(s.manifest_hash, Some(live.core));
+    assert_eq!(s.ext_manifest_hash, Some(live.ext));
+}
+
+#[test]
+fn hardlink_partner_outside_tree() {
+    let (tmp, repo, src) = setup();
+    let outside = tmp.path().join("outside");
+    std::fs::write(&outside, b"shared inode").unwrap();
+    std::fs::hard_link(&outside, src.join("inside")).unwrap();
+    let r = ingest(&repo, &src);
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    // Grouped by nlink alone (R9); the manifest ignores single-member groups.
+    let e = cat.entry_by_path(r.snapshot, b"inside").unwrap();
+    assert!(e.hardlink_group.is_some());
+    let live = manifest_dir(&src, &mopts()).unwrap();
+    let s = cat.snapshot(r.snapshot).unwrap();
+    assert_eq!(s.manifest_hash, Some(live.core));
+    assert_eq!(s.ext_manifest_hash, Some(live.ext));
+}
+
+#[test]
+fn symlink_xattrs_recorded_where_supported() {
+    let (_tmp, repo, src) = setup();
+    let mut t = TreeBuilder::new(&src);
+    t.file(b"f", b"body").symlink(b"l", b"f");
+    // `xattr::set` does not follow the link. Linux refuses user.* xattrs on
+    // symlinks (EPERM); macOS allows them.
+    if let Err(e) = xattr::set(src.join("l"), XATTR, b"on the link") {
+        eprintln!("skipping: symlink xattrs unsupported here: {e}");
+        return;
+    }
+    assert!(xattr::get(src.join("f"), XATTR).unwrap().is_none());
+    let r = ingest(&repo, &src);
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    let l = cat.entry_by_path(r.snapshot, b"l").unwrap();
+    assert_eq!(
+        cat.xattrs(l.id).unwrap(),
+        vec![(XATTR.as_bytes().to_vec(), b"on the link".to_vec())]
+    );
+    let f = cat.entry_by_path(r.snapshot, b"f").unwrap();
+    assert!(cat.xattrs(f.id).unwrap().is_empty());
+    let live = manifest_dir(&src, &mopts()).unwrap();
+    let s = cat.snapshot(r.snapshot).unwrap();
     assert_eq!(s.ext_manifest_hash, Some(live.ext));
 }
 
@@ -167,7 +210,7 @@ fn assert_record_matches_catalog(repo: &Repo, r: &IngestReport) {
     let snap = cat.snapshot(r.snapshot).unwrap();
     assert_eq!(snap.status, SnapshotStatus::Complete);
     let unit = snap.record_unit.expect("record_unit set");
-    let reader = UnitReader::new(repo, &cat, DEFAULT_CACHE_BYTES);
+    let reader = UnitReader::new(repo, DEFAULT_CACHE_BYTES);
     let rec = read_record(&reader, &cat, &unit).unwrap();
 
     // The record holds the final row, minus its own record unit.
@@ -188,14 +231,19 @@ fn assert_record_matches_catalog(repo: &Repo, r: &IngestReport) {
     assert_eq!(rec.entries.len(), got.len(), "duplicate entry paths");
     assert_eq!(got, expected);
 
-    let mut want: BTreeMap<Hash32, Vec<Hash32>> = BTreeMap::new();
+    let mut want: BTreeMap<Hash32, (ContentRow, Vec<Hash32>)> = BTreeMap::new();
     for e in expected.values() {
         if let Some(h) = e.content_hash {
             let units = cat.content_units(&h).unwrap();
-            want.insert(h, units.iter().map(|u| u.hash).collect());
+            let row = cat.content(&h).unwrap();
+            want.insert(h, (row, units.iter().map(|u| u.hash).collect()));
         }
     }
-    let have: BTreeMap<Hash32, Vec<Hash32>> = rec.contents.iter().cloned().collect();
+    let have: BTreeMap<Hash32, (ContentRow, Vec<Hash32>)> = rec
+        .contents
+        .iter()
+        .map(|(c, u)| (c.hash, (c.clone(), u.clone())))
+        .collect();
     assert_eq!(rec.contents.len(), have.len(), "duplicate contents");
     assert_eq!(have, want);
 

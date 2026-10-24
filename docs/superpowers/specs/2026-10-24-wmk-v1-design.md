@@ -265,14 +265,26 @@ footer : (only on seal) record count u64 | [unit_hash, offset u64]* | pack_blake
 
 ### 6.3 Snapshot record unit
 
-When an ingest finishes, wmk serializes a CBOR document (the snapshot record) containing:
+When an ingest finishes, wmk writes a document (the snapshot record) after every other row of the snapshot is committed. The document is a CBOR sequence (RFC 8742): a concatenation of CBOR items with no framing. It is streamed, so it never has to sit in memory.
 
-- the snapshot row
-- every entry, with its UUID
-- the `content → [unit_hash]` lists for contents this snapshot references
-- xattrs, provenance, and screen hits
+Each item is a CBOR map with a text field `t` naming its kind, plus the fields below. Field names are text keys. Ids (16 bytes), hashes (32 bytes), and raw-byte fields (`bin`) are CBOR byte strings. `int` is a CBOR integer, `text` is a CBOR text string, and `?` marks a field that may be CBOR null. Enum fields hold the catalog's strings from §6.1.
 
-The document is chunked with the binary profile and stored as ordinary `raw_chunk` units, so a 100M-entry record never exceeds pack limits. A small `snapshot_record` unit then holds `{snapshot_id, document_blake3, document_size, [chunk unit hashes]}`, and `snapshot.record_unit` points at it.
+Items appear in this order. Within a section, items may appear in any order.
+
+| # | `t` | Count | Fields |
+|---|---|---|---|
+| 1 | `header` | exactly 1 | `version` int (= 1), `snapshot` map: the snapshot row, with every §6.1 column as a field (`id` id, `status` text, `source_root` bin, `host` text, `tool_version` text, `started_at` int, `completed_at` int?, `note` text?, `manifest_hash` hash?, `ext_manifest_hash` hash?, `source_manifest_hash` hash?, `record_unit` hash?, `entry_count` int?, `file_bytes` int?, `screened_out` int, `label_pattern` text?) |
+| 2 | `entry` | one per entry | every §6.1 `entry` column: `id` id, `snapshot_id` id, `parent_id` id?, `name` bin, `path` bin, `kind` text, `mode` int, `mtime_ns` int, `size` int?, `content_hash` hash?, `link_target` bin?, `hardlink_group` int?, `status` text |
+| 3 | `content` | one per distinct content the snapshot references | `hash` hash, `size` int, `format` text?, `profile` text, `unit_count` int, `units` array of hashes in `seq` order (`unit_count` must equal its length) |
+| 4 | `xattr` | one per xattr row | `entry` id, `name` bin, `value` bin |
+| 5 | `provenance` | optional, one per provenance row | `entry` id, `source` text, `url` text?, `fetched_at` int?, `last_modified` int?, `server_ip` text?, `http_headers` text? |
+| 6 | `screen_hit` | optional, one per screen hit | `id` int, `snapshot_id` id, `entry_id` id, `verdict` text, `screener` text, `list_version` text?, `blake3` hash, `md5` bin?, `sha1` bin?, `sha256` bin?, `detail` text?, `detected_at` int |
+
+- The header's snapshot row is the final row (`status = complete`, with its hashes and `completed_at`), except that `record_unit` is null: a row cannot contain its own record unit.
+- Sections 5 and 6 are reserved for provenance and screening. v1 writes none, but a v1 reader must accept and return them.
+- Adding any other item kind, or changing any field, requires a new `version`. A reader rejects an unknown kind, an unknown version, or out-of-order items as corruption.
+
+The document is chunked with the binary profile and stored as ordinary `raw_chunk` units, so a 100M-entry record never exceeds pack limits. A small `snapshot_record` unit then holds the CBOR map `{snapshot_id: id, document_blake3: hash, document_size: int, chunks: [chunk unit hashes]}`, and `snapshot.record_unit` points at it. A reader verifies every chunk, then the document's BLAKE3 and size.
 
 This record makes the packs the source of truth. Labels and media are derived data, so they are recomputed rather than recovered.
 

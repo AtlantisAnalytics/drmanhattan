@@ -410,29 +410,32 @@ impl Catalog {
         Ok(())
     }
 
-    /// Stream each distinct content referenced by `snapshot` with its unit
-    /// hashes in `seq` order. Only one content's unit list is held at a time.
+    /// Stream each distinct content referenced by `snapshot`: its row and
+    /// its unit hashes in `seq` order. Only one content's unit list is held
+    /// at a time.
     pub fn for_each_snapshot_content(
         &self,
         snapshot: Id,
-        mut f: impl FnMut(Hash32, Vec<Hash32>) -> Result<()>,
+        mut f: impl FnMut(ContentRow, Vec<Hash32>) -> Result<()>,
     ) -> Result<()> {
         // LEFT JOIN: an empty file's content has no units but is still listed.
+        // Columns 0..5 are CONTENT_COLS, so `content_from_row` applies.
         let mut stmt = self.conn.prepare(
-            "SELECT c.hash, cu.unit_hash FROM content c \
-             LEFT JOIN content_unit cu ON cu.content_hash = c.hash \
+            "SELECT c.hash, c.size, c.format, c.profile, c.unit_count, cu.unit_hash \
+             FROM content c LEFT JOIN content_unit cu ON cu.content_hash = c.hash \
              WHERE c.hash IN (SELECT content_hash FROM entry \
              WHERE snapshot_id = ?1 AND content_hash IS NOT NULL) \
              ORDER BY c.hash, cu.seq",
         )?;
         let mut rows = stmt.query([snapshot])?;
-        let mut cur: Option<(Hash32, Vec<Hash32>)> = None;
+        let mut cur: Option<(ContentRow, Vec<Hash32>)> = None;
         while let Some(r) = rows.next()? {
-            let (content, unit): (Hash32, Option<Hash32>) = (r.get(0)?, r.get(1)?);
+            let unit: Option<Hash32> = r.get(5)?;
+            let hash: Hash32 = r.get(0)?;
             match &mut cur {
-                Some((c, units)) if *c == content => units.extend(unit),
+                Some((c, units)) if c.hash == hash => units.extend(unit),
                 _ => {
-                    let next = (content, unit.into_iter().collect());
+                    let next = (content_from_row(r)?, unit.into_iter().collect());
                     if let Some((c, units)) = cur.replace(next) {
                         f(c, units)?;
                     }

@@ -2,7 +2,6 @@
 //! are kept in a byte-bounded LRU cache. Every unit read from a pack is
 //! verified against its hash before it is returned or cached.
 
-use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::model::UnitRow;
@@ -25,20 +24,24 @@ struct Cache {
 }
 
 impl Cache {
+    /// Evicts before adding, so `bytes <= cap` holds throughout and the sum
+    /// never exceeds `cap` (no overflow even for a cap near `usize::MAX`).
     fn insert(&mut self, hash: Hash32, data: Arc<Vec<u8>>) {
-        if data.len() > self.cap {
+        let len = data.len();
+        if len > self.cap {
             return;
         }
-        self.bytes += data.len();
-        if let Some(old) = self.lru.put(hash, data) {
+        if let Some(old) = self.lru.pop(&hash) {
             self.bytes -= old.len();
         }
-        while self.bytes > self.cap {
+        while self.bytes > self.cap - len {
             match self.lru.pop_lru() {
                 Some((_, evicted)) => self.bytes -= evicted.len(),
                 None => break,
             }
         }
+        self.bytes += len;
+        self.lru.put(hash, data);
     }
 }
 
@@ -53,11 +56,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl UnitReader {
-    /// Units name their pack and offset, so reads need no catalog lookups;
-    /// `_cat` ties the reader to the catalog its `UnitRow`s come from.
+    /// Units name their pack and offset, so reads need no catalog lookups.
     /// `cache_bytes` bounds the decoded bytes kept cached; a unit larger
     /// than that is never cached.
-    pub fn new(repo: &Repo, _cat: &Catalog, cache_bytes: usize) -> UnitReader {
+    pub fn new(repo: &Repo, cache_bytes: usize) -> UnitReader {
         UnitReader {
             packs_dir: repo.packs_dir(),
             packs: Mutex::new(HashMap::new()),
@@ -126,7 +128,6 @@ mod tests {
     struct Fixture {
         _tmp: tempfile::TempDir,
         repo: Repo,
-        cat: Catalog,
         units: Vec<(UnitRow, Vec<u8>)>,
     }
 
@@ -134,7 +135,6 @@ mod tests {
     fn fixture(payloads: &[Vec<u8>]) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repo::init(&tmp.path().join("r")).unwrap();
-        let cat = Catalog::open(&repo.catalog_path()).unwrap();
         let id = Id::new_v7();
         let mut w = PackWriter::create(&repo.packs_dir(), id).unwrap();
         let mut units = Vec::new();
@@ -162,7 +162,6 @@ mod tests {
         Fixture {
             _tmp: tmp,
             repo,
-            cat,
             units,
         }
     }
@@ -171,7 +170,7 @@ mod tests {
     fn reads_verified_units_and_streams_content() {
         assert_send_sync::<UnitReader>();
         let f = fixture(&[b"hello ".to_vec(), b"world".to_vec()]);
-        let r = UnitReader::new(&f.repo, &f.cat, DEFAULT_CACHE_BYTES);
+        let r = UnitReader::new(&f.repo, DEFAULT_CACHE_BYTES);
         for (row, bytes) in &f.units {
             assert_eq!(*r.read_unit(row).unwrap(), *bytes);
         }
@@ -185,7 +184,7 @@ mod tests {
     #[test]
     fn hash_mismatch_is_corrupt() {
         let f = fixture(&[b"payload".to_vec()]);
-        let r = UnitReader::new(&f.repo, &f.cat, DEFAULT_CACHE_BYTES);
+        let r = UnitReader::new(&f.repo, DEFAULT_CACHE_BYTES);
         let mut row = f.units[0].0.clone();
         row.hash = Hash32::of(b"something else");
         assert!(matches!(r.read_unit(&row), Err(Error::Corrupt(_))));
@@ -200,7 +199,7 @@ mod tests {
         let mut payloads = payloads;
         payloads.push(vec![9u8; 500]);
         let f = fixture(&payloads);
-        let r = UnitReader::new(&f.repo, &f.cat, 250);
+        let r = UnitReader::new(&f.repo, 250);
         for (row, _) in &f.units[..4] {
             r.read_unit(row).unwrap();
             let c = lock(&r.cache);
@@ -221,9 +220,22 @@ mod tests {
     }
 
     #[test]
+    fn huge_cap_does_not_overflow() {
+        let f = fixture(&[vec![1u8; 64], vec![2u8; 64]]);
+        let r = UnitReader::new(&f.repo, usize::MAX);
+        for (row, _) in &f.units {
+            r.read_unit(row).unwrap();
+        }
+        // Re-inserting a cached key replaces it without double counting.
+        lock(&r.cache).insert(f.units[0].0.hash, Arc::new(vec![1u8; 64]));
+        let c = lock(&r.cache);
+        assert_eq!((c.lru.len(), c.bytes), (2, 128));
+    }
+
+    #[test]
     fn cached_hit_avoids_the_pack() {
         let f = fixture(&[b"cached".to_vec()]);
-        let r = UnitReader::new(&f.repo, &f.cat, DEFAULT_CACHE_BYTES);
+        let r = UnitReader::new(&f.repo, DEFAULT_CACHE_BYTES);
         let row = &f.units[0].0;
         r.read_unit(row).unwrap();
         lock(&r.packs).clear();
