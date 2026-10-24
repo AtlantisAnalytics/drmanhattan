@@ -8,6 +8,7 @@ failpoints = []
 
 [dependencies]
 blake3 = "1.8.7"
+crc32c = "0.6.8"
 fastcdc = "5.0.0"
 fs4 = { version = "1.1.0", features = ["sync"] }
 hex = "0.4.3"

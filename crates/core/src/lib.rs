@@ -3,5 +3,6 @@ pub mod compress;
 pub mod config;
 pub mod error;
 pub mod ids;
+pub mod pack;
 pub mod repo;
 pub mod sniff;
