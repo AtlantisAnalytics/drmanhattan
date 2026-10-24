@@ -393,6 +393,77 @@ impl Catalog {
         )
     }
 
+    /// Stream every entry of `snapshot`, ordered by path, without loading
+    /// them all.
+    pub fn for_each_entry(
+        &self,
+        snapshot: Id,
+        mut f: impl FnMut(EntryRow) -> Result<()>,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ENTRY_COLS} FROM entry WHERE snapshot_id = ?1 ORDER BY path"
+        ))?;
+        let mut rows = stmt.query([snapshot])?;
+        while let Some(r) = rows.next()? {
+            f(entry_from_row(r)?)?;
+        }
+        Ok(())
+    }
+
+    /// Stream each distinct content referenced by `snapshot` with its unit
+    /// hashes in `seq` order. Only one content's unit list is held at a time.
+    pub fn for_each_snapshot_content(
+        &self,
+        snapshot: Id,
+        mut f: impl FnMut(Hash32, Vec<Hash32>) -> Result<()>,
+    ) -> Result<()> {
+        // LEFT JOIN: an empty file's content has no units but is still listed.
+        let mut stmt = self.conn.prepare(
+            "SELECT c.hash, cu.unit_hash FROM content c \
+             LEFT JOIN content_unit cu ON cu.content_hash = c.hash \
+             WHERE c.hash IN (SELECT content_hash FROM entry \
+             WHERE snapshot_id = ?1 AND content_hash IS NOT NULL) \
+             ORDER BY c.hash, cu.seq",
+        )?;
+        let mut rows = stmt.query([snapshot])?;
+        let mut cur: Option<(Hash32, Vec<Hash32>)> = None;
+        while let Some(r) = rows.next()? {
+            let (content, unit): (Hash32, Option<Hash32>) = (r.get(0)?, r.get(1)?);
+            match &mut cur {
+                Some((c, units)) if *c == content => units.extend(unit),
+                _ => {
+                    let next = (content, unit.into_iter().collect());
+                    if let Some((c, units)) = cur.replace(next) {
+                        f(c, units)?;
+                    }
+                }
+            }
+        }
+        if let Some((c, units)) = cur {
+            f(c, units)?;
+        }
+        Ok(())
+    }
+
+    /// Stream every xattr row of `snapshot`'s entries as
+    /// `(entry, name, value)`, ordered by entry id then name.
+    pub fn for_each_snapshot_xattr(
+        &self,
+        snapshot: Id,
+        mut f: impl FnMut(Id, Vec<u8>, Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT x.entry_id, x.name, x.value FROM xattr x \
+             JOIN entry e ON e.id = x.entry_id WHERE e.snapshot_id = ?1 \
+             ORDER BY x.entry_id, x.name",
+        )?;
+        let mut rows = stmt.query([snapshot])?;
+        while let Some(r) = rows.next()? {
+            f(r.get(0)?, r.get(1)?, r.get(2)?)?;
+        }
+        Ok(())
+    }
+
     /// Insert or replace a snapshot row directly (autocommit), for writes made
     /// after the writer thread has finished. Same SQL as
     /// `CatalogOp::UpsertSnapshot`.

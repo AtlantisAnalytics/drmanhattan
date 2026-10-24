@@ -10,4 +10,6 @@ pub mod model;
 pub mod pack;
 pub mod repo;
 pub mod sniff;
+pub mod unitread;
 pub mod walk;
+pub(crate) mod xattrs;

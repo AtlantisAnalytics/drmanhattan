@@ -68,7 +68,8 @@ struct Frame {
     names: Vec<Vec<u8>>,
 }
 
-fn mtime_ns(meta: &Metadata, abs: &Path) -> Result<i64> {
+/// `st_mtime` in nanoseconds; `abs` names the file in the error.
+pub(crate) fn mtime_ns(meta: &Metadata, abs: &Path) -> Result<i64> {
     meta.mtime()
         .checked_mul(1_000_000_000)
         .and_then(|s| s.checked_add(meta.mtime_nsec()))

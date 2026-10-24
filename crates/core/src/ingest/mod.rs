@@ -11,9 +11,15 @@
 //! never holds a row referencing unsynced pack bytes (the §7 ordering
 //! invariant), even when the pipeline aborts and the writer commits on close.
 //!
-//! Manifest hashes are computed at finish from the committed catalog with
-//! `manifest_snapshot`, the same code `verify` uses.
+//! Finish runs while storage is still alive: once the walker and workers are
+//! done, a `Flush` makes every row durable in the catalog; the manifest
+//! hashes are computed from it with `manifest_snapshot` (the same code
+//! `verify` uses); the snapshot record is built from it and its units go
+//! through storage like any other; a second `Flush` commits them. Only
+//! then is storage closed (sealing the open pack), every thread joined, and
+//! the snapshot row marked complete with its `record_unit`.
 
+pub mod record;
 pub mod screen;
 mod storage;
 mod worker;
@@ -26,8 +32,9 @@ use crate::manifest::{manifest_snapshot, ManifestOptions};
 use crate::model::{EntryKind, EntryRow, EntryStatus, SnapshotRow, SnapshotStatus};
 use crate::repo::Repo;
 use crate::walk::{walk, SkipReason, WalkEntry, WalkItem, WalkOptions};
+use crate::xattrs::read_xattrs;
 use screen::{NoopScreener, Screener};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -101,7 +108,7 @@ pub fn run(repo: &Repo, source: &Path, opts: &IngestOptions) -> Result<IngestRep
         label_pattern: None,
     };
     let result = pipeline(repo, &source, opts, &snap, &NoopScreener)
-        .and_then(|out| finish(repo, &snap, out, started));
+        .and_then(|out| finish(repo, out, started));
     if result.is_err() {
         mark_failed(repo, &snap);
     }
@@ -129,11 +136,24 @@ fn mark_failed(repo: &Repo, snap: &SnapshotRow) {
 }
 
 struct PipelineOutput {
+    /// Stats as of the first flush: the snapshot's entries and the file
+    /// units it added, excluding its record's units.
     stats: StorageStats,
     skipped: Vec<(Vec<u8>, SkipReason)>,
+    /// The final snapshot row, `record_unit` included.
+    row: SnapshotRow,
+    manifest_hash: Hash32,
+}
+
+/// What the finish phase produced before storage was closed.
+struct Sealed {
+    stats: StorageStats,
+    row: SnapshotRow,
+    manifest_hash: Hash32,
 }
 
 /// Why a pipeline stage stopped before finishing.
+#[derive(Debug)]
 pub(crate) enum Halt {
     /// Another stage failed (abort flag set, or a channel closed).
     Aborted,
@@ -223,7 +243,7 @@ fn pipeline(
     };
     let shared = Shared::new();
     let mut skipped = Vec::new();
-    let mut stats = None;
+    let mut sealed = None;
 
     let (cat_tx, cat_rx) = mpsc::sync_channel(CATALOG_QUEUE);
     let writer = spawn_catalog_writer(repo.catalog_path(), cat_rx);
@@ -240,6 +260,7 @@ fn pipeline(
             claimed: &claimed,
             screener,
             shared: &shared,
+            allow_unstable: opts.allow_unstable,
         };
         let worker = &worker;
         let shared = &shared;
@@ -254,11 +275,13 @@ fn pipeline(
                     shared,
                     stage: "storage",
                 };
-                Storage::open(repo, cat_tx, barrier_ops)
+                // The report's stats come from the finish phase's flush.
+                let run = Storage::open(repo, cat_tx, barrier_ops)
                     .map_err(Halt::from)
-                    .and_then(|st| st.run(&st_rx, shared))
-                    .map_err(|h| shared.halt(h))
-                    .ok()
+                    .and_then(|st| st.run(&st_rx, shared));
+                if let Err(h) = run {
+                    shared.halt(h);
+                }
             });
             let pool: Vec<_> = (0..workers)
                 .map(|_| {
@@ -279,16 +302,22 @@ fn pipeline(
 
             walk_source(source, opts, snap.id, &job_tx, &st_tx, shared, &mut skipped);
             drop(job_tx);
-            drop(st_tx);
 
             for h in pool {
                 if h.join().is_err() {
                     shared.fail(panicked("worker"));
                 }
             }
-            match storage.join() {
-                Ok(s) => stats = s,
-                Err(_) => shared.fail(panicked("storage")),
+            if !shared.aborted() {
+                match seal_snapshot(repo, snap, &st_tx) {
+                    Ok(s) => sealed = Some(s),
+                    Err(h) => shared.halt(h),
+                }
+            }
+            // Closing the last sender lets storage seal its pack and stop.
+            drop(st_tx);
+            if storage.join().is_err() {
+                shared.fail(panicked("storage"));
             }
         });
     } else {
@@ -303,8 +332,76 @@ fn pipeline(
     if let Some(e) = shared.take_error() {
         return Err(e);
     }
-    let stats = stats.ok_or_else(|| Error::Corrupt("ingest stopped without an error".into()))?;
-    Ok(PipelineOutput { stats, skipped })
+    let sealed = sealed.ok_or_else(|| Error::Corrupt("ingest stopped without an error".into()))?;
+    Ok(PipelineOutput {
+        stats: sealed.stats,
+        skipped,
+        row: sealed.row,
+        manifest_hash: sealed.manifest_hash,
+    })
+}
+
+/// Commit everything storage has received and return its stats. Fails with
+/// `Aborted` if storage or the catalog writer stopped (they record why).
+fn flush(storage: &crossbeam_channel::Sender<StorageMsg>) -> Stage<StorageStats> {
+    let (reply, replied) = mpsc::channel();
+    storage
+        .send(StorageMsg::Flush(reply))
+        .map_err(|_| Halt::Aborted)?;
+    replied.recv().map_err(|_| Halt::Aborted)
+}
+
+/// The finish phase, run with storage still alive once the walker and
+/// workers are done: commit, hash, then write and commit the record.
+fn seal_snapshot(
+    repo: &Repo,
+    snap: &SnapshotRow,
+    storage: &crossbeam_channel::Sender<StorageMsg>,
+) -> Stage<Sealed> {
+    let stats = flush(storage)?;
+    let cat = Catalog::open_readonly(&repo.catalog_path())?;
+    let h = manifest_snapshot(
+        &cat,
+        snap.id,
+        b"",
+        &ManifestOptions {
+            mtime_precision_ns: 1,
+            cross_fs: false,
+        },
+    )?;
+    // The record holds this row; a row cannot contain its own record unit.
+    let row = SnapshotRow {
+        status: SnapshotStatus::Complete,
+        completed_at: Some(now_ns()?),
+        manifest_hash: Some(h.core),
+        ext_manifest_hash: Some(h.ext),
+        // Plan 1 ingests with no filtering, so the source manifest is the core one.
+        source_manifest_hash: Some(h.core),
+        record_unit: None,
+        entry_count: Some(to_i64(stats.entries, "entry count")?),
+        file_bytes: Some(to_i64(stats.file_bytes, "file bytes")?),
+        ..snap.clone()
+    };
+    let unit = record::write_record(
+        &cat,
+        &row,
+        &repo.tmp_dir(),
+        &repo.config,
+        |header, payload| {
+            storage
+                .send(StorageMsg::Unit(header, payload))
+                .map_err(|_| Halt::Aborted)
+        },
+    )?;
+    flush(storage)?;
+    Ok(Sealed {
+        stats,
+        row: SnapshotRow {
+            record_unit: Some(unit),
+            ..row
+        },
+        manifest_hash: h.core,
+    })
 }
 
 /// Walk on the caller's thread: files go to the workers, dirs and symlinks
@@ -320,6 +417,8 @@ fn walk_source(
 ) {
     // Ids of the directories on the current path, indexed by depth.
     let mut parents: Vec<Id> = Vec::new();
+    // Hard-link groups by (dev, ino), numbered from 1 per snapshot.
+    let mut groups: HashMap<(u64, u64), i64> = HashMap::new();
     let mut halted = false;
     let wopts = WalkOptions {
         cross_fs: opts.cross_fs,
@@ -338,25 +437,40 @@ fn walk_source(
         if entry.kind == EntryKind::Dir {
             parents.push(id);
         }
-        let sent = !shared.aborted()
-            && if entry.kind == EntryKind::File {
-                let abs = source.join(OsStr::from_bytes(&entry.path));
-                jobs.send(FileJob {
-                    id,
-                    parent,
-                    abs,
-                    entry,
+        if shared.aborted() {
+            halted = true;
+            return Err(Error::Corrupt("walk halted".into()));
+        }
+        let abs = if entry.path.is_empty() {
+            source.to_path_buf()
+        } else {
+            source.join(OsStr::from_bytes(&entry.path))
+        };
+        let sent = if entry.kind == EntryKind::File {
+            let hardlink_group = (entry.nlink > 1).then(|| {
+                let next = groups.len() as i64 + 1;
+                *groups.entry((entry.dev, entry.ino)).or_insert(next)
+            });
+            jobs.send(FileJob {
+                id,
+                parent,
+                abs,
+                entry,
+                hardlink_group,
+            })
+            .is_ok()
+        } else {
+            // Files' xattrs are read by the worker that reads the file.
+            let xattrs = read_xattrs(&abs, entry.kind)?;
+            let row = entry_row(snapshot, id, parent, entry, None, None);
+            storage
+                .send(StorageMsg::Entry {
+                    row,
+                    content_known: false,
+                    xattrs,
                 })
                 .is_ok()
-            } else {
-                let row = entry_row(snapshot, id, parent, entry, None, None);
-                storage
-                    .send(StorageMsg::Entry {
-                        row,
-                        content_known: false,
-                    })
-                    .is_ok()
-            };
+        };
         if sent {
             Ok(())
         } else {
@@ -398,42 +512,21 @@ fn entry_row(
     }
 }
 
-fn finish(
-    repo: &Repo,
-    snap: &SnapshotRow,
-    out: PipelineOutput,
-    started: Instant,
-) -> Result<IngestReport> {
-    let PipelineOutput { stats, skipped } = out;
-    let cat = Catalog::open(&repo.catalog_path())?;
-    let h = manifest_snapshot(
-        &cat,
-        snap.id,
-        b"",
-        &ManifestOptions {
-            mtime_precision_ns: 1,
-            cross_fs: false,
-        },
-    )?;
-    let row = SnapshotRow {
-        status: SnapshotStatus::Complete,
-        completed_at: Some(now_ns()?),
-        manifest_hash: Some(h.core),
-        ext_manifest_hash: Some(h.ext),
-        // Plan 1 ingests with no filtering, so the source manifest is the core one.
-        source_manifest_hash: Some(h.core),
-        entry_count: Some(to_i64(stats.entries, "entry count")?),
-        file_bytes: Some(to_i64(stats.file_bytes, "file bytes")?),
-        ..snap.clone()
-    };
-    cat.upsert_snapshot(&row)?;
+fn finish(repo: &Repo, out: PipelineOutput, started: Instant) -> Result<IngestReport> {
+    let PipelineOutput {
+        stats,
+        skipped,
+        row,
+        manifest_hash,
+    } = out;
+    Catalog::open(&repo.catalog_path())?.upsert_snapshot(&row)?;
     let dedup_ratio = if stats.new_bytes_stored == 0 {
         0.0
     } else {
         stats.file_bytes as f64 / stats.new_bytes_stored as f64
     };
     Ok(IngestReport {
-        snapshot: snap.id,
+        snapshot: row.id,
         entries: stats.entries,
         files: stats.files,
         bytes_read: stats.file_bytes,
@@ -441,9 +534,9 @@ fn finish(
         new_bytes_stored: stats.new_bytes_stored,
         dedup_ratio,
         skipped,
-        unstable: Vec::new(),
+        unstable: stats.unstable,
         withheld: 0,
-        manifest_hash: h.core,
+        manifest_hash,
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     })
 }

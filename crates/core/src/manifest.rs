@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::BufReader;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -14,6 +14,7 @@ use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::model::{EntryKind, EntryRow, EntryStatus};
 use crate::walk::{walk, WalkEntry, WalkItem, WalkOptions};
+use crate::xattrs::read_xattrs;
 
 /// OS-managed, per-process xattrs that are neither recorded at ingest nor
 /// hashed (spec §4). Ingest must filter with this same list.
@@ -176,35 +177,6 @@ fn hash_file(path: &Path) -> Result<Hash32> {
     h.update_reader(BufReader::with_capacity(1 << 20, f))
         .map_err(|e| Error::io(path, e))?;
     Ok(Hash32(*h.finalize().as_bytes()))
-}
-
-fn read_xattrs(path: &Path, kind: EntryKind) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    // `xattr::list` / `xattr::get` do not follow symlinks.
-    let names = match xattr::list(path) {
-        Ok(n) => n,
-        Err(e) => {
-            let code = e.raw_os_error();
-            let unsupported = code == Some(libc::ENOTSUP);
-            let link_perm = kind == EntryKind::Symlink && code == Some(libc::EPERM);
-            if unsupported || link_perm {
-                return Ok(Vec::new());
-            }
-            return Err(Error::io(path, e));
-        }
-    };
-    let mut out = Vec::new();
-    for name in names {
-        if IGNORED_XATTRS.contains(&name.as_bytes()) {
-            continue;
-        }
-        match xattr::get(path, &name) {
-            Ok(Some(v)) => out.push((name.into_vec(), v)),
-            Ok(None) => {}
-            Err(e) => return Err(Error::io(path, e)),
-        }
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
 }
 
 pub fn manifest_dir(root: &Path, opts: &ManifestOptions) -> Result<ManifestHashes> {

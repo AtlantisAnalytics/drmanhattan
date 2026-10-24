@@ -10,46 +10,66 @@
 //! `UpsertPack(size = header)`, which must not overwrite the synced length.
 //!
 //! Foreign-key order is kept here: a pack row precedes its units, units
-//! precede their content, and a file entry whose content is still in flight
-//! (claimed by another worker) is parked until that content is inserted.
+//! precede their content, an entry precedes its xattrs, and a file entry
+//! whose content is still in flight (claimed by another worker) is parked,
+//! with its xattrs, until that content is inserted.
+//!
+//! `Flush` lets the finish phase read the catalog while storage stays alive:
+//! storage runs a barrier, waits until the catalog writer has committed
+//! everything forwarded so far, and only then replies.
 
 use super::{Halt, Shared, Stage};
 use crate::catalog::writer::CatalogOp;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
-use crate::model::{ContentRow, EntryKind, EntryRow, PackRow, UnitRow};
+use crate::model::{ContentRow, EntryKind, EntryRow, EntryStatus, PackRow, UnitRow};
 use crate::pack::{PackWriter, RecordHeader, RECORD_HEADER_LEN};
 use crate::repo::Repo;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
 /// Commit barrier: after this many buffered ops, or this much time.
 pub(super) const BARRIER_OPS: usize = 10_000;
 const BARRIER_INTERVAL: Duration = Duration::from_secs(1);
 
+/// An entry's xattrs, sorted by name.
+pub(super) type Xattrs = Vec<(Vec<u8>, Vec<u8>)>;
+
 pub(super) enum StorageMsg {
-    /// An entry row. `content_known` is set when the worker found the
-    /// entry's content already committed in the catalog.
-    Entry { row: EntryRow, content_known: bool },
+    /// An entry row and its xattrs. `content_known` is set when the worker
+    /// found the entry's content already committed in the catalog.
+    Entry {
+        row: EntryRow,
+        content_known: bool,
+        xattrs: Xattrs,
+    },
     /// A content new to the repository, with its units in `seq` order.
     NewContent {
         content: ContentRow,
         units: Vec<(RecordHeader, Vec<u8>)>,
         media: Option<(u32, u32)>,
     },
+    /// A unit outside any content (the snapshot record's units), stored
+    /// unless it already exists.
+    Unit(RecordHeader, Vec<u8>),
+    /// Commit everything received so far, then reply with the stats. A
+    /// dropped reply sender means storage or the catalog writer stopped.
+    Flush(Sender<StorageStats>),
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct StorageStats {
     pub entries: u64,
     pub files: u64,
     pub file_bytes: u64,
     pub new_units: u64,
     pub new_bytes_stored: u64,
+    /// Paths of the entries stored with `status = unstable`.
+    pub unstable: Vec<Vec<u8>>,
 }
 
 struct OpenPack {
@@ -70,8 +90,9 @@ pub(super) struct Storage {
     written_units: HashSet<Hash32>,
     /// Contents inserted during this run.
     inserted_contents: HashSet<Hash32>,
-    /// File entries waiting for their content's `NewContent`.
-    pending: HashMap<Hash32, Vec<EntryRow>>,
+    /// File entries (with their xattrs) waiting for their content's
+    /// `NewContent`.
+    pending: HashMap<Hash32, Vec<(EntryRow, Xattrs)>>,
     /// Ops not yet forwarded; flushed at the next barrier.
     buf: Vec<CatalogOp>,
     /// Barrier once `buf` holds this many ops.
@@ -121,14 +142,18 @@ impl Storage {
         self.finish()
     }
 
-    fn handle(&mut self, msg: StorageMsg) -> Result<()> {
+    fn handle(&mut self, msg: StorageMsg) -> Stage<()> {
         match msg {
-            StorageMsg::Entry { row, content_known } => {
+            StorageMsg::Entry {
+                row,
+                content_known,
+                xattrs,
+            } => {
                 match row.content_hash {
                     Some(h) if !content_known && !self.inserted_contents.contains(&h) => {
-                        self.pending.entry(h).or_default().push(row);
+                        self.pending.entry(h).or_default().push((row, xattrs));
                     }
-                    _ => self.push_entry(row),
+                    _ => self.push_entry(row, xattrs),
                 }
                 Ok(())
             }
@@ -136,17 +161,61 @@ impl Storage {
                 content,
                 units,
                 media,
-            } => self.new_content(content, units, media),
+            } => Ok(self.new_content(content, units, media)?),
+            StorageMsg::Unit(header, payload) => Ok(self.store_unit(&header, &payload)?),
+            StorageMsg::Flush(reply) => self.flush(reply),
         }
     }
 
-    fn push_entry(&mut self, row: EntryRow) {
+    fn push_entry(&mut self, row: EntryRow, xattrs: Xattrs) {
         self.stats.entries += 1;
         if row.kind == EntryKind::File {
             self.stats.files += 1;
             self.stats.file_bytes += row.size.and_then(|s| u64::try_from(s).ok()).unwrap_or(0);
         }
+        if row.status == EntryStatus::Unstable {
+            self.stats.unstable.push(row.path.clone());
+        }
+        let id = row.id;
         self.buf.push(CatalogOp::InsertEntry(row));
+        for (name, value) in xattrs {
+            self.buf.push(CatalogOp::InsertXattr(id, name, value));
+        }
+    }
+
+    /// Append `header`'s unit unless this run or an earlier one stored it.
+    fn store_unit(&mut self, header: &RecordHeader, payload: &[u8]) -> Result<()> {
+        if !self.written_units.contains(&header.unit_hash)
+            && !self.cat.has_unit(&header.unit_hash)?
+        {
+            self.append(header, payload)?;
+        }
+        Ok(())
+    }
+
+    /// Barrier, then wait for the writer to commit, then reply. Called once
+    /// every producer of entries has finished, so nothing may be parked.
+    fn flush(&mut self, reply: Sender<StorageStats>) -> Stage<()> {
+        self.check_pending()?;
+        self.barrier()?;
+        let (ack, acked) = mpsc::channel();
+        self.out
+            .send(CatalogOp::Sync(ack))
+            .map_err(|_| Halt::Aborted)?;
+        acked.recv().map_err(|_| Halt::Aborted)?;
+        // The requester may have stopped waiting; it then sees the abort.
+        let _ = reply.send(self.stats.clone());
+        Ok(())
+    }
+
+    fn check_pending(&self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let n: usize = self.pending.values().map(Vec::len).sum();
+        Err(Error::Corrupt(format!(
+            "{n} entries reference content that was never stored"
+        )))
     }
 
     fn new_content(
@@ -158,11 +227,7 @@ impl Storage {
         let mut hashes = Vec::with_capacity(units.len());
         for (header, payload) in units {
             hashes.push(header.unit_hash);
-            if !self.written_units.contains(&header.unit_hash)
-                && !self.cat.has_unit(&header.unit_hash)?
-            {
-                self.append(&header, &payload)?;
-            }
+            self.store_unit(&header, &payload)?;
         }
         let hash = content.hash;
         self.buf.push(CatalogOp::InsertContent(content, hashes));
@@ -174,8 +239,8 @@ impl Storage {
             });
         }
         self.inserted_contents.insert(hash);
-        for row in self.pending.remove(&hash).unwrap_or_default() {
-            self.push_entry(row);
+        for (row, xattrs) in self.pending.remove(&hash).unwrap_or_default() {
+            self.push_entry(row, xattrs);
         }
         Ok(())
     }
@@ -274,13 +339,7 @@ impl Storage {
     }
 
     fn finish(mut self) -> Stage<StorageStats> {
-        if !self.pending.is_empty() {
-            let n: usize = self.pending.values().map(Vec::len).sum();
-            return Err(Error::Corrupt(format!(
-                "{n} entries reference content that was never stored"
-            ))
-            .into());
-        }
+        self.check_pending()?;
         self.seal()?;
         self.barrier()?;
         Ok(self.stats)
@@ -291,7 +350,6 @@ impl Storage {
 mod tests {
     use super::*;
     use crate::compress::Compression;
-    use crate::model::EntryStatus;
     use crate::pack::UnitKind;
     use crate::sniff::{Format, ProfileKind};
     use std::sync::mpsc::{sync_channel, Receiver};
@@ -352,6 +410,7 @@ mod tests {
             CatalogOp::InsertUnit(_) => "unit",
             CatalogOp::InsertContent(..) => "content",
             CatalogOp::InsertEntry(_) => "entry",
+            CatalogOp::InsertXattr(..) => "xattr",
             CatalogOp::Commit => "commit",
             _ => "other",
         }
@@ -365,6 +424,7 @@ mod tests {
         st.handle(StorageMsg::Entry {
             row: file_entry(h),
             content_known: false,
+            xattrs: vec![(b"user.a".to_vec(), b"1".to_vec())],
         })
         .unwrap();
         assert_eq!(st.pending.len(), 1);
@@ -374,6 +434,7 @@ mod tests {
         st.handle(StorageMsg::Entry {
             row: file_entry(h),
             content_known: false,
+            xattrs: vec![(b"user.a".to_vec(), b"1".to_vec())],
         })
         .unwrap();
         let stats = match st.finish() {
@@ -382,9 +443,10 @@ mod tests {
         };
         assert_eq!((stats.entries, stats.new_units), (2, 1));
         let ops: Vec<&str> = rx.try_iter().map(|op| kind(&op)).collect();
+        // Each parked entry is released together with its xattr.
         assert_eq!(
             ops,
-            ["pack", "unit", "content", "entry", "entry", "seal", "commit"]
+            ["pack", "unit", "content", "entry", "xattr", "entry", "xattr", "seal", "commit"]
         );
     }
 
@@ -425,11 +487,49 @@ mod tests {
     }
 
     #[test]
+    fn flush_replies_only_after_the_writer_commits() {
+        let (_tmp, mut st, rx) = storage();
+        st.handle(new_content(b"x")).unwrap();
+        let (reply, replied) = mpsc::channel();
+        let t = std::thread::spawn(move || st.handle(StorageMsg::Flush(reply)).is_ok());
+        let mut ops = Vec::new();
+        let ack = loop {
+            match rx.recv().unwrap() {
+                CatalogOp::Sync(ack) => break ack,
+                op => ops.push(kind(&op)),
+            }
+        };
+        assert_eq!(ops, ["pack", "unit", "content", "pack", "commit"]);
+        // Storage is blocked on the writer's ack, so it cannot have replied.
+        assert!(replied.try_recv().is_err());
+        ack.send(()).unwrap();
+        assert_eq!(replied.recv().unwrap().new_units, 1);
+        assert!(t.join().unwrap());
+    }
+
+    #[test]
+    fn flush_with_a_parked_entry_is_corrupt() {
+        let (_tmp, mut st, _rx) = storage();
+        st.handle(StorageMsg::Entry {
+            row: file_entry(Hash32::of(b"missing")),
+            content_known: false,
+            xattrs: Vec::new(),
+        })
+        .unwrap();
+        let (reply, _replied) = mpsc::channel();
+        assert!(matches!(
+            st.handle(StorageMsg::Flush(reply)),
+            Err(Halt::Failed(Error::Corrupt(_)))
+        ));
+    }
+
+    #[test]
     fn content_that_never_arrives_is_corrupt() {
         let (_tmp, mut st, _rx) = storage();
         st.handle(StorageMsg::Entry {
             row: file_entry(Hash32::of(b"missing")),
             content_known: false,
+            xattrs: Vec::new(),
         })
         .unwrap();
         assert!(matches!(st.finish(), Err(Halt::Failed(Error::Corrupt(_)))));

@@ -9,6 +9,7 @@ const CONFIG_FILE: &str = "wmk.toml";
 const LOCK_FILE: &str = "wmk.lock";
 const CATALOG_FILE: &str = "catalog.sqlite";
 const PACKS_DIR: &str = "packs";
+const TMP_DIR: &str = "tmp";
 
 #[derive(Debug)]
 pub struct Repo {
@@ -69,6 +70,12 @@ impl Repo {
 
     pub fn packs_dir(&self) -> PathBuf {
         self.root.join(PACKS_DIR)
+    }
+
+    /// Scratch space for files that never outlive a command (created on
+    /// demand).
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.root.join(TMP_DIR)
     }
 
     /// Take the non-blocking exclusive writer lock on `wmk.lock`.

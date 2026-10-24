@@ -166,7 +166,14 @@ fn exact_duplicates_stored_once() {
         1
     );
     assert_eq!(count(&repo, "SELECT count(*) FROM content"), 1);
-    assert_eq!(count(&repo, "SELECT count(*) FROM unit"), chunks);
+    // Content units only; the snapshot record adds its own.
+    assert_eq!(
+        count(
+            &repo,
+            "SELECT count(*) FROM unit WHERE hash IN (SELECT unit_hash FROM content_unit)"
+        ),
+        chunks
+    );
     assert_eq!(r.new_units, chunks as u64);
     assert_eq!(r.bytes_read, 5 * data.len() as u64);
 }
@@ -383,5 +390,8 @@ fn worker_error_aborts_cleanly() {
     let snaps = cat.snapshots().unwrap();
     assert_eq!(snaps.len(), 1);
     assert_eq!(snaps[0].status, SnapshotStatus::Failed);
+    // Some units were committed before the abort, so the check below is
+    // not vacuous.
+    assert!(count(&repo, "SELECT count(*) FROM unit") > 0);
     common::assert_units_within_packs(&repo);
 }

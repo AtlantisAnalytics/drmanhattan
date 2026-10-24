@@ -2,6 +2,10 @@
 //! inside one open transaction, which commits only on `Commit` or when the
 //! channel closes. Callers must send rows in foreign-key order (pack, unit,
 //! content, snapshot, entry parents before children, then xattr/media).
+//!
+//! Because the open transaction also commits when the channel closes
+//! (including when the sender stops on an error), a sender must only forward
+//! ops whose pack bytes are already fsynced: anything sent may be committed.
 
 use super::Catalog;
 use crate::error::Result;
@@ -9,7 +13,7 @@ use crate::ids::{Hash32, Id};
 use crate::model::{ContentRow, EntryRow, PackRow, SnapshotRow, UnitRow};
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 
 #[derive(Debug)]
@@ -27,11 +31,14 @@ pub enum CatalogOp {
         height: u32,
     },
     Commit,
+    /// Commit like `Commit`, then acknowledge on the channel: every op sent
+    /// before it is committed by the time the ack arrives.
+    Sync(Sender<()>),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CatalogStats {
-    /// Data ops applied (every op except `Commit`).
+    /// Data ops applied (every op except `Commit` and `Sync`).
     pub ops: u64,
     /// Transactions committed. Only non-empty transactions count: a `Commit`
     /// with no pending ops does nothing.
@@ -57,6 +64,16 @@ fn run(path: PathBuf, rx: Receiver<CatalogOp>) -> Result<CatalogStats> {
                 open = false;
                 stats.commits += 1;
             }
+            continue;
+        }
+        if let CatalogOp::Sync(ack) = op {
+            if open {
+                conn.execute_batch("COMMIT")?;
+                open = false;
+                stats.commits += 1;
+            }
+            // The requester may have given up; nothing to do then.
+            let _ = ack.send(());
             continue;
         }
         if !open {
@@ -158,7 +175,7 @@ fn apply(conn: &Connection, op: CatalogOp) -> Result<()> {
             )?
             .execute(params![content, width, height])?;
         }
-        CatalogOp::Commit => {}
+        CatalogOp::Commit | CatalogOp::Sync(_) => {}
     }
     Ok(())
 }
