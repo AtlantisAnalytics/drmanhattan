@@ -4,13 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-failpoints = []
+failpoints = ["fail/failpoints"]
 test-seams = []
 
 [dependencies]
 blake3 = "1.8.7"
 crc32c = "0.6.8"
 crossbeam-channel = "0.5.17"
+fail = "0.5.1"
 fastcdc = "5.0.0"
 filetime = "0.2.29"
 fs4 = { version = "1.1.0", features = ["sync"] }

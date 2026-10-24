@@ -4,6 +4,11 @@
 //! barriers, right after the open pack is fsynced. So the catalog never holds
 //! (committed or pending) a unit row whose pack bytes are not durable.
 //!
+//! Barrier order: fsync the open pack → forward the buffered ops →
+//! `UpsertPack(size = synced length)` → `Commit`. The size update goes after
+//! the buffered ops because the buffer may hold the pack's creating
+//! `UpsertPack(size = header)`, which must not overwrite the synced length.
+//!
 //! Foreign-key order is kept here: a pack row precedes its units, units
 //! precede their content, and a file entry whose content is still in flight
 //! (claimed by another worker) is parked until that content is inserted.
@@ -23,7 +28,7 @@ use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 /// Commit barrier: after this many buffered ops, or this much time.
-const BARRIER_OPS: usize = 10_000;
+pub(super) const BARRIER_OPS: usize = 10_000;
 const BARRIER_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(super) enum StorageMsg {
@@ -69,16 +74,19 @@ pub(super) struct Storage {
     pending: HashMap<Hash32, Vec<EntryRow>>,
     /// Ops not yet forwarded; flushed at the next barrier.
     buf: Vec<CatalogOp>,
+    /// Barrier once `buf` holds this many ops.
+    barrier_ops: usize,
     stats: StorageStats,
 }
 
 impl Storage {
-    pub fn open(repo: &Repo, out: SyncSender<CatalogOp>) -> Result<Storage> {
+    pub fn open(repo: &Repo, out: SyncSender<CatalogOp>, barrier_ops: usize) -> Result<Storage> {
         Ok(Storage {
             packs_dir: repo.packs_dir(),
             max_size: repo.config.packs.max_size,
             cat: Catalog::open_readonly(&repo.catalog_path())?,
             out,
+            barrier_ops,
             pack: None,
             written_units: HashSet::new(),
             inserted_contents: HashSet::new(),
@@ -101,7 +109,7 @@ impl Storage {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
-            if self.buf.len() >= BARRIER_OPS || last_barrier.elapsed() >= BARRIER_INTERVAL {
+            if self.buf.len() >= self.barrier_ops || last_barrier.elapsed() >= BARRIER_INTERVAL {
                 self.barrier()?;
                 last_barrier = Instant::now();
             }
@@ -234,15 +242,20 @@ impl Storage {
         Ok(())
     }
 
-    /// fsync the open pack, record its length, then forward every buffered
-    /// op and commit. Packs sealed since the last barrier were fsynced by
-    /// `seal`.
+    /// fsync the open pack, then forward every buffered op, then the pack's
+    /// synced length, then `Commit` (see the module doc for why in that
+    /// order). Packs sealed since the last barrier were fsynced by `seal`.
     fn barrier(&mut self) -> Stage<()> {
         if let Some(p) = &mut self.pack {
             if p.dirty {
+                fail::fail_point!("ingest::storage_before_sync", |_| Err(Halt::Failed(
+                    Error::Corrupt("failpoint ingest::storage_before_sync".into())
+                )));
                 p.writer.sync()?;
                 p.dirty = false;
                 let size = super::to_i64(p.writer.len(), "pack size")?;
+                // Appended after the buffered ops, which may hold this pack's
+                // creating row (size = header only).
                 self.buf.push(CatalogOp::UpsertPack(PackRow {
                     id: p.id,
                     size,
@@ -329,7 +342,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repo::init(&tmp.path().join("r")).unwrap();
         let (tx, rx) = sync_channel(1024);
-        (tmp, Storage::open(&repo, tx).unwrap(), rx)
+        (tmp, Storage::open(&repo, tx, BARRIER_OPS).unwrap(), rx)
     }
 
     fn kind(op: &CatalogOp) -> &'static str {
@@ -373,6 +386,42 @@ mod tests {
             ops,
             ["pack", "unit", "content", "entry", "entry", "seal", "commit"]
         );
+    }
+
+    #[test]
+    fn ops_reach_the_writer_only_at_a_barrier_after_sync() {
+        let (_tmp, mut st, rx) = storage();
+        st.handle(new_content(b"first unit")).unwrap();
+        st.handle(new_content(b"second, longer unit")).unwrap();
+        assert!(rx.try_recv().is_err(), "ops forwarded before a barrier");
+
+        assert!(st.barrier().is_ok());
+        let pack = st.pack.as_ref().expect("pack stays open (unsealed)");
+        assert!(!pack.dirty);
+        let len = pack.writer.len() as i64;
+        let ops: Vec<CatalogOp> = rx.try_iter().collect();
+        assert!(matches!(ops.last(), Some(CatalogOp::Commit)));
+        // The last pack row before Commit carries the synced length.
+        let Some(CatalogOp::UpsertPack(p)) = ops.get(ops.len() - 2) else {
+            panic!("expected UpsertPack before Commit");
+        };
+        assert!(!p.sealed && p.blake3.is_none());
+        assert_eq!(p.size, len);
+        let units: Vec<&UnitRow> = ops
+            .iter()
+            .filter_map(|op| match op {
+                CatalogOp::InsertUnit(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(units.len(), 2);
+        for u in units {
+            assert!(u.pack_offset + RECORD_HEADER_LEN as i64 + u.stored_size <= p.size);
+        }
+
+        // Nothing new: a further barrier forwards nothing.
+        assert!(st.barrier().is_ok());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

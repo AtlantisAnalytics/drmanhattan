@@ -23,6 +23,7 @@ fn opts() -> IngestOptions {
         allow_unstable: false,
         cross_fs: false,
         workers: 4,
+        barrier_ops: None,
     }
 }
 
@@ -367,7 +368,12 @@ fn worker_error_aborts_cleanly() {
     }
     let locked = src.join("d2/f100");
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let err = ingest::run(&repo, &src, &opts()).unwrap_err();
+    // Barrier after every op, so units are committed before the abort.
+    let opts = IngestOptions {
+        barrier_ops: Some(1),
+        ..opts()
+    };
+    let err = ingest::run(&repo, &src, &opts).unwrap_err();
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
     match err {
         Error::Io { path, .. } => assert!(path.ends_with("d2/f100"), "{}", path.display()),
@@ -377,4 +383,5 @@ fn worker_error_aborts_cleanly() {
     let snaps = cat.snapshots().unwrap();
     assert_eq!(snaps.len(), 1);
     assert_eq!(snaps[0].status, SnapshotStatus::Failed);
+    common::assert_units_within_packs(&repo);
 }

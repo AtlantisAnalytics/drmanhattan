@@ -7,7 +7,51 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use drmanhattan_core::ids::Id;
+use drmanhattan_core::pack::{pack_path, RECORD_HEADER_LEN};
+use drmanhattan_core::repo::Repo;
 use filetime::FileTime;
+
+/// The §7 ordering invariant as seen after a run: every committed unit lies
+/// inside its pack's committed size, which the bytes on disk cover.
+/// Returns the number of committed units in unsealed packs.
+pub fn assert_units_within_packs(repo: &Repo) -> u64 {
+    let conn = rusqlite::Connection::open(repo.catalog_path()).expect("open catalog");
+    let mut stmt = conn
+        .prepare(
+            "SELECT u.pack_offset, u.stored_size, p.id, p.size, p.sealed \
+             FROM unit u JOIN pack p ON p.id = u.pack_id",
+        )
+        .expect("prepare");
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, bool>(4)?,
+            ))
+        })
+        .expect("query");
+    let mut unsealed = 0;
+    for row in rows {
+        let (offset, stored, id, size, sealed) = row.expect("row");
+        assert!(
+            offset + RECORD_HEADER_LEN as i64 + stored <= size,
+            "unit at {offset}+{stored} beyond committed pack size {size}"
+        );
+        let id = Id::from_bytes(id.try_into().expect("16-byte id"));
+        let on_disk = fs::metadata(pack_path(&repo.packs_dir(), id))
+            .expect("pack file")
+            .len();
+        assert!(size as u64 <= on_disk, "pack size {size} > file {on_disk}");
+        if !sealed {
+            unsealed += 1;
+        }
+    }
+    unsealed
+}
 
 pub struct TreeBuilder {
     root: PathBuf,

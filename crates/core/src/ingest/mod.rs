@@ -47,6 +47,10 @@ pub struct IngestOptions {
     pub cross_fs: bool,
     /// Reader threads; 0 means `std::thread::available_parallelism()`.
     pub workers: usize,
+    /// Test seam: commit barrier after this many buffered catalog ops
+    /// instead of 10_000. `None` (the default) is the production value.
+    #[doc(hidden)]
+    pub barrier_ops: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,15 +112,20 @@ fn canonical(p: &Path) -> Result<PathBuf> {
     p.canonicalize().map_err(|e| Error::io(p, e))
 }
 
-/// Best effort: the original error is what the caller needs, so a failure to
-/// record the failure is deliberately dropped.
+/// Best effort: the caller gets the original error either way, so a failure
+/// to record the failure is reported on stderr rather than returned.
 fn mark_failed(repo: &Repo, snap: &SnapshotRow) {
     let row = SnapshotRow {
         status: SnapshotStatus::Failed,
         completed_at: now_ns().ok(),
         ..snap.clone()
     };
-    let _ = Catalog::open(&repo.catalog_path()).and_then(|c| c.upsert_snapshot(&row));
+    if let Err(e) = Catalog::open(&repo.catalog_path()).and_then(|c| c.upsert_snapshot(&row)) {
+        eprintln!(
+            "warning: could not mark snapshot {} as failed: {e}",
+            snap.id
+        );
+    }
 }
 
 struct PipelineOutput {
@@ -183,6 +192,22 @@ fn panicked(stage: &str) -> Error {
     Error::Corrupt(format!("ingest {stage} thread panicked"))
 }
 
+/// Records a panic as soon as unwinding passes through the stage, so peers
+/// abort at once instead of when the panicked thread is joined. Declare it
+/// after the stage's channel ends so it drops (and fires) before them.
+struct PanicGuard<'a> {
+    shared: &'a Shared,
+    stage: &'static str,
+}
+
+impl Drop for PanicGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.shared.fail(panicked(self.stage));
+        }
+    }
+}
+
 /// Run walker, workers, storage and catalog writer to completion. Every
 /// thread is joined before this returns, on success and on failure.
 fn pipeline(
@@ -222,8 +247,14 @@ fn pipeline(
             let (job_tx, job_rx) = crossbeam_channel::bounded::<FileJob>(4 * workers);
             let (st_tx, st_rx) = crossbeam_channel::bounded::<StorageMsg>(4 * workers);
 
+            let barrier_ops = opts.barrier_ops.unwrap_or(storage::BARRIER_OPS);
             let storage = s.spawn(move || {
-                Storage::open(repo, cat_tx)
+                let st_rx = st_rx;
+                let _guard = PanicGuard {
+                    shared,
+                    stage: "storage",
+                };
+                Storage::open(repo, cat_tx, barrier_ops)
                     .map_err(Halt::from)
                     .and_then(|st| st.run(&st_rx, shared))
                     .map_err(|h| shared.halt(h))
@@ -233,6 +264,11 @@ fn pipeline(
                 .map(|_| {
                     let (jobs, out) = (job_rx.clone(), st_tx.clone());
                     s.spawn(move || {
+                        let (jobs, out) = (jobs, out);
+                        let _guard = PanicGuard {
+                            shared,
+                            stage: "worker",
+                        };
                         if let Err(h) = worker.run(&jobs, &out) {
                             shared.halt(h);
                         }

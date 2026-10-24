@@ -122,6 +122,7 @@ pub fn run(cli: &Cli, args: &IngestArgs) -> Result<i32> {
             allow_unstable: args.allow_unstable,
             cross_fs: args.cross_fs,
             workers: args.workers,
+            ..IngestOptions::default()
         },
     )?;
     emit(cli.json, &Report::new(&report))?;
