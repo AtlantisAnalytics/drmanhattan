@@ -281,7 +281,7 @@ Items appear in this order. Within a section, items may appear in any order.
 | 1 | `header` | exactly 1 | `version` u32 (= 1), `snapshot` map: the snapshot row, with every §6.1 column as a field (`id` id, `status` text, `source_root` bin, `host` text, `tool_version` text, `started_at` i64, `completed_at` i64?, `note` text?, `manifest_hash` hash?, `ext_manifest_hash` hash?, `source_manifest_hash` hash?, `record_unit` hash?, `entry_count` i64?, `file_bytes` i64?, `screened_out` i64, `label_pattern` text?) |
 | 2 | `entry` | one per entry | every §6.1 `entry` column: `id` id, `snapshot_id` id, `parent_id` id?, `name` bin, `path` bin, `kind` text, `mode` u32, `mtime_ns` i64, `size` i64?, `content_hash` hash?, `link_target` bin?, `hardlink_group` i64?, `status` text |
 | 3 | `content` | one per distinct content the snapshot references | `hash` hash, `size` i64, `format` text?, `profile` text, `unit_count` i64, `units` array of hashes in `seq` order (`unit_count` must equal its length) |
-| 4 | `xattr` | one per xattr row | `entry` id, `name` bin, `value` bin |
+| 4 | `xattr` | one per xattr row | `entry_id` id, `name` bin, `value` bin |
 | 5 | `provenance` | optional, one per provenance row | `entry_id` id, `source` text, `url` text?, `fetched_at` i64?, `last_modified` i64?, `server_ip` text?, `http_headers` text? |
 | 6 | `screen_hit` | optional, one per screen hit | `id` i64, `snapshot_id` id, `entry_id` id, `verdict` text, `screener` text, `list_version` text?, `blake3` hash, `md5` bin?, `sha1` bin?, `sha256` bin?, `detail` text?, `detected_at` i64 |
 

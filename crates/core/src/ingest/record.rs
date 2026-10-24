@@ -257,7 +257,7 @@ enum Item {
         units: Vec<B32>,
     },
     Xattr {
-        entry: B16,
+        entry_id: B16,
         name: Bin,
         value: Bin,
     },
@@ -602,9 +602,9 @@ fn write_document(cat: &Catalog, snapshot: &SnapshotRow, path: &Path) -> Result<
     cat.for_each_snapshot_content(snapshot.id, |content, units| {
         to_cbor(&content_item(content, units)?, &mut w, path)
     })?;
-    cat.for_each_snapshot_xattr(snapshot.id, |entry, name, value| {
+    cat.for_each_snapshot_xattr(snapshot.id, |entry_id, name, value| {
         let item = Item::Xattr {
-            entry: B16(entry),
+            entry_id: B16(entry_id),
             name: Bin(name),
             value: Bin(value),
         };
@@ -719,7 +719,11 @@ fn parse_document(r: &mut impl BufRead) -> Result<SnapshotRecord> {
                 unit_count,
                 units,
             } => contents.push(content_row(hash, size, format, profile, unit_count, units)?),
-            Item::Xattr { entry, name, value } => xattrs.push((entry.0, name.0, value.0)),
+            Item::Xattr {
+                entry_id,
+                name,
+                value,
+            } => xattrs.push((entry_id.0, name.0, value.0)),
             Item::Provenance(p) => provenance.push(ProvenanceRecord::try_from(p)?),
             Item::ScreenHit(h) => screen_hits.push(ScreenHitRecord::try_from(h)?),
         }
@@ -862,7 +866,7 @@ mod tests {
             Item::Entry(e.clone().into()),
             content_item(content(&[b"u1", b"u2"]).0, content(&[b"u1", b"u2"]).1).unwrap(),
             Item::Xattr {
-                entry: B16(e.id),
+                entry_id: B16(e.id),
                 name: Bin(b"user.x".to_vec()),
                 value: Bin(big.clone()),
             },
@@ -1026,6 +1030,32 @@ mod tests {
         ciborium::into_writer(&snap, &mut doc).unwrap();
         assert!(matches!(
             parse_document(&mut &doc[..]),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    /// The xattr item's id key is `entry_id`, the §6.1 column name.
+    #[test]
+    fn xattr_item_keys_entry_id() {
+        let s = snapshot();
+        let e = entry(s.id);
+        let xattr = |id_key: &str| {
+            Value::Map(vec![
+                (Value::Text("t".into()), Value::Text("xattr".into())),
+                (Value::Text(id_key.into()), Value::Bytes(e.id.0.to_vec())),
+                (Value::Text("name".into()), Value::Bytes(b"user.k".to_vec())),
+                (Value::Text("value".into()), Value::Bytes(b"v".to_vec())),
+            ])
+        };
+        let doc = |id_key: &str| {
+            let mut out = encode_items(&[header(&s), Item::Entry(e.clone().into())]);
+            ciborium::into_writer(&xattr(id_key), &mut out).unwrap();
+            out
+        };
+        let rec = parse_document(&mut &doc("entry_id")[..]).unwrap();
+        assert_eq!(rec.xattrs, vec![(e.id, b"user.k".to_vec(), b"v".to_vec())]);
+        assert!(matches!(
+            parse_document(&mut &doc("entry")[..]),
             Err(Error::Corrupt(_))
         ));
     }
