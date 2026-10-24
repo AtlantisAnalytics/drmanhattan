@@ -1,12 +1,13 @@
-# wmk v1 — Design Spec
+# watchmaker (`wmk`) v1 — Design Spec
 
-- **Project:** drmanhattan (CLI binary: `wmk`, "watchmaker")
+- **Tool:** watchmaker, invoked as `wmk`
+- **Package and repo:** `drmanhattan` (crates `drmanhattan-core` and `drmanhattan`; future PyPI package `drmanhattan`)
 - **Date:** 2026-10-24
 - **Status:** Draft, awaiting review
 
 ## 1. Purpose
 
-`wmk` inspects a directory, records its exact structure, assigns a UUID alias to every entry, and decomposes file contents into deduplicated, content-addressed storage units. Any snapshot can be rebuilt byte-for-byte from a repository on demand.
+**watchmaker** (`wmk`) inspects a directory, records its exact structure, assigns a UUID alias to every entry, and decomposes file contents into deduplicated, content-addressed storage units. Any snapshot can be rebuilt byte-for-byte from a repository on demand.
 
 The primary use case is **ML datasets built from scraped websites**, including existing hand-labelled datasets (folder-as-class) that represent hundreds of hours of annotation and must survive storage and rebuild exactly.
 
@@ -475,6 +476,8 @@ wmk ingest ./scrape --labels '{split}/{class}/**'
 
 ## 11. CLI summary
 
+`wmk --help` opens with: `wmk (watchmaker): disassemble directories into storage units and rebuild them exactly`.
+
 The repo is selected with `--repo <path>` or `WMK_REPO`. All commands support `--json`, and progress is shown on stderr.
 
 | Command | Purpose |
@@ -518,6 +521,9 @@ The repo is selected with `--repo <path>` or `WMK_REPO`. All commands support `-
 
 ```
 Cargo.toml                  # workspace
+# Published names: crates.io `drmanhattan` (installs the `wmk` binary) and `drmanhattan-core`.
+# `watchmaker` and `wmk` are already taken on crates.io and PyPI, so they are used only as the
+# tool and command name, never as a package name.
 crates/core/                # drmanhattan-core (lib)
   config, model, walk, chunk, sniff, pack, catalog, manifest,
   ingest, restore, verify, screen, provenance, labels, purge, recover, analyze
