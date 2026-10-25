@@ -159,9 +159,42 @@ fn png(tag: u8) -> Vec<u8> {
     v
 }
 
-/// 30 files (25 HTML sharing templates, a stylesheet, two PNG-magic files,
-/// one empty file, one of exactly 2048 bytes), nested dirs, two symlinks
-/// and one hard-link pair, with fixed modes and mtimes.
+/// The xattr the fixture pins (a `user.` name, recorded on Linux and macOS).
+const XATTR_NAME: &str = "user.wmk.fixture";
+const XATTR_FILE: &[u8] = b"shared/tagged.txt";
+/// The multi-chunk binary file.
+const TILES_FILE: &[u8] = b"assets/tiles.bin";
+
+/// 1.5 MiB of low-entropy bytes: one 16 KiB block from a fixed splitmix64
+/// stream, repeated, each copy starting with its index as a u64. FastCDC
+/// cuts it into six distinct binary-profile chunks (with this seed), and
+/// each compresses to a fraction under zstd.
+fn tiles() -> Vec<u8> {
+    const LEN: usize = 3 << 19;
+    const BLOCK: usize = 16 << 10;
+    let mut state: u64 = 0x5745_4d4b_5f46_4958;
+    let mut next = move || {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let block: Vec<u8> = (0..BLOCK).map(|_| next() as u8).collect();
+    let mut v = Vec::with_capacity(LEN);
+    for i in 0..(LEN / BLOCK) as u64 {
+        v.extend_from_slice(&i.to_le_bytes());
+        v.extend_from_slice(&block[8..]);
+    }
+    v
+}
+
+/// 32 files (25 HTML sharing templates, a stylesheet, two PNG-magic files,
+/// one empty file, one of exactly 2048 bytes, one carrying a `user.` xattr
+/// and one 1.5 MiB low-entropy binary spanning several chunks), nested
+/// dirs, two symlinks and one hard-link pair, with fixed modes and mtimes.
+///
+/// Panics if the filesystem refuses `user.` xattrs.
 fn fixture_tree(root: &Path) {
     let mut t = TreeBuilder::new(root);
     let mut files: Vec<(String, Vec<u8>, u32)> = Vec::new();
@@ -196,7 +229,17 @@ fn fixture_tree(root: &Path) {
     files.push(("shared/empty.txt".into(), Vec::new(), 0o600));
     let blob: Vec<u8> = (0..2048u32).map(|i| (i * 31 + 7) as u8).collect();
     files.push(("assets/blob-2048.bin".into(), blob, 0o755));
-    assert_eq!(files.len(), 30);
+    files.push((
+        String::from_utf8(XATTR_FILE.to_vec()).unwrap(),
+        b"this file carries an extended attribute\n".to_vec(),
+        0o644,
+    ));
+    files.push((
+        String::from_utf8(TILES_FILE.to_vec()).unwrap(),
+        tiles(),
+        0o644,
+    ));
+    assert_eq!(files.len(), 32);
 
     for (i, (path, bytes, mode)) in files.iter().enumerate() {
         let ns = T + i as i64 * 1_000_000_007;
@@ -221,6 +264,20 @@ fn fixture_tree(root: &Path) {
         t.mode(dir, mode).mtime(dir, ns);
     }
     t.finish();
+    // Setting an xattr leaves the mtime alone.
+    let tagged = root.join(OsStr::from_bytes(XATTR_FILE));
+    require_user_xattrs(xattr::set(&tagged, XATTR_NAME, b"v1"));
+}
+
+/// Fail with a clear message, never skip, where `user.` xattrs are refused.
+fn require_user_xattrs(r: std::io::Result<()>) {
+    if let Err(e) = r {
+        panic!(
+            "this filesystem refuses the user.* xattr {XATTR_NAME} ({e}); \
+             the repo-v1 fixture pins xattrs, so run it on a filesystem with \
+             user xattrs (ext4, xfs, btrfs, APFS)"
+        );
+    }
 }
 
 // ---- tests ----
@@ -287,7 +344,7 @@ fn generate_fixture() {
         ext_manifest_hash: live.ext.to_hex(),
         files: file_hashes(&src),
     };
-    assert_eq!(expected.files.len(), 31);
+    assert_eq!(expected.files.len(), 33);
     fs::write(expected_path(), toml::to_string(&expected).unwrap()).unwrap();
     let size = dir_size(&dir);
     assert!(size < MIB, "fixture is {size} bytes");
@@ -330,11 +387,29 @@ fn fixture_restores_exactly() {
     assert!(v.problems.is_empty(), "verify: {:?}", v.problems);
     assert_eq!(v.snapshots, 1);
 
+    // The fixture pins an xattr and a multi-chunk binary content.
+    let tagged = cat.entry_by_path(snap.id, XATTR_FILE).unwrap();
+    assert_eq!(
+        cat.xattrs(tagged.id).unwrap(),
+        vec![(XATTR_NAME.as_bytes().to_vec(), b"v1".to_vec())]
+    );
+    let tiles = cat.entry_by_path(snap.id, TILES_FILE).unwrap();
+    let units = cat.content_units(&tiles.content_hash.unwrap()).unwrap();
+    assert!(units.len() >= 2, "tiles.bin is {} unit(s)", units.len());
+    assert!(units
+        .iter()
+        .all(|u| u.compression == drmanhattan_core::compress::Compression::Zstd));
+
+    // Restoring xattrs needs a filesystem that takes user.* names.
+    let probe_file = tmp.path().join("xattr-probe");
+    fs::write(&probe_file, b"").unwrap();
+    require_user_xattrs(xattr::set(&probe_file, XATTR_NAME, b"v1"));
+
     let out = tmp.path().join("out");
     let opts = RestoreOptions {
         path: Vec::new(),
         hardlinks: true,
-        xattrs: false,
+        xattrs: true,
     };
     restore::run(&repo, snap.id, &out, &opts).unwrap();
     let p = preflight::probe(tmp.path()).unwrap().mtime_precision_ns;

@@ -1,13 +1,15 @@
-manifest_hash = "baee44cff725e295b1a6ea43ef417cbcb6f95ddd53457dbab68afaf45a6333dc"
-ext_manifest_hash = "26b97cc00acc2063469f96df936180ef7bebd3df1b14188acab5d61b23e8e202"
+manifest_hash = "b59571d55846a9d4d50e0c397ff87ddff48cc1e300006ddfb07d7a6959b145bb"
+ext_manifest_hash = "f00947826661e107fd3c5d9e656b04e2d764c93d641fb84c5c06bdc89e6531b0"
 
 [files]
 "assets/blob-2048.bin" = "634f590a498b3e29165cd8bd32f30a99a2b0d8949a3d7ce35779b6253d8ca0d5"
 "assets/img/dial.png" = "ed2ef9642effe381297c62193a8914cb3a93d95bd1c80d145d1c75dac63c1239"
 "assets/img/hand.png" = "b8f014ccdb547453fe988f8b4f589573c61af42214a4f49ea5030cf7c5cec3a6"
 "assets/style.css" = "f57fe4bd27777756c17c43ef3b045a7fd46224a2bc068c3805a110d3516da3e5"
+"assets/tiles.bin" = "0163d14357fa9426d83bb675341c35fe25c7a052840dd587c82e8617f4b4c163"
 "shared/empty.txt" = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
 "shared/index-copy.html" = "cc32fb61fba16b2a606702ad69d59971963ac36f32023d9e9db8a24cfb130d2b"
+"shared/tagged.txt" = "d0ed51fcc22422f9ac0b493da5bda09b5dda25d2b5b29387f3e82d7691fa31c0"
 "site/blog/2019/archive-01.html" = "9cfae0683ba83bb6e9a4b99470f804f3feb6e6bc0ba6c0dd8f35da150bcf0faa"
 "site/blog/2019/archive-02.html" = "de471a953f26dafd1ce8f9392c533352c77d575ac6d8280da5f4daba3ae47fd6"
 "site/blog/2019/archive-03.html" = "ce63383d4c3f8b9a1583bba15f6f046a2c08734cb1c67586ad3513afe3e34359"
