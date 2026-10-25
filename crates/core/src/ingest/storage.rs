@@ -56,6 +56,9 @@ pub(super) enum StorageMsg {
     /// A unit outside any content (the snapshot record's units), stored
     /// unless it already exists.
     Unit(RecordHeader, Vec<u8>),
+    /// Mark entries unstable, `(entry, leave_group)`, after their rows were
+    /// committed (a hard-link group that diverged).
+    MarkUnstable(Vec<(Id, bool)>),
     /// Commit everything received so far, then reply with the stats. A
     /// dropped reply sender means storage or the catalog writer stopped.
     Flush(Sender<StorageStats>),
@@ -163,6 +166,14 @@ impl Storage {
                 media,
             } => Ok(self.new_content(content, units, media)?),
             StorageMsg::Unit(header, payload) => Ok(self.store_unit(&header, &payload)?),
+            StorageMsg::MarkUnstable(marks) => {
+                self.buf.extend(
+                    marks
+                        .into_iter()
+                        .map(|(entry, leave_group)| CatalogOp::MarkUnstable { entry, leave_group }),
+                );
+                Ok(())
+            }
             StorageMsg::Flush(reply) => self.flush(reply),
         }
     }

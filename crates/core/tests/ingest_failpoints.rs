@@ -216,3 +216,86 @@ fn unstable_once_then_stable_is_ok() {
     .unwrap();
     assert_eq!(r.manifest_hash, live.core);
 }
+
+/// A repo plus a source holding `src/a` and its hard link `src/b`. While
+/// one worker ingests them in order, the shared inode is rewritten between
+/// the two reads: `a` is read with its old bytes, and `b`, whose walked
+/// stamp no longer matches, is re-read with the new ones. Both reads are
+/// stable on their own, so only a group-level check sees the divergence.
+fn diverging_hardlinks() -> (tempfile::TempDir, Repo, PathBuf, IngestOptions) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repo::init(&tmp.path().join("r")).unwrap();
+    let src = tmp.path().join("src");
+    TreeBuilder::new(&src)
+        .file(b"a", b"old bytes")
+        .hardlink(b"b", b"a");
+    let a = src.join("a").canonicalize().unwrap();
+    let calls = AtomicUsize::new(0);
+    fail::cfg_callback("ingest::after_walk", move || {
+        if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            std::fs::write(&a, b"new, longer bytes").unwrap();
+        }
+    })
+    .unwrap();
+    let opts = IngestOptions {
+        workers: 1,
+        ..IngestOptions::default()
+    };
+    (tmp, repo, src, opts)
+}
+
+#[test]
+fn diverging_hardlink_group_fails_by_default() {
+    let _serial = FAIL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let scenario = fail::FailScenario::setup();
+    let (_tmp, repo, src, opts) = diverging_hardlinks();
+    let err = ingest::run(&repo, &src, &opts).unwrap_err();
+    scenario.teardown();
+    match err {
+        Error::Unstable(path) => assert_eq!(path, src.join("b").canonicalize().unwrap()),
+        e => panic!("unexpected error {e:?}"),
+    }
+    assert_eq!(first_status(&repo), SnapshotStatus::Failed);
+}
+
+#[test]
+fn diverging_hardlink_group_allowed_restores_as_copies() {
+    let _serial = FAIL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let scenario = fail::FailScenario::setup();
+    let (tmp, repo, src, opts) = diverging_hardlinks();
+    let opts = IngestOptions {
+        allow_unstable: true,
+        ..opts
+    };
+    let r = ingest::run(&repo, &src, &opts).unwrap();
+    scenario.teardown();
+    assert_eq!(first_status(&repo), SnapshotStatus::Complete);
+    let mut unstable = r.unstable.clone();
+    unstable.sort();
+    assert_eq!(unstable, [b"a".to_vec(), b"b".to_vec()]);
+
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    let a = cat.entry_by_path(r.snapshot, b"a").unwrap();
+    let b = cat.entry_by_path(r.snapshot, b"b").unwrap();
+    assert_eq!(a.content_hash, Some(Hash32::of(b"old bytes")));
+    assert_eq!(b.content_hash, Some(Hash32::of(b"new, longer bytes")));
+    assert_eq!(
+        (a.status, b.status),
+        (EntryStatus::Unstable, EntryStatus::Unstable)
+    );
+    // The divergent member leaves the group; the first keeps it.
+    assert!(a.hardlink_group.is_some());
+    assert_eq!(b.hardlink_group, None);
+
+    let v = drmanhattan_core::verify::run(&repo, None, false).unwrap();
+    assert!(v.problems.is_empty(), "{:?}", v.problems);
+    let out = tmp.path().join("out");
+    let ropts = drmanhattan_core::restore::RestoreOptions {
+        path: Vec::new(),
+        hardlinks: true,
+        xattrs: false,
+    };
+    drmanhattan_core::restore::run(&repo, r.snapshot, &out, &ropts).unwrap();
+    assert_eq!(std::fs::read(out.join("a")).unwrap(), b"old bytes");
+    assert_eq!(std::fs::read(out.join("b")).unwrap(), b"new, longer bytes");
+}

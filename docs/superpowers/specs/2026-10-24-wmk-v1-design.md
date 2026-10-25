@@ -361,7 +361,7 @@ walker ──► reader/chunker pool (rayon) ──► pack writer (1 thread) �
    - Sniff the format using magic bytes (`infer`), plus file extensions for text classes (html, htm, css, js, mjs, json, xml, svg, txt, csv, md).
    - Read image dimensions from the header only (`imagesize`), without decoding.
    - If the content hash is already in the catalog or in flight, skip chunk emission. The entry still references the content.
-4. **Stability check.** Run `stat` before and after reading. If size or mtime changed, retry once. If it changed again, fail the ingest (exit 1). With `--allow-unstable`, the bytes read are stored instead, and the entry gets `status=unstable`.
+4. **Stability check.** Run `stat` before and after reading. If size or mtime changed, retry once. If it changed again, fail the ingest (exit 1). With `--allow-unstable`, the bytes read are stored instead, and the entry gets `status=unstable`. Members of one `hardlink_group` share an inode, so if they end up with different content hashes (the file changed between their reads), the group is unstable too: by default the ingest fails; with `--allow-unstable` every member gets `status=unstable` and the members whose content differs from the group's first member (by path) leave the group (`hardlink_group` cleared), so a restore copies them instead of linking them.
 5. **Screen** each new content (§8) before emitting any of its units.
 6. **Compress.** Use `none` for already-compressed formats (jpeg, png, webp, gif, avif, heic, mp4, webm, zip, gz, bz2, xz, zst, 7z). Otherwise use zstd level 3. If the result is ≥ 97% of the raw size, store it uncompressed. The decision is deterministic per unit.
 7. **Pack writer.**

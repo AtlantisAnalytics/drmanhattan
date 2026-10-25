@@ -394,6 +394,23 @@ impl Catalog {
         .ok_or_else(|| Error::NotFound(format!("pack {id}")))
     }
 
+    /// Every file entry of `snapshot` in a hard-link group whose members do
+    /// not all have the same content (the shared inode changed between
+    /// their reads), ordered by group, then path.
+    pub fn divergent_hardlink_members(&self, snapshot: Id) -> Result<Vec<EntryRow>> {
+        self.all(
+            &format!(
+                "SELECT {ENTRY_COLS} FROM entry WHERE snapshot_id = ?1 AND kind = 'file' \
+                 AND hardlink_group IN (SELECT hardlink_group FROM entry \
+                 WHERE snapshot_id = ?1 AND kind = 'file' AND hardlink_group IS NOT NULL \
+                 GROUP BY hardlink_group HAVING count(DISTINCT content_hash) > 1) \
+                 ORDER BY hardlink_group, path"
+            ),
+            [snapshot],
+            entry_from_row,
+        )
+    }
+
     pub fn entries_with_content(&self, h: &Hash32) -> Result<Vec<EntryRow>> {
         self.all(
             &format!("SELECT {ENTRY_COLS} FROM entry WHERE content_hash = ?1 ORDER BY id"),

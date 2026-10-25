@@ -30,6 +30,12 @@ pub enum CatalogOp {
         width: u32,
         height: u32,
     },
+    /// Set an entry's status to `unstable`; with `leave_group`, also clear
+    /// its `hardlink_group`.
+    MarkUnstable {
+        entry: Id,
+        leave_group: bool,
+    },
     Commit,
     /// Commit like `Commit`, then acknowledge on the channel: every op sent
     /// before it is committed by the time the ack arrives.
@@ -174,6 +180,14 @@ fn apply(conn: &Connection, op: CatalogOp) -> Result<()> {
                 "INSERT OR IGNORE INTO media(content_hash, width, height) VALUES (?1,?2,?3)",
             )?
             .execute(params![content, width, height])?;
+        }
+        CatalogOp::MarkUnstable { entry, leave_group } => {
+            conn.prepare_cached(
+                "UPDATE entry SET status = 'unstable', \
+                 hardlink_group = CASE WHEN ?2 THEN NULL ELSE hardlink_group END \
+                 WHERE id = ?1",
+            )?
+            .execute(params![entry, leave_group])?;
         }
         CatalogOp::Commit | CatalogOp::Sync(_) => {}
     }

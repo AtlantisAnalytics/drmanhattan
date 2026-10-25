@@ -345,7 +345,7 @@ fn pipeline(
                 }
             }
             if !shared.aborted() {
-                match seal_snapshot(repo, snap, &st_tx) {
+                match seal_snapshot(repo, snap, &st_tx, source, opts.allow_unstable) {
                     Ok(s) => sealed = Some(s),
                     Err(h) => shared.halt(h),
                 }
@@ -388,14 +388,33 @@ fn flush(storage: &crossbeam_channel::Sender<StorageMsg>) -> Stage<StorageStats>
 }
 
 /// The finish phase, run with storage still alive once the walker and
-/// workers are done: commit, hash, then write and commit the record.
+/// workers are done: commit, settle diverged hard-link groups, hash, then
+/// write and commit the record.
 fn seal_snapshot(
     repo: &Repo,
     snap: &SnapshotRow,
     storage: &crossbeam_channel::Sender<StorageMsg>,
+    source: &Path,
+    allow_unstable: bool,
 ) -> Stage<Sealed> {
-    let stats = flush(storage)?;
+    let mut stats = flush(storage)?;
     let cat = Catalog::open_readonly(&repo.catalog_path())?;
+    let marks = diverged_hardlinks(&cat.divergent_hardlink_members(snap.id)?);
+    if let Some(m) = marks.iter().find(|m| m.leave_group) {
+        if !allow_unstable {
+            return Err(Error::Unstable(source.join(OsStr::from_bytes(&m.path))).into());
+        }
+    }
+    if !marks.is_empty() {
+        let ops = marks.iter().map(|m| (m.entry, m.leave_group)).collect();
+        storage
+            .send(StorageMsg::MarkUnstable(ops))
+            .map_err(|_| Halt::Aborted)?;
+        flush(storage)?;
+        stats
+            .unstable
+            .extend(marks.into_iter().filter(|m| m.newly).map(|m| m.path));
+    }
     let h = manifest_snapshot(
         &cat,
         snap.id,
@@ -438,6 +457,43 @@ fn seal_snapshot(
         },
         manifest_hash: h.core,
     })
+}
+
+/// A member of a hard-link group whose contents diverged.
+struct DivergedMember {
+    entry: Id,
+    path: Vec<u8>,
+    /// Its content differs from the group's first member (by path), so it
+    /// leaves the group and is restored as a copy.
+    leave_group: bool,
+    /// It was `ok` until now (not already unstable from its own read).
+    newly: bool,
+}
+
+/// Members of hard-link groups that read different contents, as returned
+/// by `Catalog::divergent_hardlink_members` (by group, then path). The
+/// shared inode changed between the reads, so like an unstable file every
+/// member becomes `unstable`, and the members whose content differs from
+/// the group's first leave the group.
+fn diverged_hardlinks(rows: &[EntryRow]) -> Vec<DivergedMember> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut first: Option<(Option<i64>, Option<Hash32>)> = None;
+    for r in rows {
+        let content = match first {
+            Some((g, c)) if g == r.hardlink_group => c,
+            _ => {
+                first = Some((r.hardlink_group, r.content_hash));
+                r.content_hash
+            }
+        };
+        out.push(DivergedMember {
+            entry: r.id,
+            path: r.path.clone(),
+            leave_group: r.content_hash != content,
+            newly: r.status != EntryStatus::Unstable,
+        });
+    }
+    out
 }
 
 /// Walk on the caller's thread: files go to the workers, dirs and symlinks
