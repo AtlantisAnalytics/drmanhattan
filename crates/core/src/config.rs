@@ -27,6 +27,11 @@ pub struct PacksCfg {
     pub max_size: u64,
 }
 
+/// Smallest allowed `packs.max_size`: 1 MiB.
+pub const MIN_PACK_SIZE: u64 = 1 << 20;
+/// Largest allowed `packs.max_size`: 4 GiB.
+pub const MAX_PACK_SIZE: u64 = 4 << 30;
+
 /// Contents of `wmk.toml`; fixed at `wmk init`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -72,8 +77,10 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Check that the config is usable: supported format version and chunk
-    /// profiles within fastcdc's bounds (so chunking can never panic).
+    /// Check that the config is usable: supported format version, chunk
+    /// profiles within fastcdc's bounds (so chunking can never panic), zstd
+    /// at a level zstd accepts, and a pack size from `MIN_PACK_SIZE` to
+    /// `MAX_PACK_SIZE`.
     pub fn validate(&self) -> Result<()> {
         if self.format_version != 1 {
             return Err(Error::Config(format!(
@@ -82,7 +89,29 @@ impl Config {
             )));
         }
         validate_profile("text", &self.chunking.text)?;
-        validate_profile("binary", &self.chunking.binary)
+        validate_profile("binary", &self.chunking.binary)?;
+        if self.compression.algo != "zstd" {
+            return Err(Error::Config(format!(
+                "compression.algo = {:?} is not supported (only \"zstd\")",
+                self.compression.algo
+            )));
+        }
+        let levels = zstd::compression_level_range();
+        if !levels.contains(&self.compression.level) {
+            return Err(Error::Config(format!(
+                "compression.level = {} out of range {}..={}",
+                self.compression.level,
+                levels.start(),
+                levels.end()
+            )));
+        }
+        let size = self.packs.max_size;
+        if !(MIN_PACK_SIZE..=MAX_PACK_SIZE).contains(&size) {
+            return Err(Error::Config(format!(
+                "packs.max_size = {size} out of range {MIN_PACK_SIZE}..={MAX_PACK_SIZE}"
+            )));
+        }
+        Ok(())
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {

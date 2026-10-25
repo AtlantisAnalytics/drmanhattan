@@ -38,3 +38,42 @@ fn config_rejects_unknown_format_version() {
         other => panic!("expected Config error, got {:?}", other.map(|_| ())),
     }
 }
+
+fn config_error(edit: impl FnOnce(&mut Config)) -> String {
+    match open_with(edit) {
+        Err(Error::Config(m)) => m,
+        other => panic!("expected Config error, got {:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
+fn config_rejects_unknown_compression_algo() {
+    let m = config_error(|c| c.compression.algo = "lz4".into());
+    assert!(m.contains("compression.algo"), "{m}");
+}
+
+#[test]
+fn config_rejects_out_of_range_compression_level() {
+    for level in [-200_000, 23] {
+        let m = config_error(|c| c.compression.level = level);
+        assert!(m.contains("compression.level"), "{level}: {m}");
+    }
+    for level in [1, 19, 22] {
+        let mut c = Config::default();
+        c.compression.level = level;
+        c.validate().unwrap();
+    }
+}
+
+#[test]
+fn config_rejects_out_of_range_pack_size() {
+    for size in [0, (1 << 20) - 1, (4 << 30) + 1] {
+        let m = config_error(|c| c.packs.max_size = size);
+        assert!(m.contains("packs.max_size"), "{size}: {m}");
+    }
+    for size in [1 << 20, 4 << 30] {
+        let mut c = Config::default();
+        c.packs.max_size = size;
+        c.validate().unwrap();
+    }
+}
