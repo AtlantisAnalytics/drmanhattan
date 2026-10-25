@@ -21,6 +21,7 @@ hashes and link targets. `wmk manifest` computes the same hash from a live
 directory, so you can check a restore yourself:
 
 ```sh
+wmk init r
 wmk --repo r ingest data/                 # prints the manifest hash
 wmk --repo r restore latest out/
 wmk manifest out/                         # same hash
@@ -86,3 +87,17 @@ Exit codes: 0 success, 1 error, 2 verification failure or differences found,
 The full design, including the catalog schema, pack format and manifest
 encoding, is in
 [docs/superpowers/specs/2026-10-24-wmk-v1-design.md](docs/superpowers/specs/2026-10-24-wmk-v1-design.md).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.

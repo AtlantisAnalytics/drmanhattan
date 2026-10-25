@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.87"
 description = "watchmaker (wmk): disassemble directories into storage units and rebuild them exactly"
-# TODO: replace OWNER with the GitHub owner before publishing.
-repository = "https://github.com/OWNER/drmanhattan"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AtlantisAnalytics/drmanhattan"
 readme = "../../README.md"
 
 [[bin]]
