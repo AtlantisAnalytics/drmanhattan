@@ -11,6 +11,7 @@ pub mod model;
 pub mod pack;
 pub mod repo;
 pub mod restore;
+pub(crate) mod snaptree;
 pub mod sniff;
 pub mod unitread;
 pub mod verify;

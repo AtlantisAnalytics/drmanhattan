@@ -12,7 +12,8 @@ use std::path::Path;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
-use crate::model::{EntryKind, EntryRow, EntryStatus};
+use crate::model::EntryKind;
+use crate::snaptree;
 use crate::walk::{walk, WalkEntry, WalkItem, WalkOptions};
 use crate::xattrs::read_xattrs;
 
@@ -250,64 +251,25 @@ fn push_walk_entry(
     })
 }
 
-fn included(row: &EntryRow) -> bool {
-    matches!(row.status, EntryStatus::Ok | EntryStatus::Unstable)
-}
-
-/// Pre-order traversal of the included entries under `start` (inclusive).
-fn traverse(
-    cat: &Catalog,
-    snapshot: Id,
-    start: EntryRow,
-    mut visit: impl FnMut(&EntryRow) -> Result<()>,
-) -> Result<()> {
-    if !included(&start) {
-        return Ok(());
-    }
-    visit(&start)?;
-    if start.kind != EntryKind::Dir {
-        return Ok(());
-    }
-    // Stack of pending sibling lists, each reversed so `pop` yields the first.
-    let mut stack: Vec<Vec<EntryRow>> = vec![reversed(cat.children(snapshot, Some(start.id))?)];
-    while let Some(top) = stack.last_mut() {
-        let Some(row) = top.pop() else {
-            stack.pop();
-            continue;
-        };
-        if !included(&row) {
-            continue;
-        }
-        visit(&row)?;
-        if row.kind == EntryKind::Dir {
-            stack.push(reversed(cat.children(snapshot, Some(row.id))?));
-        }
-    }
-    Ok(())
-}
-
-fn reversed(mut v: Vec<EntryRow>) -> Vec<EntryRow> {
-    v.reverse();
-    v
-}
-
 pub fn manifest_snapshot(
     cat: &Catalog,
     snapshot: Id,
     root_path: &[u8],
     opts: &ManifestOptions,
 ) -> Result<ManifestHashes> {
-    let start = cat.entry_by_path(snapshot, root_path)?;
-    if !included(&start) {
-        return Err(Error::NotFound(format!(
+    let withheld = || {
+        Error::NotFound(format!(
             "path {root_path:?} is withheld in snapshot {snapshot}"
-        )));
-    }
-
+        ))
+    };
     let mut counts: HashMap<i64, u32> = HashMap::new();
-    traverse(cat, snapshot, start.clone(), |row| {
-        if row.kind == EntryKind::File {
-            if let Some(g) = row.hardlink_group {
+    let mut first = true;
+    snaptree::traverse(cat, snapshot, root_path, |n| {
+        if std::mem::take(&mut first) && !n.included {
+            return Err(withheld());
+        }
+        if n.included && n.row.kind == EntryKind::File {
+            if let Some(g) = n.row.hardlink_group {
                 *counts.entry(g).or_insert(0) += 1;
             }
         }
@@ -317,22 +279,11 @@ pub fn manifest_snapshot(
     let mut hasher = ManifestHasher::new(opts.mtime_precision_ns);
     let mut firsts: HashMap<i64, u64> = HashMap::new();
     let mut index: u64 = 0;
-    traverse(cat, snapshot, start, |row| {
-        let rel: &[u8] = if root_path.is_empty() {
-            &row.path
-        } else if row.path == root_path {
-            &[]
-        } else {
-            row.path
-                .strip_prefix(root_path)
-                .and_then(|p| p.strip_prefix(b"/"))
-                .ok_or_else(|| {
-                    Error::Corrupt(format!(
-                        "entry path not under {root_path:?}: {:?}",
-                        row.path
-                    ))
-                })?
-        };
+    snaptree::traverse(cat, snapshot, root_path, |n| {
+        if !n.included {
+            return Ok(());
+        }
+        let row = &n.row;
         let hardlink_first = match (row.kind, row.hardlink_group) {
             (EntryKind::File, Some(g)) if counts.get(&g).copied().unwrap_or(0) >= 2 => {
                 Some(*firsts.entry(g).or_insert(index))
@@ -353,7 +304,7 @@ pub fn manifest_snapshot(
         };
         let xattrs = cat.xattrs(row.id)?;
         hasher.push(&ManifestEntry {
-            path: rel,
+            path: &n.rel,
             kind: row.kind,
             mode: row.mode,
             mtime_ns: row.mtime_ns,

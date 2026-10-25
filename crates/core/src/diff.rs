@@ -15,6 +15,7 @@ use crate::ids::Id;
 use crate::manifest::hash_file;
 use crate::model::{EntryKind, EntryRow, EntryStatus};
 use crate::repo::Repo;
+use crate::snaptree;
 use crate::walk::{walk, WalkEntry, WalkItem, WalkOptions};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,19 +60,6 @@ fn withheld(s: EntryStatus) -> bool {
         s,
         EntryStatus::ScreenedOut | EntryStatus::ScreenError | EntryStatus::Purged
     )
-}
-
-/// `path` relative to `root` (`root` itself is the empty path), if under it.
-fn rebase(root: &[u8], path: &[u8]) -> Option<Vec<u8>> {
-    if root.is_empty() {
-        return Some(path.to_vec());
-    }
-    if path == root {
-        return Some(Vec::new());
-    }
-    path.strip_prefix(root)
-        .and_then(|p| p.strip_prefix(b"/"))
-        .map(<[u8]>::to_vec)
 }
 
 /// True if a strict ancestor of `path` is in `withheld_paths`.
@@ -139,20 +127,10 @@ pub fn run(repo: &Repo, snapshot: Id, dir: &Path, opts: &DiffOptions) -> Result<
 
     // The snapshot subtree, keyed by path relative to the subtree root.
     let mut snap: HashMap<Vec<u8>, EntryRow> = HashMap::new();
-    if opts.path.is_empty() {
-        cat.for_each_entry(snapshot, |row| {
-            snap.insert(row.path.clone(), row);
-            Ok(())
-        })?;
-    } else {
-        cat.entry_by_path(snapshot, &opts.path)?;
-        cat.for_each_entry(snapshot, |row| {
-            if let Some(rel) = rebase(&opts.path, &row.path) {
-                snap.insert(rel, row);
-            }
-            Ok(())
-        })?;
-    }
+    snaptree::traverse(&cat, snapshot, &opts.path, |n| {
+        snap.insert(n.rel, n.row);
+        Ok(())
+    })?;
     let withheld_paths: std::collections::HashSet<Vec<u8>> = snap
         .iter()
         .filter(|(_, r)| withheld(r.status))

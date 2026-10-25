@@ -12,8 +12,9 @@ pub mod preflight;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
-use crate::model::{EntryKind, EntryRow, EntryStatus, SnapshotStatus, UnitRow};
+use crate::model::{EntryKind, EntryRow, SnapshotStatus, UnitRow};
 use crate::repo::Repo;
+use crate::snaptree;
 use crate::unitread::{UnitReader, DEFAULT_CACHE_BYTES};
 use filetime::FileTime;
 use preflight::FsProbe;
@@ -210,87 +211,30 @@ fn exists(p: &Path) -> Result<bool> {
     }
 }
 
-fn included(e: &EntryRow) -> bool {
-    matches!(e.status, EntryStatus::Ok | EntryStatus::Unstable)
-}
-
 /// The restored set in canonical pre-order, with paths re-based onto the
-/// entry at `root_path` (which gets path `""`), and the withheld count.
+/// entry at `root_path` (which gets path `""`), and the withheld count:
+/// every entry that is withheld or beneath a withheld directory.
 fn collect(cat: &Catalog, snapshot: Id, root_path: &[u8]) -> Result<(Vec<EntryRow>, u64)> {
-    let start = cat.entry_by_path(snapshot, root_path)?;
-    if !included(&start) {
-        return Err(Error::NotFound(format!(
-            "path {} is withheld in snapshot {snapshot}",
-            root_path.escape_ascii()
-        )));
-    }
-    let rebase = |e: &mut EntryRow| -> Result<()> {
-        if root_path.is_empty() {
-            return Ok(());
-        }
-        let rel = e
-            .path
-            .strip_prefix(root_path)
-            .and_then(|p| p.strip_prefix(b"/"))
-            .ok_or_else(|| {
-                Error::Corrupt(format!(
-                    "entry {} is not under {}",
-                    e.path.escape_ascii(),
-                    root_path.escape_ascii()
-                ))
-            })?;
-        e.path = rel.to_vec();
-        Ok(())
-    };
     let mut withheld = 0u64;
     let mut out = Vec::new();
-    let mut stack: Vec<Vec<EntryRow>> = Vec::new();
-    let mut root = start;
-    if root.kind == EntryKind::Dir {
-        stack.push(reversed(cat.children(snapshot, Some(root.id))?));
-    }
-    root.path.clear();
-    validate(&root)?;
-    out.push(root);
-    while let Some(top) = stack.last_mut() {
-        let Some(mut e) = top.pop() else {
-            stack.pop();
-            continue;
-        };
-        if !included(&e) {
-            withheld += subtree_size(cat, snapshot, &e)?;
-            continue;
+    snaptree::traverse(cat, snapshot, root_path, |n| {
+        if !n.included {
+            if out.is_empty() {
+                return Err(Error::NotFound(format!(
+                    "path {} is withheld in snapshot {snapshot}",
+                    root_path.escape_ascii()
+                )));
+            }
+            withheld += 1;
+            return Ok(());
         }
-        if e.kind == EntryKind::Dir {
-            stack.push(reversed(cat.children(snapshot, Some(e.id))?));
-        }
-        rebase(&mut e)?;
+        let mut e = n.row;
+        e.path = n.rel;
         validate(&e)?;
         out.push(e);
-    }
+        Ok(())
+    })?;
     Ok((out, withheld))
-}
-
-fn reversed(mut v: Vec<EntryRow>) -> Vec<EntryRow> {
-    v.reverse();
-    v
-}
-
-/// `e` and every entry beneath it.
-fn subtree_size(cat: &Catalog, snapshot: Id, e: &EntryRow) -> Result<u64> {
-    let mut n = 0;
-    let mut dirs = vec![(e.id, e.kind)];
-    while let Some((id, kind)) = dirs.pop() {
-        n += 1;
-        if kind == EntryKind::Dir {
-            dirs.extend(
-                cat.children(snapshot, Some(id))?
-                    .iter()
-                    .map(|c| (c.id, c.kind)),
-            );
-        }
-    }
-    Ok(n)
 }
 
 /// Reject rows the restore cannot reproduce exactly.
