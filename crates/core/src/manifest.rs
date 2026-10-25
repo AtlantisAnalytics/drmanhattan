@@ -3,10 +3,8 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs::OpenOptions;
 use std::io::BufReader;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::catalog::Catalog;
@@ -15,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::model::EntryKind;
 use crate::snaptree;
-use crate::walk::{walk, WalkEntry, WalkItem, WalkOptions};
+use crate::walk::{open_walked_file, walk, WalkEntry, WalkItem, WalkOptions};
 use crate::xattrs::read_xattrs;
 
 /// macOS: OS-managed xattrs that are neither recorded at ingest nor hashed
@@ -199,12 +197,12 @@ impl ManifestHasher {
     }
 }
 
-pub(crate) fn hash_file(path: &Path) -> Result<Hash32> {
-    let f = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| Error::io(path, e))?;
+/// BLAKE3 of the regular file the walk saw as `entry` at `path`, opened
+/// with the ingest worker's checks (`open_walked_file`): a path swapped
+/// for a FIFO, a symlink or another file since the walk is an error, never
+/// a hang or a hash of something else.
+pub(crate) fn hash_file(path: &Path, entry: &WalkEntry) -> Result<Hash32> {
+    let (f, _) = open_walked_file(path, entry)?;
     let mut h = blake3::Hasher::new();
     h.update_reader(BufReader::with_capacity(1 << 20, f))
         .map_err(|e| Error::io(path, e))?;
@@ -264,7 +262,7 @@ fn push_walk_entry(
         None
     };
     let content = if e.kind == EntryKind::File {
-        Some(hash_file(abs)?)
+        Some(hash_file(abs, e)?)
     } else {
         None
     };
@@ -363,6 +361,39 @@ pub fn manifest_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_file_refuses_a_fifo_swapped_in_after_the_walk_without_hanging() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let abs = tmp.path().join("f");
+        std::fs::write(&abs, b"hello").unwrap();
+        let mut entry = None;
+        walk(tmp.path(), &WalkOptions { cross_fs: false }, |item| {
+            if let WalkItem::Entry(e) = item {
+                if e.path == b"f" {
+                    entry = Some(e);
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        let entry = entry.unwrap();
+        assert_eq!(hash_file(&abs, &entry).unwrap(), Hash32::of(b"hello"));
+        std::fs::remove_file(&abs).unwrap();
+        let c = std::ffi::CString::new(abs.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = abs.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(hash_file(&p, &entry).is_err());
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("hash_file hung opening a FIFO");
+        assert!(refused);
+    }
 
     #[test]
     fn mtime_floor_saturates_instead_of_overflowing() {

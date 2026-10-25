@@ -22,14 +22,13 @@ use crate::ids::{Hash32, Id};
 use crate::model::{ContentRow, EntryStatus};
 use crate::pack::{RecordHeader, UnitKind};
 use crate::sniff::{detect, profile_kind, Format, ProfileKind};
-use crate::walk::{mtime_ns, WalkEntry};
+use crate::walk::{mtime_ns, open_walked_file, WalkEntry};
 use crate::xattrs::read_file_xattrs;
 use crossbeam_channel::{Receiver, Sender};
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fs::{File, Metadata, OpenOptions};
+use std::fs::{File, Metadata};
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -233,27 +232,6 @@ fn fstamp(file: &File, abs: &Path) -> Result<Stamp> {
     stamp(&meta, abs)
 }
 
-/// Open the file the walker saw at `abs` and return it with its `fstat`
-/// metadata. `O_NOFOLLOW` refuses a symlink and `O_NONBLOCK` keeps the open from
-/// hanging if the path was swapped for a FIFO after the walk; the `fstat`
-/// then requires the same regular file (`dev`, `ino`). `O_NONBLOCK` has no
-/// effect on reads of a regular file, so the descriptor is read normally.
-fn open_walked_file(abs: &Path, entry: &WalkEntry) -> Result<(File, Metadata)> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(abs)
-        .map_err(|e| Error::io(abs, e))?;
-    let meta = file.metadata().map_err(|e| Error::io(abs, e))?;
-    if !meta.is_file() || meta.dev() != entry.dev || meta.ino() != entry.ino {
-        return Err(Error::io(
-            abs,
-            std::io::Error::other("replaced or changed type during ingest"),
-        ));
-    }
-    Ok((file, meta))
-}
-
 /// `chunk_reader` reports read errors with an empty path.
 fn with_path(e: Error, path: &Path) -> Error {
     match e {
@@ -295,81 +273,4 @@ fn image_dims(format: Format, head: &[u8]) -> Option<(u32, u32)> {
     }
     let s = imagesize::blob_size(head).ok()?;
     Some((u32::try_from(s.width).ok()?, u32::try_from(s.height).ok()?))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::walk::{walk, WalkItem, WalkOptions};
-    use std::os::unix::ffi::OsStrExt;
-
-    /// The walk entry for `name` in `dir`.
-    fn walked(dir: &Path, name: &[u8]) -> WalkEntry {
-        let mut found = None;
-        walk(dir, &WalkOptions { cross_fs: false }, |item| {
-            if let WalkItem::Entry(e) = item {
-                if e.path == name {
-                    found = Some(e);
-                }
-            }
-            Ok(())
-        })
-        .unwrap();
-        found.unwrap()
-    }
-
-    fn assert_refused(r: Result<(File, Metadata)>, abs: &Path) {
-        match r {
-            Err(Error::Io { path, .. }) => assert_eq!(path, abs),
-            Err(e) => panic!("unexpected error {e:?}"),
-            Ok(_) => panic!("swapped path was accepted"),
-        }
-    }
-
-    #[test]
-    fn opens_the_walked_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let abs = tmp.path().join("f");
-        std::fs::write(&abs, b"hello").unwrap();
-        let entry = walked(tmp.path(), b"f");
-        let (_, meta) = open_walked_file(&abs, &entry).unwrap();
-        assert_eq!(meta.len(), 5);
-    }
-
-    #[test]
-    fn fifo_swapped_in_after_walk_is_refused_without_hanging() {
-        let tmp = tempfile::tempdir().unwrap();
-        let abs = tmp.path().join("f");
-        std::fs::write(&abs, b"hello").unwrap();
-        let entry = walked(tmp.path(), b"f");
-        std::fs::remove_file(&abs).unwrap();
-        let c = std::ffi::CString::new(abs.as_os_str().as_bytes()).unwrap();
-        // SAFETY: c is a valid NUL-terminated path for the duration of the call.
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
-        assert_refused(open_walked_file(&abs, &entry), &abs);
-    }
-
-    #[test]
-    fn replaced_file_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let abs = tmp.path().join("f");
-        std::fs::write(&abs, b"hello").unwrap();
-        let entry = walked(tmp.path(), b"f");
-        let other = tmp.path().join("g");
-        std::fs::write(&other, b"hello").unwrap();
-        std::fs::rename(&other, &abs).unwrap();
-        assert_refused(open_walked_file(&abs, &entry), &abs);
-    }
-
-    #[test]
-    fn symlink_swapped_in_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let abs = tmp.path().join("f");
-        std::fs::write(&abs, b"hello").unwrap();
-        let entry = walked(tmp.path(), b"f");
-        std::fs::write(tmp.path().join("g"), b"hello").unwrap();
-        std::fs::remove_file(&abs).unwrap();
-        std::os::unix::fs::symlink("g", &abs).unwrap();
-        assert_refused(open_walked_file(&abs, &entry), &abs);
-    }
 }

@@ -111,7 +111,7 @@ fn compare(
             if e.kind == EntryKind::File {
                 let same_size = row.size.and_then(|s| u64::try_from(s).ok()) == Some(e.size);
                 // Hash only when the sizes match; a row without a hash never matches.
-                if !same_size || Some(hash_file(abs)?) != row.content_hash {
+                if !same_size || Some(hash_file(abs, e)?) != row.content_hash {
                     out.push(Difference::ContentDiffers { path });
                 }
             }
