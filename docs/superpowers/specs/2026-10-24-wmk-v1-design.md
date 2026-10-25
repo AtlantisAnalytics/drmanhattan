@@ -79,7 +79,12 @@ macOS (APFS, including case-insensitive volumes) and Linux (ext4, xfs, btrfs).
 | uid/gid, atime, ctime, ACLs | no | — | — |
 | Sockets, FIFOs, device files | listed in the ingest report, skipped | — | excluded, on both sides |
 
-OS-managed volatile xattrs (`com.apple.provenance`) are neither recorded nor hashed. `com.apple.quarantine` is ordinary data and is recorded.
+Which extended attributes count is fixed per platform. Ingest, `wmk manifest` and the snapshot manifest all apply the same policy, through one shared xattr reader:
+
+- **Linux:** only the `user.*` namespace is recorded and hashed. `security.*` (SELinux labels, file capabilities), `system.*` (POSIX ACLs) and `trusted.*` are ignored. ACLs are not recorded.
+- **macOS:** every xattr is recorded except the OS-managed volatile ones, `com.apple.provenance` and `com.apple.macl`, which are neither recorded nor hashed. `com.apple.quarantine` is ordinary data and is recorded. ACLs (which macOS keeps outside xattrs) are not recorded.
+
+A filesystem without xattr support (`ENOTSUP` or `EOPNOTSUPP`) yields no xattrs rather than an error.
 
 The same rules apply whether a manifest is computed from a live directory (`wmk manifest`) or from a snapshot. That is what makes the hashes comparable.
 

@@ -108,11 +108,12 @@ fn catalog_of(root: &Path, db: &Path, tweak: impl Fn(&mut EntryRow)) -> Id {
         tweak(&mut row);
         ids.insert(e.path.clone(), id);
         tx.send(CatalogOp::InsertEntry(row)).unwrap();
-        // Live files may carry xattrs (e.g. com.apple.provenance on macOS).
+        // Live files may carry xattrs (e.g. com.apple.provenance on macOS,
+        // security.selinux on Linux).
         let abs = root.join(std::ffi::OsStr::from_bytes(&e.path));
         for name in xattr::list(&abs).unwrap_or_default() {
-            // Ingest filters the same list.
-            if drmanhattan_core::manifest::IGNORED_XATTRS.contains(&name.as_bytes()) {
+            // Ingest filters with the same policy.
+            if !drmanhattan_core::manifest::xattr_recorded(name.as_bytes()) {
                 continue;
             }
             if let Ok(Some(v)) = xattr::get(&abs, &name) {

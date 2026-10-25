@@ -18,10 +18,27 @@ use crate::snaptree;
 use crate::walk::{walk, WalkEntry, WalkItem, WalkOptions};
 use crate::xattrs::read_xattrs;
 
-/// OS-managed, per-process xattrs that are neither recorded at ingest nor
-/// hashed (spec §4). Ingest must filter with this same list.
-/// `com.apple.quarantine` is deliberately NOT listed: it is meaningful data.
-pub const IGNORED_XATTRS: &[&[u8]] = &[b"com.apple.provenance"];
+/// macOS: OS-managed xattrs that are neither recorded at ingest nor hashed
+/// (spec §4). `com.apple.quarantine` is deliberately NOT listed: it is
+/// meaningful data.
+pub const IGNORED_XATTRS: &[&[u8]] = &[b"com.apple.provenance", b"com.apple.macl"];
+
+/// Whether the xattr `name` is recorded at ingest and hashed (spec §4).
+/// On Linux only the `user.` namespace is: `security.*`, `system.*` (POSIX
+/// ACLs) and `trusted.*` are not. Elsewhere (macOS) every name is, except
+/// `IGNORED_XATTRS`. Ingest and `manifest_dir` both filter with this, via
+/// the shared xattr reader.
+pub fn xattr_recorded(name: &[u8]) -> bool {
+    recorded_on(cfg!(target_os = "linux"), name)
+}
+
+fn recorded_on(linux: bool, name: &[u8]) -> bool {
+    if linux {
+        name.starts_with(b"user.")
+    } else {
+        !IGNORED_XATTRS.contains(&name)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ManifestOptions {
@@ -334,4 +351,39 @@ pub fn manifest_snapshot(
         Ok(())
     })?;
     Ok(hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recorded_on;
+
+    #[test]
+    fn linux_records_only_the_user_namespace() {
+        for name in [&b"user.wmk"[..], b"user.xdg.origin.url"] {
+            assert!(recorded_on(true, name), "{name:?}");
+        }
+        for name in [
+            &b"security.selinux"[..],
+            b"security.capability",
+            b"system.posix_acl_access",
+            b"system.posix_acl_default",
+            b"trusted.overlay.opaque",
+            b"user",
+        ] {
+            assert!(!recorded_on(true, name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn macos_drops_only_the_os_managed_names() {
+        assert!(!recorded_on(false, b"com.apple.provenance"));
+        assert!(!recorded_on(false, b"com.apple.macl"));
+        for name in [
+            &b"com.apple.quarantine"[..],
+            b"com.apple.metadata:kMDItemWhereFroms",
+            b"com.example.test",
+        ] {
+            assert!(recorded_on(false, name), "{name:?}");
+        }
+    }
 }

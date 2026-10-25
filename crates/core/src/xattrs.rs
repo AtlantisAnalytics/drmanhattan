@@ -2,7 +2,7 @@
 //! Ingest and `manifest_dir` share this logic so they cannot disagree.
 
 use crate::error::{Error, Result};
-use crate::manifest::IGNORED_XATTRS;
+use crate::manifest::xattr_recorded;
 use crate::model::EntryKind;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -29,9 +29,11 @@ pub(crate) fn read_file_xattrs(file: &File, path: &Path) -> Result<Vec<(Vec<u8>,
     )
 }
 
-/// Sorted bytewise by name, with `IGNORED_XATTRS` dropped. A filesystem
-/// without xattr support, and a symlink whose xattrs the OS refuses to list
-/// (`EPERM`), both yield none.
+/// Sorted bytewise by name, keeping only the names `xattr_recorded`
+/// accepts (the spec §4 namespace policy). A filesystem without xattr
+/// support (`ENOTSUP`, or `EOPNOTSUPP`, which differs from it on macOS),
+/// and a symlink whose xattrs the OS refuses to list (`EPERM`), both yield
+/// none.
 fn collect(
     names: io::Result<XAttrs>,
     get: impl Fn(&OsStr) -> io::Result<Option<Vec<u8>>>,
@@ -42,7 +44,7 @@ fn collect(
         Ok(n) => n,
         Err(e) => {
             let code = e.raw_os_error();
-            let unsupported = code == Some(libc::ENOTSUP);
+            let unsupported = code == Some(libc::ENOTSUP) || code == Some(libc::EOPNOTSUPP);
             let link_perm = kind == EntryKind::Symlink && code == Some(libc::EPERM);
             if unsupported || link_perm {
                 return Ok(Vec::new());
@@ -52,7 +54,7 @@ fn collect(
     };
     let mut out = Vec::new();
     for name in names {
-        if IGNORED_XATTRS.contains(&name.as_bytes()) {
+        if !xattr_recorded(name.as_bytes()) {
             continue;
         }
         match get(&name) {
