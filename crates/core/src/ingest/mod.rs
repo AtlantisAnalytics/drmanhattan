@@ -547,7 +547,8 @@ fn finish(repo: &Repo, out: PipelineOutput, started: Instant) -> Result<IngestRe
         row,
         manifest_hash,
     } = out;
-    Catalog::open(&repo.catalog_path())?.upsert_snapshot(&row)?;
+    // The one commit that must survive power loss: after it, wmk exits 0.
+    Catalog::open(&repo.catalog_path())?.upsert_snapshot_durable(&row)?;
     let dedup_ratio = if stats.new_bytes_stored == 0 {
         0.0
     } else {

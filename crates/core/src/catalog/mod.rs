@@ -509,6 +509,18 @@ impl Catalog {
     pub fn upsert_snapshot(&self, s: &SnapshotRow) -> Result<()> {
         writer::upsert_snapshot(&self.conn, s)
     }
+
+    /// `upsert_snapshot`, durable against power loss once it returns.
+    ///
+    /// The catalog runs WAL with `synchronous=NORMAL`, under which the last
+    /// commits before a power cut may roll back. This switches the
+    /// connection to `synchronous=FULL` first, so the commit fsyncs the WAL.
+    /// Ingest marks a snapshot complete with it: a run that exits 0 never
+    /// loses its `complete` row.
+    pub fn upsert_snapshot_durable(&self, s: &SnapshotRow) -> Result<()> {
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
+        writer::upsert_snapshot(&self.conn, s)
+    }
 }
 
 fn unsupported_version(v: i64) -> Error {
@@ -516,4 +528,42 @@ fn unsupported_version(v: i64) -> Error {
         "unsupported catalog user_version {v} (this build supports {})",
         schema::USER_VERSION
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_upsert_commits_with_synchronous_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&tmp.path().join("c.sqlite")).unwrap();
+        let sync = |c: &Catalog| -> i64 {
+            c.conn
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(sync(&cat), 1, "NORMAL by default");
+        let row = SnapshotRow {
+            id: Id::new_v7(),
+            status: SnapshotStatus::Complete,
+            source_root: b"/src".to_vec(),
+            host: "h".into(),
+            tool_version: "0".into(),
+            started_at: 1,
+            completed_at: Some(2),
+            note: None,
+            manifest_hash: None,
+            ext_manifest_hash: None,
+            source_manifest_hash: None,
+            record_unit: None,
+            entry_count: None,
+            file_bytes: None,
+            screened_out: 0,
+            label_pattern: None,
+        };
+        cat.upsert_snapshot_durable(&row).unwrap();
+        assert_eq!(sync(&cat), 2, "FULL");
+        assert_eq!(cat.snapshot(row.id).unwrap(), row);
+    }
 }
