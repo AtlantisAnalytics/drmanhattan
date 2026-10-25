@@ -504,7 +504,8 @@ fn preflight_normalizing_fs_rejects_rewritten_names() {
     let msgs = check(&es, &probe_with(|p| p.normalizes_names = true), 10);
     assert_eq!(
         msgs,
-        vec!["name not representable: caf\\xc3\\xa9".to_string()]
+        // Printable UTF-8 is shown as is (the one display renderer).
+        vec!["name not representable: caf\u{e9}".to_string()]
     );
 }
 

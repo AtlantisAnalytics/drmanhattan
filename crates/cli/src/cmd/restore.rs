@@ -1,5 +1,5 @@
 use crate::cmd::open_repo;
-use crate::output::emit;
+use crate::output::{display_path, emit};
 use crate::Cli;
 use anyhow::{anyhow, Result};
 use clap::Args;
@@ -118,11 +118,7 @@ pub fn run(cli: &Cli, args: &RestoreArgs) -> Result<i32> {
     };
     emit(
         cli.json,
-        &Report::new(
-            snapshot.to_string(),
-            args.dest.display().to_string(),
-            &report,
-        ),
+        &Report::new(snapshot.to_string(), display_path(&args.dest), &report),
     )?;
     Ok(if report.withheld > 0 { 3 } else { 0 })
 }

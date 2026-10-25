@@ -2,6 +2,7 @@
 //! refuse any tree it would silently alter: names that collide or would be
 //! rewritten, and paths longer than it allows.
 
+use crate::display::{display_bytes, display_path};
 use crate::error::{Error, Result};
 use crate::ids::Id;
 use crate::model::EntryRow;
@@ -104,10 +105,10 @@ pub fn probe(dir: &Path) -> Result<FsProbe> {
         // `check` can only predict an NFD rewrite.
         return Err(Error::Preflight(vec![format!(
             "destination filesystem rewrites names in an unknown way: {} reads back as {}",
-            NFC_E.escape_ascii(),
+            display_bytes(NFC_E),
             listed
                 .iter()
-                .map(|n| n.escape_ascii().to_string())
+                .map(|n| display_bytes(n))
                 .collect::<Vec<_>>()
                 .join(", ")
         )]));
@@ -152,7 +153,7 @@ fn precision_of(subsec_ns: u32) -> u64 {
 
 fn path_max(dir: &Path) -> Result<usize> {
     let c = CString::new(dir.as_os_str().as_bytes())
-        .map_err(|_| Error::Preflight(vec![format!("path contains NUL: {}", dir.display())]))?;
+        .map_err(|_| Error::Preflight(vec![format!("path contains NUL: {}", display_path(dir))]))?;
     // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
     let v = unsafe { libc::pathconf(c.as_ptr(), libc::_PC_PATH_MAX) };
     // -1: no limit reported (the probe has just written in `dir`, so it
@@ -206,8 +207,8 @@ pub fn check(entries: &[EntryRow], probe: &FsProbe, dest_abs_len: usize) -> Vec<
             match seen.get(&(e.parent_id, key.clone())) {
                 Some(first) => msgs.push(format!(
                     "case collision: {} vs {}",
-                    first.escape_ascii(),
-                    e.path.escape_ascii()
+                    display_bytes(first),
+                    display_bytes(&e.path)
                 )),
                 None => {
                     seen.insert((e.parent_id, key), &e.path);
@@ -215,14 +216,17 @@ pub fn check(entries: &[EntryRow], probe: &FsProbe, dest_abs_len: usize) -> Vec<
             }
         }
         if not_representable(&e.name, probe) {
-            msgs.push(format!("name not representable: {}", e.path.escape_ascii()));
+            msgs.push(format!(
+                "name not representable: {}",
+                display_bytes(&e.path)
+            ));
         }
         let len = dest_abs_len + 1 + e.path.len();
         if len >= probe.path_max {
             msgs.push(format!(
                 "path too long ({len} > {}): {}",
                 probe.path_max.saturating_sub(1),
-                e.path.escape_ascii()
+                display_bytes(&e.path)
             ));
         }
     }

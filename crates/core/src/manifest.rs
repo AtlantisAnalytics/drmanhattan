@@ -10,6 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::catalog::Catalog;
+use crate::display::display_bytes;
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::model::EntryKind;
@@ -127,13 +128,19 @@ impl ManifestHasher {
                 buf.extend_from_slice(&mtime.to_le_bytes());
                 buf.extend_from_slice(&e.size.to_le_bytes());
                 let c = e.content.ok_or_else(|| {
-                    Error::Corrupt(format!("file entry {:?} has no content hash", e.path))
+                    Error::Corrupt(format!(
+                        "file entry {} has no content hash",
+                        display_bytes(e.path)
+                    ))
                 })?;
                 buf.extend_from_slice(&c.0);
             }
             EntryKind::Symlink => {
                 let t = e.link_target.ok_or_else(|| {
-                    Error::Corrupt(format!("symlink entry {:?} has no target", e.path))
+                    Error::Corrupt(format!(
+                        "symlink entry {} has no target",
+                        display_bytes(e.path)
+                    ))
                 })?;
                 put_u32(&mut buf, t.len())?;
                 buf.extend_from_slice(t);
@@ -259,7 +266,8 @@ pub fn manifest_snapshot(
 ) -> Result<ManifestHashes> {
     let withheld = || {
         Error::NotFound(format!(
-            "path {root_path:?} is withheld in snapshot {snapshot}"
+            "path {} is withheld in snapshot {snapshot}",
+            display_bytes(root_path)
         ))
     };
     let mut counts: HashMap<i64, u32> = HashMap::new();
@@ -292,12 +300,20 @@ pub fn manifest_snapshot(
         };
         let (size, content) = if row.kind == EntryKind::File {
             let content = row.content_hash.ok_or_else(|| {
-                Error::Corrupt(format!("file entry {:?} has no content hash", row.path))
+                Error::Corrupt(format!(
+                    "file entry {} has no content hash",
+                    display_bytes(&row.path)
+                ))
             })?;
             let size = row
                 .size
                 .and_then(|s| u64::try_from(s).ok())
-                .ok_or_else(|| Error::Corrupt(format!("file entry {:?} has no size", row.path)))?;
+                .ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "file entry {} has no size",
+                        display_bytes(&row.path)
+                    ))
+                })?;
             (size, Some(content))
         } else {
             (0, None)

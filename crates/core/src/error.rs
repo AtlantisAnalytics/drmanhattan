@@ -1,8 +1,9 @@
+use crate::display::display_path;
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("I/O error on {}: {source}", path.display())]
+    #[error("I/O error on {}: {source}", display_path(path))]
     Io {
         path: PathBuf,
         #[source]
@@ -22,7 +23,7 @@ pub enum Error {
     Ambiguous(String),
     #[error("preflight failed: {}", .0.join("; "))]
     Preflight(Vec<String>),
-    #[error("tree changed while reading: {}", .0.display())]
+    #[error("tree changed while reading: {}", display_path(.0))]
     Unstable(PathBuf),
     #[error("source and repository paths overlap")]
     Overlap,

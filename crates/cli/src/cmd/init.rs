@@ -1,4 +1,4 @@
-use crate::output::emit;
+use crate::output::{display_path, emit};
 use crate::Cli;
 use anyhow::{anyhow, Result};
 use clap::Args;
@@ -32,7 +32,7 @@ pub fn run(cli: &Cli, args: &InitArgs) -> Result<()> {
         .ok_or_else(|| anyhow!("no repository path given (use <path>, --repo, or WMK_REPO)"))?;
     let repo = Repo::init(&path)?;
     let report = InitReport {
-        path: repo.root.display().to_string(),
+        path: display_path(&repo.root),
         format_version: repo.config.format_version,
     };
     emit(cli.json, &report)

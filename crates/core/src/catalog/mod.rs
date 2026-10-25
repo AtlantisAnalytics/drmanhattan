@@ -4,6 +4,7 @@ pub mod schema;
 pub mod writer;
 
 use crate::compress::Compression;
+use crate::display::display_bytes;
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::model::{
@@ -342,8 +343,8 @@ impl Catalog {
         )?
         .ok_or_else(|| {
             Error::NotFound(format!(
-                "path {:?} in snapshot {snapshot}",
-                String::from_utf8_lossy(path)
+                "path {} in snapshot {snapshot}",
+                display_bytes(path)
             ))
         })
     }

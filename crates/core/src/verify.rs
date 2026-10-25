@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
+use crate::display::display_path;
 use crate::error::Result;
 use crate::ids::{Hash32, Id};
 use crate::ingest::record;
@@ -46,7 +47,8 @@ impl Checker<'_> {
     fn pack(&mut self, id: Id) -> &std::result::Result<PackReader, String> {
         self.packs.entry(id).or_insert_with(|| {
             let path = pack_path(&self.repo.packs_dir(), id);
-            PackReader::open(&path).map_err(|e| format!("pack {} unreadable: {e}", path.display()))
+            PackReader::open(&path)
+                .map_err(|e| format!("pack {} unreadable: {e}", display_path(&path)))
         })
     }
 
@@ -66,7 +68,7 @@ impl Checker<'_> {
         self.touched.insert(row.pack_id);
         let loc = format!(
             "pack {} offset {}",
-            pack_path(&self.repo.packs_dir(), row.pack_id).display(),
+            display_path(&pack_path(&self.repo.packs_dir(), row.pack_id)),
             row.pack_offset
         );
         let offset = match u64::try_from(row.pack_offset) {
@@ -224,9 +226,11 @@ pub fn run(repo: &Repo, snapshot: Option<Id>, quick: bool) -> Result<VerifyRepor
             match scan(&path) {
                 Ok(s) if s.sealed && s.blake3_ok != Some(true) => c
                     .problems
-                    .push(format!("pack {}: BLAKE3 mismatch", path.display())),
+                    .push(format!("pack {}: BLAKE3 mismatch", display_path(&path))),
                 Ok(_) => {}
-                Err(e) => c.problems.push(format!("pack {}: {e}", path.display())),
+                Err(e) => c
+                    .problems
+                    .push(format!("pack {}: {e}", display_path(&path))),
             }
         }
     }

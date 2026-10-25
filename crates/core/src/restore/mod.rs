@@ -10,6 +10,7 @@
 pub mod preflight;
 
 use crate::catalog::Catalog;
+use crate::display::{display_bytes, display_path};
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::model::{EntryKind, EntryRow, SnapshotStatus, UnitRow};
@@ -87,14 +88,14 @@ pub fn run_with_probe(
     if exists(&dest)? {
         return Err(Error::Preflight(vec![format!(
             "destination exists: {}",
-            dest.display()
+            display_path(&dest)
         )]));
     }
     let partial = partial_path(&dest, snapshot);
     if exists(&partial)? {
         return Err(Error::Preflight(vec![format!(
             "partial restore {} exists from an earlier attempt; inspect or remove it",
-            partial.display()
+            display_path(&partial)
         )]));
     }
     let (entries, withheld) = collect(&cat, snapshot, &opts.path)?;
@@ -184,7 +185,7 @@ fn locate(dest: &Path) -> Result<(PathBuf, PathBuf)> {
     let name = dest.file_name().ok_or_else(|| {
         Error::Preflight(vec![format!(
             "destination has no final name: {}",
-            dest.display()
+            display_path(dest)
         )])
     })?;
     let parent = match dest.parent() {
@@ -222,7 +223,7 @@ fn collect(cat: &Catalog, snapshot: Id, root_path: &[u8]) -> Result<(Vec<EntryRo
             if out.is_empty() {
                 return Err(Error::NotFound(format!(
                     "path {} is withheld in snapshot {snapshot}",
-                    root_path.escape_ascii()
+                    display_bytes(root_path)
                 )));
             }
             withheld += 1;
@@ -242,7 +243,7 @@ fn validate(e: &EntryRow) -> Result<()> {
     let bad = |what: &str| {
         Err(Error::Corrupt(format!(
             "entry {} {what}",
-            e.path.escape_ascii()
+            display_bytes(&e.path)
         )))
     };
     match e.kind {
@@ -300,8 +301,8 @@ fn plan(cat: &Catalog, entries: &[EntryRow], hardlinks: bool) -> Result<Plan> {
                 if entries[first].content_hash != Some(content) {
                     return Err(Error::Corrupt(format!(
                         "hard-link group {g} members {} and {} have different content",
-                        entries[first].path.escape_ascii(),
-                        e.path.escape_ascii()
+                        display_bytes(&entries[first].path),
+                        display_bytes(&e.path)
                     )));
                 }
                 plan.links.push((i, first));
@@ -347,7 +348,7 @@ fn write_file(reader: &UnitReader, path: &Path, job: &FileJob) -> Result<()> {
     if got != job.content {
         return Err(Error::Corrupt(format!(
             "restored file {} hashes to {got}, catalog says {}",
-            path.display(),
+            display_path(path),
             job.content
         )));
     }

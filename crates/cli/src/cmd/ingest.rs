@@ -1,5 +1,5 @@
 use crate::cmd::open_repo;
-use crate::output::emit;
+use crate::output::{display_bytes, emit};
 use crate::Cli;
 use anyhow::Result;
 use clap::Args;
@@ -50,11 +50,6 @@ struct Report {
     withheld: u64,
 }
 
-/// Lossless, printable rendering of a raw path.
-fn show(path: &[u8]) -> String {
-    path.escape_ascii().to_string()
-}
-
 impl Report {
     fn new(r: &IngestReport) -> Report {
         Report {
@@ -72,11 +67,11 @@ impl Report {
                 .skipped
                 .iter()
                 .map(|(p, reason)| Skipped {
-                    path: show(p),
+                    path: display_bytes(p),
                     reason: reason.as_str(),
                 })
                 .collect(),
-            unstable: r.unstable.iter().map(|p| show(p)).collect(),
+            unstable: r.unstable.iter().map(|p| display_bytes(p)).collect(),
             withheld: r.withheld,
         }
     }

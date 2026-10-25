@@ -51,7 +51,7 @@ impl fmt::Display for Rows {
                 rfc3339(r.started_at),
                 dash(r.entry_count),
                 dash(r.file_bytes),
-                r.note.as_deref().unwrap_or("")
+                display_bytes(r.note.as_deref().unwrap_or("").as_bytes())
             )?;
         }
         Ok(())

@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 
 use crate::catalog::Catalog;
+use crate::display::display_bytes;
 use crate::error::{Error, Result};
 use crate::ids::Id;
 use crate::model::{EntryKind, EntryRow, EntryStatus};
@@ -45,7 +46,7 @@ fn corrupt(snapshot: Id, row: &EntryRow, why: &str) -> Error {
     Error::Corrupt(format!(
         "snapshot {snapshot}: entry {} at {}: {why}",
         row.id,
-        row.path.escape_ascii()
+        display_bytes(&row.path)
     ))
 }
 
@@ -78,8 +79,8 @@ fn check_child(snapshot: Id, parent: &[u8], row: &EntryRow) -> Result<()> {
             row,
             &format!(
                 "stored path disagrees with its parent's path {} and its name {}",
-                parent.escape_ascii(),
-                row.name.escape_ascii()
+                display_bytes(parent),
+                display_bytes(&row.name)
             ),
         ));
     }

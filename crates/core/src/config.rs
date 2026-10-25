@@ -1,3 +1,4 @@
+use crate::display::display_path;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -65,8 +66,8 @@ impl Default for Config {
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
-        let cfg: Config =
-            toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+        let cfg: Config = toml::from_str(&text)
+            .map_err(|e| Error::Config(format!("{}: {e}", display_path(path))))?;
         cfg.validate()?;
         Ok(cfg)
     }

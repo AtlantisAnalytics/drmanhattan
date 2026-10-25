@@ -14,6 +14,7 @@
 //! recognised from its last 16 bytes, independent of any mid-file damage.
 
 use crate::compress::{self, Compression};
+use crate::display::display_path;
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use std::fs::{File, OpenOptions};
@@ -248,7 +249,7 @@ impl PackWriter {
     fn poisoned(&self) -> Error {
         Error::Corrupt(format!(
             "pack writer poisoned by earlier I/O error: {}",
-            self.path.display()
+            display_path(&self.path)
         ))
     }
 
@@ -368,7 +369,7 @@ impl PackReader {
     fn corrupt(&self, offset: u64, why: impl std::fmt::Display) -> Error {
         Error::Corrupt(format!(
             "pack {} at offset {offset}: {why}",
-            self.path.display()
+            display_path(&self.path)
         ))
     }
 
@@ -505,7 +506,7 @@ impl PackReader {
 /// invalid record. Unsupported kinds/compressions and I/O errors are errors.
 pub fn scan(path: &Path) -> Result<PackScan> {
     let r = PackReader::open(path)?;
-    let bad = |why: &str| Error::Corrupt(format!("pack {}: {why}", path.display()));
+    let bad = |why: &str| Error::Corrupt(format!("pack {}: {why}", display_path(path)));
     if r.len < FILE_HEADER_LEN {
         return Err(bad("file shorter than pack header"));
     }

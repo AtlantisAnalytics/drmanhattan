@@ -11,17 +11,10 @@ pub fn emit<T: Serialize + std::fmt::Display>(json: bool, value: &T) -> Result<(
     Ok(())
 }
 
-/// Render stored bytes for display: valid UTF-8 as is, each invalid byte as `\xHH`.
-pub fn display_bytes(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    for chunk in bytes.utf8_chunks() {
-        out.push_str(chunk.valid());
-        for b in chunk.invalid() {
-            out.push_str(&format!("\\x{b:02x}"));
-        }
-    }
-    out
-}
+/// The one renderer for every user-visible path, name and link target, in
+/// human and JSON output alike (core's error messages use it too): printable
+/// UTF-8 as is, `\` as `\\`, and each control or invalid byte as `\xHH`.
+pub use drmanhattan_core::display::{display_bytes, display_path};
 
 #[cfg(test)]
 mod tests {
@@ -30,6 +23,12 @@ mod tests {
     #[test]
     fn display_bytes_escapes() {
         assert_eq!(display_bytes(b"a\xffb"), "a\\xffb");
+    }
+
+    #[test]
+    fn controls_and_backslash_are_escaped() {
+        assert_eq!(display_bytes(b"a\x1b[2Jb\nfake"), "a\\x1b[2Jb\\x0afake");
+        assert_eq!(display_bytes(b"\\xff"), "\\\\xff");
     }
 
     #[test]

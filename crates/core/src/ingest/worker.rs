@@ -16,6 +16,7 @@ use crate::catalog::Catalog;
 use crate::chunk::{chunk_reader, FileDigest};
 use crate::compress::encode;
 use crate::config::Config;
+use crate::display::display_path;
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::model::{ContentRow, EntryStatus};
@@ -138,7 +139,7 @@ impl Worker<'_> {
                 v => {
                     return Err(Error::Corrupt(format!(
                         "screener returned {v:?} for {}; withholding is not supported yet",
-                        abs.display()
+                        display_path(&abs)
                     )))
                 }
             }

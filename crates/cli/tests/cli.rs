@@ -280,3 +280,51 @@ fn show_non_utf8_name_escaped() {
         .collect();
     assert_eq!(names, ["bad\\xff"]);
 }
+
+/// A name a terminal would act on (clear screen, fake second line).
+const HOSTILE: &[u8] = b"a\x1b[2Jb\nfake";
+const HOSTILE_SHOWN: &str = "a\\x1b[2Jb\\x0afake";
+
+#[test]
+fn hostile_names_are_escaped_in_human_and_json_output() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("r");
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join(std::ffi::OsStr::from_bytes(HOSTILE)), b"x").unwrap();
+    wmk().arg("init").arg(&repo).assert().success();
+    wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .arg("ingest")
+        .arg(&src)
+        .assert()
+        .success();
+    let out = wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .args(["show", "latest"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains(HOSTILE_SHOWN), "{stdout:?}");
+    assert!(!stdout.contains('\x1b'), "raw ESC in {stdout:?}");
+    assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
+    let v = run_json(&repo, &["show", "latest"]);
+    assert_eq!(v[0]["name"].as_str().unwrap(), HOSTILE_SHOWN);
+}
+
+#[test]
+fn hostile_paths_are_escaped_in_error_text() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join(std::ffi::OsStr::from_bytes(HOSTILE));
+    let out = wmk().arg("manifest").arg(&missing).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains(HOSTILE_SHOWN), "{stderr:?}");
+    assert!(!stderr.contains('\x1b'), "raw ESC in {stderr:?}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+}
