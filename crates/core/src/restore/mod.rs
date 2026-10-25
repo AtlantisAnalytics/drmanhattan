@@ -13,6 +13,7 @@ use crate::catalog::Catalog;
 use crate::display::{display_bytes, display_path};
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
+use crate::manifest::xattr_recorded;
 use crate::model::{EntryKind, EntryRow, SnapshotStatus, UnitRow};
 use crate::repo::Repo;
 use crate::snaptree;
@@ -99,6 +100,7 @@ pub fn run_with_probe(
         )]));
     }
     let (entries, withheld) = collect(&cat, snapshot, &opts.path)?;
+    check_xattr_names(&cat, snapshot, &entries)?;
     let probe = match probe {
         Some(p) => p,
         None => preflight::probe(&parent)?,
@@ -252,6 +254,22 @@ fn validate(e: &EntryRow) -> Result<()> {
         EntryKind::Symlink if e.link_target.is_none() => bad("has no link target"),
         _ => Ok(()),
     }
+}
+
+/// Refuse any xattr the namespace policy never records (spec §4). An honest
+/// catalog cannot hold one, and setting `security.*` or `trusted.*` as root
+/// would defeat the intent of masking setuid bits. Checked whether or not
+/// `--xattrs` is given: the catalog is corrupt either way.
+fn check_xattr_names(cat: &Catalog, snapshot: Id, entries: &[EntryRow]) -> Result<()> {
+    let index: HashMap<Id, usize> = entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
+    cat.for_each_snapshot_xattr(snapshot, |id, name, _| match index.get(&id) {
+        Some(&i) if !xattr_recorded(&name) => Err(Error::Corrupt(format!(
+            "snapshot {snapshot}: entry {} has xattr {} outside the recorded namespace",
+            display_bytes(&entries[i].path),
+            display_bytes(&name)
+        ))),
+        _ => Ok(()),
+    })
 }
 
 struct FileJob {

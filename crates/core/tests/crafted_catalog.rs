@@ -259,3 +259,47 @@ fn root_with_a_name_is_corrupt() {
     let c = case(|conn, _| set(conn, b"", "name = ?1", b"root"));
     assert_refused(&c, b"");
 }
+
+/// A name the namespace policy refuses to record on this OS.
+#[cfg(target_os = "linux")]
+const UNRECORDED_XATTR: &str = "security.capability";
+#[cfg(not(target_os = "linux"))]
+const UNRECORDED_XATTR: &str = "com.apple.provenance";
+
+/// An honest catalog never holds an xattr outside the policy, so restore
+/// refuses one before writing anything, with or without `--xattrs`.
+#[test]
+fn xattr_outside_namespace_policy_is_corrupt() {
+    for xattrs in [false, true] {
+        let c = case(|conn, _| {
+            conn.execute(
+                "INSERT INTO xattr(entry_id, name, value) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id_of(conn, b"a/f"), UNRECORDED_XATTR.as_bytes(), &b"v"[..]],
+            )
+            .unwrap();
+        });
+        let (repo_dir, out, snap) = (c.repo_dir.clone(), c.out.clone(), c.snapshot);
+        let r = within("restore", move || {
+            let repo = Repo::open(&repo_dir).unwrap();
+            let opts = RestoreOptions {
+                path: Vec::new(),
+                hardlinks: true,
+                xattrs,
+            };
+            restore::run(&repo, snap, &out.join("dest"), &opts)
+        });
+        match r {
+            Err(Error::Corrupt(m)) => {
+                assert!(m.contains("snapshot "), "xattrs={xattrs}: {m:?}");
+                assert!(m.contains("a/f"), "xattrs={xattrs}: {m:?}");
+                assert!(m.contains(UNRECORDED_XATTR), "xattrs={xattrs}: {m:?}");
+            }
+            other => panic!("xattrs={xattrs}: expected Corrupt, got {other:?}"),
+        }
+        let left: Vec<_> = fs::read_dir(&c.out)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(left.is_empty(), "xattrs={xattrs}: restore wrote {left:?}");
+    }
+}
