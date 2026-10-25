@@ -255,13 +255,14 @@ All integers are little-endian.
 
 ```
 header : "WMKPACK\0" (8) | format u16 | pack_id (16)
-record : marker u32 = 0x574D4B52 ("WMKR") | kind u8 | compression u8
+record : marker u32 = 0x574D4B52 | kind u8 | compression u8
          | unit_hash (32) | raw_len u64 | stored_len u64
          | header_crc32c u32 (over the preceding header fields) | payload (stored_len)
 footer : (only on seal) record count u64 | [unit_hash, offset u64]* | pack_blake3 (32)
          | footer_offset u64 | "WMKPEND\0" (8)
 ```
 
+- The record marker is the u32 0x574D4B52 written little-endian, so its bytes on disk are `52 4B 4D 57` ("RKMW", not "WMKR").
 - Every record is self-describing, so the catalog can be rebuilt by scanning packs (`recover`).
 - `header_crc32c` lets the scanner detect a torn tail on an unsealed pack and truncate it.
 - `pack_blake3` covers every byte before the footer, i.e. file offsets `[0, footer_offset)`.
@@ -328,7 +329,7 @@ file:    mode u32 (& 0o1777) | mtime_ns i64 | size u64 | content_blake3 (32)
 symlink: target_len u32 | target bytes
 ```
 
-The root entry has `path = ""` and is included.
+An entry's `path` is its root-relative path: the raw bytes of each name from the root down to the entry, joined with `/`, with no leading or trailing slash. The root entry itself has the empty path `""` and is included. The same definition holds for `entry.path` in the catalog (§6.1): every reader derives each path from its parent's path and its own `name`, and treats a stored path that disagrees, a name that is empty (except the root's), `.` or `..` or contains `/` or NUL, a second root, or a cycle as corruption. When a subtree is hashed, paths are relative to the subtree's root, which gets `""`.
 
 `ext_manifest_hash` uses the same encoding, followed after each entry by:
 
@@ -337,7 +338,7 @@ The root entry has `path = ""` and is included.
 
 Exactly, per entry, the ext stream is: the core bytes above, then `hardlink_first u64 | xattr_count u32 | (name_len u32 | name | value_len u32 | value)*`. Entries with no xattrs contribute `xattr_count = 0`.
 
-All integers in §6.4 (core and ext) are little-endian. A `mtime_ns` is first floored to the mtime precision (`m - m.rem_euclid(p)`; precision 0 is treated as 1). An entry that cannot be encoded (a symlink without a target, a file without a content hash, a length over `u32`) is an error, never hashed as a default.
+All integers in §6.4 (core and ext) are little-endian. An `mtime_ns` is first floored to the mtime precision (`m - m.rem_euclid(p)`; precision 0 is treated as 1). An entry that cannot be encoded (a symlink without a target, a file without a content hash, a length over `u32`) is an error, never hashed as a default.
 
 UUIDs, labels, media, provenance, and snapshot metadata are never hashed.
 
@@ -367,10 +368,11 @@ walker ──► reader/chunker pool (rayon) ──► pack writer (1 thread) �
    - This is the only authority on whether a unit is new. It checks the in-memory set of in-flight hashes and the catalog, so concurrent duplicates are written once.
    - New units are appended to the open pack. At `max_size` the pack is fsynced, its footer written, and it is sealed.
 8. **Catalog writer.** Commits batched transactions of about 10k rows or 1 s, whichever comes first.
-9. **Finish.**
-   - Fsync all packs and write the `snapshot_record` unit.
-   - Compute `manifest_hash`, `ext_manifest_hash` and `source_manifest_hash`.
-   - Set `status=complete`.
+9. **Finish**, in this order, once every entry row is committed:
+   1. Compute `manifest_hash`, `ext_manifest_hash` and `source_manifest_hash` from the committed catalog.
+   2. Build the snapshot record (§6.3) from the catalog, with the final snapshot row (`status=complete`, the hashes, `completed_at`) as its header.
+   3. Write the record's units through the pack writer like any other units, fsync the pack and commit them, then seal the open pack.
+   4. Run the final upsert: the snapshot row with `status=complete` and its `record_unit`. This one commit runs with SQLite `synchronous=FULL`, so once wmk exits 0 the `complete` row survives power loss.
 
 **Ordering invariant:** pack bytes are fsynced before any catalog row that references them is committed.
 
