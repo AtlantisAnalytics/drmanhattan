@@ -116,6 +116,14 @@ pub fn run(repo: &Repo, source: &Path, opts: &IngestOptions) -> Result<IngestRep
     if source.starts_with(&root) || root.starts_with(&source) {
         return Err(Error::Overlap);
     }
+    // Refuse a non-directory before the snapshot row exists, not after.
+    let meta = std::fs::metadata(&source).map_err(|e| Error::io(&source, e))?;
+    if !meta.is_dir() {
+        return Err(Error::io(
+            &source,
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a directory"),
+        ));
+    }
     let (host, source_root) = recorded_identity(opts, &source);
     let snap = SnapshotRow {
         id: Id::new_v7(),

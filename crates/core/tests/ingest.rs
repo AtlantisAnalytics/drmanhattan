@@ -348,13 +348,21 @@ fn image_dimensions_recorded() {
 
 #[test]
 fn walk_error_marks_failed() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root can list mode-000 directories
+    }
+    use std::os::unix::fs::PermissionsExt;
     let (_tmp, repo, src) = setup();
-    let file = src.join("not-a-dir");
-    std::fs::write(&file, b"x").unwrap();
-    assert!(matches!(
-        ingest::run(&repo, &file, &opts()),
-        Err(Error::Io { .. })
-    ));
+    let locked = src.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r = ingest::run(&repo, &src, &opts());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(&r, Err(Error::Io { path, .. }) if *path == locked.canonicalize().unwrap()),
+        "{r:?}"
+    );
     let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
     let snaps = cat.snapshots().unwrap();
     assert_eq!(snaps.len(), 1);
@@ -394,4 +402,25 @@ fn worker_error_aborts_cleanly() {
     // not vacuous.
     assert!(count(&repo, "SELECT count(*) FROM unit") > 0);
     common::assert_units_within_packs(&repo);
+}
+
+#[test]
+fn non_directory_source_is_refused_before_any_snapshot_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repo::init(&tmp.path().join("r")).unwrap();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"not a dir").unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    for src in [&file, &link] {
+        match ingest::run(&repo, src, &opts()) {
+            Err(Error::Io { path, .. }) => assert_eq!(path, file.canonicalize().unwrap()),
+            other => panic!("{other:?}"),
+        }
+    }
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    assert!(
+        cat.snapshots().unwrap().is_empty(),
+        "a snapshot row was created"
+    );
 }
