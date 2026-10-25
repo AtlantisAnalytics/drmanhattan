@@ -401,3 +401,67 @@ fn diff_precision() {
         "{d:?}"
     );
 }
+
+fn unit_of(repo: &Repo, snap: Id, path: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    let c = cat.entry_by_path(snap, path).unwrap().content_hash.unwrap();
+    let u = cat.content_units(&c).unwrap()[0].hash;
+    (c.0.to_vec(), u.0.to_vec())
+}
+
+#[test]
+fn full_verify_detects_content_mapped_to_wrong_units() {
+    let (_tmp, repo, snap) = setup();
+    // Every unit stays intact; only the content -> unit mapping lies.
+    let (alpha, _) = unit_of(&repo, snap, b"a.txt");
+    let (_, mode_unit) = unit_of(&repo, snap, b"m.txt");
+    let conn = rusqlite::Connection::open(repo.catalog_path()).unwrap();
+    let n = conn
+        .execute(
+            "UPDATE content_unit SET unit_hash = ?1 WHERE content_hash = ?2",
+            rusqlite::params![mode_unit, alpha],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    drop(conn);
+
+    let q = verify::run(&repo, Some(snap), true).unwrap();
+    assert!(
+        q.problems.is_empty(),
+        "quick checks units only: {:?}",
+        q.problems
+    );
+    let f = verify::run(&repo, Some(snap), false).unwrap();
+    let hex: String = alpha.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(
+        f.problems.iter().any(|p| p.contains(&hex)),
+        "{:?}",
+        f.problems
+    );
+}
+
+#[test]
+fn verify_detects_unit_kind_disagreeing_with_record_header() {
+    let (_tmp, repo, snap) = setup();
+    let (_, unit) = unit_of(&repo, snap, b"a.txt");
+    let conn = rusqlite::Connection::open(repo.catalog_path()).unwrap();
+    let n = conn
+        .execute(
+            "UPDATE unit SET kind = 'purge_record' WHERE hash = ?1",
+            [&unit],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    drop(conn);
+    let hex: String = unit.iter().map(|b| format!("{b:02x}")).collect();
+    for quick in [true, false] {
+        let r = verify::run(&repo, Some(snap), quick).unwrap();
+        assert!(
+            r.problems
+                .iter()
+                .any(|p| p.contains(&hex) && p.contains("kind")),
+            "quick={quick}: {:?}",
+            r.problems
+        );
+    }
+}
