@@ -338,7 +338,7 @@ An entry's `path` is its root-relative path: the raw bytes of each name from the
 
 Exactly, per entry, the ext stream is: the core bytes above, then `hardlink_first u64 | xattr_count u32 | (name_len u32 | name | value_len u32 | value)*`. Entries with no xattrs contribute `xattr_count = 0`.
 
-All integers in §6.4 (core and ext) are little-endian. An `mtime_ns` is first floored to the mtime precision (`m - m.rem_euclid(p)`; precision 0 is treated as 1). An entry that cannot be encoded (a symlink without a target, a file without a content hash, a length over `u32`) is an error, never hashed as a default.
+All integers in §6.4 (core and ext) are little-endian. An `mtime_ns` is first floored to the mtime precision (`m - m.rem_euclid(p)`, saturating at `i64::MIN`; precision 0 is treated as 1). An entry that cannot be encoded (a symlink without a target, a file without a content hash, a length over `u32`) is an error, never hashed as a default.
 
 UUIDs, labels, media, provenance, and snapshot metadata are never hashed.
 

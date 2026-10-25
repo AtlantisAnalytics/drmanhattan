@@ -98,6 +98,13 @@ impl OwnedManifestEntry {
     }
 }
 
+/// `ns` floored to a multiple of `precision` (which must be at least 1):
+/// `ns - ns.rem_euclid(precision)`, saturating at `i64::MIN` where the
+/// true floor is not representable.
+pub(crate) fn floor_mtime(ns: i64, precision: i64) -> i64 {
+    ns.saturating_sub(ns.rem_euclid(precision))
+}
+
 pub struct ManifestHasher {
     core: blake3::Hasher,
     ext: blake3::Hasher,
@@ -134,7 +141,7 @@ impl ManifestHasher {
         buf.extend_from_slice(e.path);
         buf.push(e.kind.as_u8());
         let mode = e.mode & 0o1777;
-        let mtime = e.mtime_ns - e.mtime_ns.rem_euclid(self.precision);
+        let mtime = floor_mtime(e.mtime_ns, self.precision);
         match e.kind {
             EntryKind::Dir => {
                 buf.extend_from_slice(&mode.to_le_bytes());
@@ -355,7 +362,30 @@ pub fn manifest_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::recorded_on;
+    use super::*;
+
+    #[test]
+    fn mtime_floor_saturates_instead_of_overflowing() {
+        assert_eq!(floor_mtime(1_234, 100), 1_200);
+        assert_eq!(floor_mtime(-1_234, 100), -1_300);
+        assert_eq!(floor_mtime(i64::MAX, 1), i64::MAX);
+        // i64::MIN is 2 above a multiple of 10: the floor is below i64::MIN.
+        assert_eq!(floor_mtime(i64::MIN, 10), i64::MIN);
+        let mut h = ManifestHasher::new(10);
+        let e = ManifestEntry {
+            path: b"",
+            kind: EntryKind::Dir,
+            mode: 0o755,
+            mtime_ns: i64::MIN,
+            size: 0,
+            content: None,
+            link_target: None,
+            hardlink_first: None,
+            xattrs: &[],
+        };
+        h.push(&e).unwrap();
+        assert_eq!(h.finish().entries, 1);
+    }
 
     #[test]
     fn linux_records_only_the_user_namespace() {

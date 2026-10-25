@@ -292,7 +292,7 @@ fn plan(cat: &Catalog, entries: &[EntryRow], hardlinks: bool) -> Result<Plan> {
         let (Some(content), Some(size)) = (e.content_hash, e.size) else {
             continue; // `validate` already refused these
         };
-        plan.bytes += size as u64;
+        plan.bytes = plan.bytes.saturating_add(size as u64);
         let group = e
             .hardlink_group
             .filter(|g| members.get(g).copied().unwrap_or(0) >= 2);

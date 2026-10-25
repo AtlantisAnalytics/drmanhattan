@@ -12,7 +12,7 @@ use std::path::Path;
 use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::ids::Id;
-use crate::manifest::hash_file;
+use crate::manifest::{floor_mtime, hash_file};
 use crate::model::{EntryKind, EntryRow, EntryStatus};
 use crate::repo::Repo;
 use crate::snaptree;
@@ -70,10 +70,6 @@ fn under_withheld(withheld_paths: &std::collections::HashSet<Vec<u8>>, path: &[u
         .any(|(i, _)| withheld_paths.contains(&path[..i]))
 }
 
-fn floor(ns: i64, precision: i64) -> i64 {
-    ns - ns.rem_euclid(precision)
-}
-
 fn compare(
     out: &mut Vec<Difference>,
     row: &EntryRow,
@@ -101,7 +97,10 @@ fn compare(
                     dir: dm,
                 });
             }
-            let (st, dt) = (floor(row.mtime_ns, precision), floor(e.mtime_ns, precision));
+            let (st, dt) = (
+                floor_mtime(row.mtime_ns, precision),
+                floor_mtime(e.mtime_ns, precision),
+            );
             if st != dt {
                 out.push(Difference::MtimeDiffers {
                     path: path.clone(),
