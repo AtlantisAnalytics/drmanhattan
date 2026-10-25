@@ -276,6 +276,29 @@ fn snapshot_record_roundtrip() {
     assert_record_matches_catalog(&repo, &r);
 }
 
+/// The test-only host and source-root overrides replace what the snapshot
+/// row and its record carry, and nothing else: the real source is walked.
+#[test]
+fn recorded_identity_overrides() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src)
+        .file(b"a.txt", b"alpha")
+        .file(b"d/b.txt", b"beta");
+    let opts = IngestOptions {
+        host_override: Some("fixture-host".into()),
+        source_root_override: Some(b"/fixture/src".to_vec()),
+        ..opts()
+    };
+    let r = ingest::run(&repo, &src, &opts).unwrap();
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    let snap = cat.snapshot(r.snapshot).unwrap();
+    assert_eq!(snap.host, "fixture-host");
+    assert_eq!(snap.source_root, b"/fixture/src");
+    assert_eq!(snap.entry_count, Some(4));
+    assert_eq!(r.manifest_hash, manifest_dir(&src, &mopts()).unwrap().core);
+    assert_record_matches_catalog(&repo, &r);
+}
+
 #[test]
 fn snapshot_record_spans_chunks() {
     let (_tmp, mut repo, src) = setup();

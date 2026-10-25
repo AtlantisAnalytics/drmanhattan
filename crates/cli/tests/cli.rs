@@ -202,3 +202,81 @@ fn find_by_content() {
     let none = run_json(&repo, &["find", "--content", &"0".repeat(64)]);
     assert_eq!(none.as_array().unwrap().len(), 0);
 }
+
+#[test]
+fn cat_withheld_entry_exits_1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = inspect_repo(tmp.path());
+    let shown = run_json(&repo, &["show", "latest"]);
+    assert_eq!(shown[0]["name"], "a.bin");
+    let id = shown[0]["id"].as_str().unwrap().to_string();
+    let conn = rusqlite::Connection::open(repo.join("catalog.sqlite")).unwrap();
+    let n = conn
+        .execute(
+            "UPDATE entry SET status = 'screened_out', content_hash = NULL \
+             WHERE path = CAST('a.bin' AS BLOB)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    drop(conn);
+    let out = wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .args(["cat", &id])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("withheld"), "{stderr}");
+}
+
+#[test]
+fn stats_empty_repo_is_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("r");
+    wmk().arg("init").arg(&repo).assert().success();
+    let v = run_json(&repo, &["stats"]);
+    for k in [
+        "snapshots",
+        "entries",
+        "contents",
+        "units",
+        "packs",
+        "logical_bytes",
+        "unique_bytes",
+        "stored_bytes",
+    ] {
+        assert_eq!(v[k], 0, "{k}");
+    }
+    assert_eq!(v["dedup_ratio"].as_f64(), Some(0.0));
+    assert_eq!(v["storage_ratio"].as_f64(), Some(0.0));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn show_non_utf8_name_escaped() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("r");
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join(std::ffi::OsStr::from_bytes(b"bad\xff")), b"x").unwrap();
+    wmk().arg("init").arg(&repo).assert().success();
+    wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .arg("ingest")
+        .arg(&src)
+        .assert()
+        .success();
+    let v = run_json(&repo, &["show", "latest"]);
+    let names: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["bad\\xff"]);
+}

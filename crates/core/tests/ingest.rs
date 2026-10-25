@@ -23,7 +23,7 @@ fn opts() -> IngestOptions {
         allow_unstable: false,
         cross_fs: false,
         workers: 4,
-        barrier_ops: None,
+        ..IngestOptions::default()
     }
 }
 

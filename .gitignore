@@ -1,1 +1,3 @@
 /target
+# Overrides a global `.*` ignore, so workflow files need no `git add -f`.
+!.github/

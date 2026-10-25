@@ -58,6 +58,33 @@ pub struct IngestOptions {
     /// instead of 10_000. `None` (the default) is the production value.
     #[doc(hidden)]
     pub barrier_ops: Option<usize>,
+    /// Test seam: recorded as the snapshot's `host` instead of the
+    /// machine's hostname (keeps committed fixtures free of local names).
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub host_override: Option<String>,
+    /// Test seam: recorded as the snapshot's `source_root` instead of the
+    /// canonical source path. The real source is still what is walked.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub source_root_override: Option<Vec<u8>>,
+}
+
+/// The `(host, source_root)` a snapshot records for `source`.
+#[cfg(feature = "test-seams")]
+fn recorded_identity(opts: &IngestOptions, source: &Path) -> (String, Vec<u8>) {
+    (
+        opts.host_override.clone().unwrap_or_else(hostname),
+        opts.source_root_override
+            .clone()
+            .unwrap_or_else(|| source.as_os_str().as_bytes().to_vec()),
+    )
+}
+
+/// The `(host, source_root)` a snapshot records for `source`.
+#[cfg(not(feature = "test-seams"))]
+fn recorded_identity(_opts: &IngestOptions, source: &Path) -> (String, Vec<u8>) {
+    (hostname(), source.as_os_str().as_bytes().to_vec())
 }
 
 #[derive(Debug, Clone)]
@@ -89,11 +116,12 @@ pub fn run(repo: &Repo, source: &Path, opts: &IngestOptions) -> Result<IngestRep
     if source.starts_with(&root) || root.starts_with(&source) {
         return Err(Error::Overlap);
     }
+    let (host, source_root) = recorded_identity(opts, &source);
     let snap = SnapshotRow {
         id: Id::new_v7(),
         status: SnapshotStatus::InProgress,
-        source_root: source.as_os_str().as_bytes().to_vec(),
-        host: hostname(),
+        source_root,
+        host,
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         started_at: now_ns()?,
         completed_at: None,

@@ -1,0 +1,5 @@
+# Only wmk.toml, catalog.sqlite and packs/ are part of the fixture.
+*-wal
+*-shm
+wmk.lock
+tmp/
