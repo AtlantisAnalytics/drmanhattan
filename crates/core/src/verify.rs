@@ -10,7 +10,7 @@
 //! whole-pack BLAKE3 of each sealed pack touched, and a full read of the
 //! snapshot record.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::catalog::Catalog;
 use crate::display::display_path;
@@ -19,7 +19,7 @@ use crate::ids::{Hash32, Id};
 use crate::ingest::record;
 use crate::manifest::{manifest_snapshot, ManifestOptions};
 use crate::model::{SnapshotRow, SnapshotStatus};
-use crate::pack::{pack_path, scan, PackReader};
+use crate::pack::{pack_path, scan};
 use crate::repo::Repo;
 use crate::unitread::UnitReader;
 
@@ -36,22 +36,15 @@ struct Checker<'a> {
     repo: &'a Repo,
     cat: &'a Catalog,
     quick: bool,
+    /// Also the only source of pack handles, so verify holds at most its
+    /// bounded number open.
     reader: UnitReader,
-    packs: HashMap<Id, std::result::Result<PackReader, String>>,
     seen: HashSet<Hash32>,
     touched: HashSet<Id>,
     problems: Vec<String>,
 }
 
 impl Checker<'_> {
-    fn pack(&mut self, id: Id) -> &std::result::Result<PackReader, String> {
-        self.packs.entry(id).or_insert_with(|| {
-            let path = pack_path(&self.repo.packs_dir(), id);
-            PackReader::open(&path)
-                .map_err(|e| format!("pack {} unreadable: {e}", display_path(&path)))
-        })
-    }
-
     /// Check one unit by hash, once per run.
     fn unit(&mut self, snap: Id, hash: &Hash32) {
         if !self.seen.insert(*hash) {
@@ -80,10 +73,13 @@ impl Checker<'_> {
                 return;
             }
         };
-        let header = match self.pack(row.pack_id) {
-            Err(why) => {
-                let msg = format!("snapshot {snap}: unit {hash}: {why}");
-                self.problems.push(msg);
+        let header = match self.reader.pack(row.pack_id) {
+            Err(e) => {
+                let path = pack_path(&self.repo.packs_dir(), row.pack_id);
+                self.problems.push(format!(
+                    "snapshot {snap}: unit {hash}: pack {} unreadable: {e}",
+                    display_path(&path)
+                ));
                 return;
             }
             Ok(p) => p.read_record(offset).map(|(h, _)| h),
@@ -196,7 +192,6 @@ pub fn run(repo: &Repo, snapshot: Option<Id>, quick: bool) -> Result<VerifyRepor
         cat: &cat,
         quick,
         reader: UnitReader::new(repo, 64 << 20),
-        packs: HashMap::new(),
         seen: HashSet::new(),
         touched: HashSet::new(),
         problems: Vec::new(),
