@@ -79,6 +79,13 @@ macOS (APFS, including case-insensitive volumes) and Linux (ext4, xfs, btrfs).
 | uid/gid, atime, ctime, ACLs | no | — | — |
 | Sockets, FIFOs, device files | listed in the ingest report, skipped | — | excluded, on both sides |
 
+Which extended attributes count is fixed per platform. Ingest, `wmk manifest` and the snapshot manifest all apply the same policy, through one shared xattr reader:
+
+- **Linux:** only the `user.*` namespace is recorded and hashed. `security.*` (SELinux labels, file capabilities), `system.*` (POSIX ACLs) and `trusted.*` are ignored. ACLs are not recorded.
+- **macOS:** every xattr is recorded except the OS-managed volatile ones, `com.apple.provenance` and `com.apple.macl`, which are neither recorded nor hashed. `com.apple.quarantine` is ordinary data and is recorded. ACLs (which macOS keeps outside xattrs) are not recorded.
+
+A filesystem without xattr support (`ENOTSUP` or `EOPNOTSUPP`) yields no xattrs rather than an error.
+
 The same rules apply whether a manifest is computed from a live directory (`wmk manifest`) or from a snapshot. That is what makes the hashes comparable.
 
 ## 5. Repository layout
@@ -163,7 +170,7 @@ entry(
 content(
   hash BLOB PRIMARY KEY,          -- BLAKE3-256 of the whole file
   size INTEGER NOT NULL,
-  format TEXT,                    -- sniffed: jpeg, png, webp, gif, html, css, js, json, ...
+  format TEXT,                    -- sniffed; closed vocabulary, see below
   profile TEXT NOT NULL,          -- text | binary
   unit_count INTEGER NOT NULL
 )
@@ -236,6 +243,8 @@ purge_log(
 )
 ```
 
+`content.format` is a closed vocabulary. Its only values are `jpeg`, `png`, `webp`, `gif`, `avif`, `heic`, `mp4`, `webm`, `zip`, `gzip`, `bzip2`, `xz`, `zstd`, `seven_z`, `html`, `css`, `js`, `json`, `xml`, `svg`, `txt`, `csv`, `md` and `other`, or NULL. Adding a format is a format change: it requires bumping both the repository's `format_version` (catalog and `wmk.toml`) and the snapshot record `version` (§6.3). The other enum columns are closed too, with the values listed in their comments.
+
 Indexes: `entry(snapshot_id, parent_id)`, `entry(content_hash)`, `content_unit(unit_hash)`, `unit(pack_id, pack_offset)`, `label(scheme, value)`, `media(phash)`.
 
 Identity is kept separate from content. The same image at 40 paths has 40 entries (40 UUIDs), 1 `content` row, and its units stored once.
@@ -246,28 +255,66 @@ All integers are little-endian.
 
 ```
 header : "WMKPACK\0" (8) | format u16 | pack_id (16)
-record : marker u32 = 0x574D4B52 ("WMKR") | kind u8 | compression u8
+record : marker u32 = 0x574D4B52 | kind u8 | compression u8
          | unit_hash (32) | raw_len u64 | stored_len u64
          | header_crc32c u32 (over the preceding header fields) | payload (stored_len)
 footer : (only on seal) record count u64 | [unit_hash, offset u64]* | pack_blake3 (32)
-         | "WMKPEND\0" (8)
+         | footer_offset u64 | "WMKPEND\0" (8)
 ```
 
+- The record marker is the u32 0x574D4B52 written little-endian, so its bytes on disk are `52 4B 4D 57` ("RKMW", not "WMKR").
 - Every record is self-describing, so the catalog can be rebuilt by scanning packs (`recover`).
 - `header_crc32c` lets the scanner detect a torn tail on an unsealed pack and truncate it.
-- `pack_blake3` covers every byte before the footer.
+- `pack_blake3` covers every byte before the footer, i.e. file offsets `[0, footer_offset)`.
+- The footer is end-anchored: `footer_offset` is the file offset where the footer starts. A scanner that finds the trailing magic and a consistent `footer_offset` treats the pack as sealed and validates each indexed record individually, so mid-file corruption in a sealed pack is reported as damage rather than mistaken for a torn tail. A pack without a valid end-anchored footer is unsealed, and its scan stops at the first record that is too short, has a bad marker or CRC, or violates the size invariants below. A record whose CRC is valid but whose kind or compression is unknown is an error, not a stopping point, in both cases.
+- The footer index is not covered by `pack_blake3`, so it is advisory. For a sealed pack the scan reports every record it can validate, from the sequential parse and from the index. `damaged` lists offsets where something claims a record but none validates; `index_ok` is true only when the index exactly matches the sequentially parsed records.
+- Record sizes are bounded: `raw_len` and `stored_len` are at most 16 MiB; `none` requires `stored_len == raw_len`, and `zstd` requires `stored_len < raw_len`.
 - Unit integrity is checked by recomputing BLAKE3 over the decompressed payload and comparing it with `unit_hash`.
 
 ### 6.3 Snapshot record unit
 
-When an ingest finishes, wmk serializes a CBOR document (the snapshot record) containing:
+When an ingest finishes, wmk writes a document (the snapshot record) after every other row of the snapshot is committed. The document is a CBOR sequence (RFC 8742): a concatenation of CBOR items with no framing. It is streamed, so it never has to sit in memory.
 
-- the snapshot row
-- every entry, with its UUID
-- the `content → [unit_hash]` lists for contents this snapshot references
-- xattrs, provenance, and screen hits
+Each item is a CBOR map with a text field `t` naming its kind, plus the fields below. Field names are text keys. Ids (16 bytes), hashes (32 bytes) and raw-byte fields (`bin`) are CBOR byte strings. `text` is a CBOR text string. `?` marks an optional field, whose value may be CBOR null. Integers are CBOR integers that must fit the stated width:
+- `u32`: `version`, `mode`.
+- `u64`: the index's `document_size`.
+- `i64`: every other integer, matching the INTEGER columns of §6.1. These are the times, sizes, counts, `hardlink_group`, `screened_out`, and the screen hit `id`.
 
-The document is chunked with the binary profile and stored as ordinary `raw_chunk` units, so a 100M-entry record never exceeds pack limits. A small `snapshot_record` unit then holds `{snapshot_id, document_blake3, document_size, [chunk unit hashes]}`, and `snapshot.record_unit` points at it.
+Items appear in this order. Within a section, items may appear in any order.
+
+| # | `t` | Count | Fields |
+|---|---|---|---|
+| 1 | `header` | exactly 1 | `version` u32 (= 1), `snapshot` map: the snapshot row, with every §6.1 column as a field (`id` id, `status` text, `source_root` bin, `host` text, `tool_version` text, `started_at` i64, `completed_at` i64?, `note` text?, `manifest_hash` hash?, `ext_manifest_hash` hash?, `source_manifest_hash` hash?, `record_unit` hash?, `entry_count` i64?, `file_bytes` i64?, `screened_out` i64, `label_pattern` text?) |
+| 2 | `entry` | one per entry | every §6.1 `entry` column: `id` id, `snapshot_id` id, `parent_id` id?, `name` bin, `path` bin, `kind` text, `mode` u32, `mtime_ns` i64, `size` i64?, `content_hash` hash?, `link_target` bin?, `hardlink_group` i64?, `status` text |
+| 3 | `content` | one per distinct content the snapshot references | `hash` hash, `size` i64, `format` text?, `profile` text, `unit_count` i64, `units` array of hashes in `seq` order (`unit_count` must equal its length) |
+| 4 | `xattr` | one per xattr row | `entry_id` id, `name` bin, `value` bin |
+| 5 | `provenance` | optional, one per provenance row | `entry_id` id, `source` text, `url` text?, `fetched_at` i64?, `last_modified` i64?, `server_ip` text?, `http_headers` text? |
+| 6 | `screen_hit` | optional, one per screen hit | `id` i64, `snapshot_id` id, `entry_id` id, `verdict` text, `screener` text, `list_version` text?, `blake3` hash, `md5` bin?, `sha1` bin?, `sha256` bin?, `detail` text?, `detected_at` i64 |
+
+- **The header row.** The header's snapshot row is the final row (`status = complete`, with its hashes and `completed_at`), except that `record_unit` is null: a row cannot contain its own record unit.
+- **Reserved sections.** Sections 5 and 6 are reserved for provenance and screening. v1 writes none, but a v1 reader must accept them and return them.
+- **Closed vocabularies.** Enum fields hold only the catalog's strings from §6.1. A writer emits only these values, and a reader checks them:
+  - `snapshot.status`
+  - `entry.kind` and `entry.status`
+  - `content.profile`
+  - `content.format`: the closed list in §6.1, or null
+  - `provenance.source` (`wget_layout | jsonl`)
+  - `screen_hit.verdict` (`match | error`)
+
+  An unknown value is corruption.
+- **Strict decoding.**
+  - A writer always writes every field, writing null for an absent optional value.
+  - A reader treats a missing optional field as null, and rejects any of the following as corruption:
+    - a missing required field
+    - an unknown field, in any item or in the header's snapshot map
+    - an unknown item kind
+    - an unknown `version`
+    - out-of-order items
+    - a `content` whose `unit_count` differs from its number of units
+  - A writer that finds `unit_count` and the unit list disagreeing in the catalog fails rather than write such a record.
+- **Versioning.** Adding any other item kind, adding a vocabulary value, or changing any field requires a new `version`.
+
+The document is chunked with the binary profile and stored as ordinary `raw_chunk` units, so a 100M-entry record never exceeds pack limits. A small `snapshot_record` unit then holds the CBOR map `{snapshot_id: id, document_blake3: hash, document_size: u64, chunks: [chunk unit hashes]}`. It is decoded with the same strict rules, and `snapshot.record_unit` points at it. A reader verifies every chunk, then the document's BLAKE3 and size.
 
 This record makes the packs the source of truth. Labels and media are derived data, so they are recomputed rather than recovered.
 
@@ -282,12 +329,16 @@ file:    mode u32 (& 0o1777) | mtime_ns i64 | size u64 | content_blake3 (32)
 symlink: target_len u32 | target bytes
 ```
 
-The root entry has `path = ""` and is included.
+An entry's `path` is its root-relative path: the raw bytes of each name from the root down to the entry, joined with `/`, with no leading or trailing slash. The root entry itself has the empty path `""` and is included. The same definition holds for `entry.path` in the catalog (§6.1): every reader derives each path from its parent's path and its own `name`, and treats a stored path that disagrees, a name that is empty (except the root's), `.` or `..` or contains `/` or NUL, a second root, or a cycle as corruption. When a subtree is hashed, paths are relative to the subtree's root, which gets `""`.
 
 `ext_manifest_hash` uses the same encoding, followed after each entry by:
 
-- the canonical hardlink group: the canonical-order index of the group's first entry, as a u64, or `u64::MAX` if the entry is not hard-linked
-- the sorted xattrs: `name_len | name | value_len | value`
+- the canonical hardlink group: the canonical-order index (0-based position in the hashed sequence, root = 0) of the group's first entry, as a u64, or `u64::MAX` if the entry is not hard-linked. A group counts only if at least two of its members are inside the tree being hashed; every member of such a group, including the first, carries the first member's index. A file with `nlink > 1` that has a single member in the tree gets `u64::MAX`, because restoring it yields an unlinked file.
+- the xattrs: `xattr_count u32`, then for each xattr, sorted bytewise by name, `name_len u32 | name | value_len u32 | value`
+
+Exactly, per entry, the ext stream is: the core bytes above, then `hardlink_first u64 | xattr_count u32 | (name_len u32 | name | value_len u32 | value)*`. Entries with no xattrs contribute `xattr_count = 0`.
+
+All integers in §6.4 (core and ext) are little-endian. An `mtime_ns` is first floored to the mtime precision (`m - m.rem_euclid(p)`, saturating at `i64::MIN`; precision 0 is treated as 1). An entry that cannot be encoded (a symlink without a target, a file without a content hash, a length over `u32`) is an error, never hashed as a default.
 
 UUIDs, labels, media, provenance, and snapshot metadata are never hashed.
 
@@ -310,17 +361,18 @@ walker ──► reader/chunker pool (rayon) ──► pack writer (1 thread) �
    - Sniff the format using magic bytes (`infer`), plus file extensions for text classes (html, htm, css, js, mjs, json, xml, svg, txt, csv, md).
    - Read image dimensions from the header only (`imagesize`), without decoding.
    - If the content hash is already in the catalog or in flight, skip chunk emission. The entry still references the content.
-4. **Stability check.** Run `stat` before and after reading. If size or mtime changed, retry once. If it changed again, fail the ingest (exit 1). With `--allow-unstable`, the bytes read are stored instead, and the entry gets `status=unstable`.
+4. **Stability check.** Run `stat` before and after reading. If size or mtime changed, retry once. If it changed again, fail the ingest (exit 1). With `--allow-unstable`, the bytes read are stored instead, and the entry gets `status=unstable`. Members of one `hardlink_group` share an inode, so if they end up with different content hashes (the file changed between their reads), the group is unstable too: by default the ingest fails; with `--allow-unstable` every member gets `status=unstable` and the members whose content differs from the group's first member (by path) leave the group (`hardlink_group` cleared), so a restore copies them instead of linking them.
 5. **Screen** each new content (§8) before emitting any of its units.
 6. **Compress.** Use `none` for already-compressed formats (jpeg, png, webp, gif, avif, heic, mp4, webm, zip, gz, bz2, xz, zst, 7z). Otherwise use zstd level 3. If the result is ≥ 97% of the raw size, store it uncompressed. The decision is deterministic per unit.
 7. **Pack writer.**
    - This is the only authority on whether a unit is new. It checks the in-memory set of in-flight hashes and the catalog, so concurrent duplicates are written once.
    - New units are appended to the open pack. At `max_size` the pack is fsynced, its footer written, and it is sealed.
 8. **Catalog writer.** Commits batched transactions of about 10k rows or 1 s, whichever comes first.
-9. **Finish.**
-   - Fsync all packs and write the `snapshot_record` unit.
-   - Compute `manifest_hash`, `ext_manifest_hash` and `source_manifest_hash`.
-   - Set `status=complete`.
+9. **Finish**, in this order, once every entry row is committed:
+   1. Compute `manifest_hash`, `ext_manifest_hash` and `source_manifest_hash` from the committed catalog.
+   2. Build the snapshot record (§6.3) from the catalog, with the final snapshot row (`status=complete`, the hashes, `completed_at`) as its header.
+   3. Write the record's units through the pack writer like any other units, fsync the pack and commit them, then seal the open pack.
+   4. Run the final upsert: the snapshot row with `status=complete` and its `record_unit`. This one commit runs with SQLite `synchronous=FULL`, so once wmk exits 0 the `complete` row survives power loss.
 
 **Ordering invariant:** pack bytes are fsynced before any catalog row that references them is committed.
 
@@ -454,7 +506,7 @@ Legal and process note (not a software requirement): the reporting protocol, inc
 
 | Command | Behavior |
 |---|---|
-| `wmk manifest <dir> [--ext] [--mtime-precision <ns>]` | Computes the manifest hash of a live directory using §4 and §6.4 rules, without ingesting |
+| `wmk manifest <dir> [--ext] [--mtime-precision <ns>] [--cross-fs]` | Computes the manifest hash of a live directory using §4 and §6.4 rules, without ingesting. `--cross-fs` descends into other filesystems, to match a source ingested with `--cross-fs` |
 | `wmk verify [<snapshot>] [--quick]` | `--quick`: catalog/pack consistency (every referenced unit exists in a pack at the recorded offset with a valid header). Default: also decompress and BLAKE3 every referenced unit and each sealed pack |
 | `wmk diff <snapshot> <dir> [--path <prefix>] [--mtime-precision <ns>]` | Path-level differences: content, mode, mtime, kind, link target, missing, extra, expected-missing |
 | `wmk recover` | Rebuilds `catalog.sqlite` from packs. Truncates torn tails of unsealed packs, re-indexes all units, replays snapshot and purge records, and recomputes labels |

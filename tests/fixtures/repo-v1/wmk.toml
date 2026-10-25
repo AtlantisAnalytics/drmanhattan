@@ -1,0 +1,18 @@
+format_version = 1
+
+[chunking.text]
+min = 2048
+avg = 8192
+max = 65536
+
+[chunking.binary]
+min = 262144
+avg = 1048576
+max = 4194304
+
+[compression]
+algo = "zstd"
+level = 3
+
+[packs]
+max_size = 268435456

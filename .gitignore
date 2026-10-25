@@ -1,0 +1,5 @@
+/target
+# Overrides a global `.*` ignore, so workflow files need no `git add -f`.
+!.github/
+# Agent workspace (plans, briefs, reports); never part of the repository.
+.superpowers/
