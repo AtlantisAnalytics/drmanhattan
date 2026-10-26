@@ -182,18 +182,19 @@ impl Checker<'_> {
         };
         match manifest_snapshot(self.cat, id, b"", &opts) {
             Ok(m) => {
+                let stored = |h: Option<Hash32>| h.map_or("(none)".into(), |h| h.to_hex());
                 if Some(m.core) != s.manifest_hash {
                     self.problems.push(format!(
-                        "snapshot {id}: manifest hash {} does not match stored {:?}",
+                        "snapshot {id}: manifest hash {} does not match stored {}",
                         m.core,
-                        s.manifest_hash.map(|h| h.to_hex())
+                        stored(s.manifest_hash)
                     ));
                 }
                 if Some(m.ext) != s.ext_manifest_hash {
                     self.problems.push(format!(
-                        "snapshot {id}: extended manifest hash {} does not match stored {:?}",
+                        "snapshot {id}: extended manifest hash {} does not match stored {}",
                         m.ext,
-                        s.ext_manifest_hash.map(|h| h.to_hex())
+                        stored(s.ext_manifest_hash)
                     ));
                 }
             }

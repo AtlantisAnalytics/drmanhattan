@@ -132,6 +132,33 @@ fn verify_detects_flipped_byte() {
 }
 
 #[test]
+fn verify_reports_manifest_mismatch_readably() {
+    let (_tmp, repo, snap) = setup();
+    let conn = rusqlite::Connection::open(repo.catalog_path()).unwrap();
+    conn.execute(
+        "UPDATE snapshot SET manifest_hash = ?1, ext_manifest_hash = NULL",
+        [[0xab_u8; 32]],
+    )
+    .unwrap();
+    drop(conn);
+
+    let r = verify::run(&repo, Some(snap), true).unwrap();
+    assert_eq!(r.problems.len(), 2, "{:?}", r.problems);
+    let stored = "ab".repeat(32);
+    assert!(
+        r.problems[0].ends_with(&format!("does not match stored {stored}")),
+        "{:?}",
+        r.problems
+    );
+    assert!(
+        r.problems[1].ends_with("does not match stored (none)"),
+        "{:?}",
+        r.problems
+    );
+    assert!(!r.problems.iter().any(|p| p.contains("Some(")));
+}
+
+#[test]
 fn verify_detects_missing_pack() {
     let (_tmp, repo, snap) = setup();
     let (pack, _) = content_pack(&repo, snap, b"sub/keep.bin");

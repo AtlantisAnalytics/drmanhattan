@@ -33,6 +33,15 @@ everything checked out. It refuses up front (writing nothing) if the
 destination filesystem would alter the tree, for example by folding case or
 normalizing Unicode names.
 
+## Install
+
+```sh
+cargo install drmanhattan    # installs the `wmk` binary
+```
+
+The library is published separately as
+[`drmanhattan-core`](https://crates.io/crates/drmanhattan-core).
+
 ## Build
 
 Requires Rust stable at or above the crates' `rust-version` (1.87),

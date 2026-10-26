@@ -71,13 +71,13 @@ documented behaviour.
 
 ## Open items
 
-### Residual from the final review (not yet fixed)
-- **`restore --xattrs` doesn't filter by the namespace policy.** On Linux, running as root, a crafted catalog could set `security.capability` or `trusted.*`. This predates the plan and is roughly a 3-line fix: refuse or skip names that `xattr_recorded` would reject.
+### Residual from the final review
 - **Unreachable rows are skipped silently.** A full traversal doesn't report catalog rows it can't reach. `verify` catches this through the manifest mismatch.
-- **Cosmetic issues:**
-  - `verify` prints `Some("…")`.
-  - Config error text is not escaped.
-  - The README example omits `wmk init`.
+- **Fixed:**
+  - `restore --xattrs` now refuses names outside the namespace policy (8bf5582, before the merge).
+  - In 0.1.1, `verify` prints a stored hash as hex or `(none)`, not `Some("…")`.
+  - In 0.1.1, config parse errors escape control bytes in the quoted line.
+  - The README example already runs `wmk init`.
 
 ### For Plan 2 (`recover` and fault injection)
 - **Ambiguous seal state.** Treat "sealed with `blake3_ok = false`" as ambiguous: a crafted tail ending in `WMKPEND` can mimic a seal.
@@ -114,4 +114,4 @@ documented behaviour.
 - **Behaviour notes:**
   - A content's format, and therefore its chunk profile, can depend on the name of the first file seen with that content. Content dedup is unaffected.
   - `Config::save` isn't atomic.
-- **CI:** CI uses `actions/checkout@v4`, which runs on Node 20.
+- **CI:** Fixed in 0.1.1: CI uses `actions/checkout@v7` (was v4, on Node 20).
