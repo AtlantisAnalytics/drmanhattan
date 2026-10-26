@@ -38,6 +38,16 @@ pub fn display_bytes(bytes: &[u8]) -> String {
     out
 }
 
+/// `display_bytes` of each line of `text`, keeping the `\n` between lines:
+/// for multi-line messages that quote untrusted input, such as a parser's
+/// report on a config file.
+pub fn display_text(text: &str) -> String {
+    text.split('\n')
+        .map(|line| display_bytes(line.as_bytes()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// `display_bytes` of a path's raw bytes.
 pub fn display_path(path: &Path) -> String {
     display_bytes(path.as_os_str().as_bytes())
@@ -78,6 +88,12 @@ mod tests {
     fn backslash_is_doubled_so_rendering_is_unambiguous() {
         assert_eq!(display_bytes(b"\\xff"), "\\\\xff");
         assert_ne!(display_bytes(b"\\xff"), display_bytes(b"\xff"));
+    }
+
+    #[test]
+    fn text_keeps_line_breaks_only() {
+        assert_eq!(display_text("a\n\x1b[2Jb\r\n"), "a\n\\x1b[2Jb\\x0d\n");
+        assert_eq!(display_text(""), "");
     }
 
     #[test]

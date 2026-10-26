@@ -1,12 +1,14 @@
 [package]
 name = "drmanhattan-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.87"
 description = "Core library of watchmaker (wmk): deduplicated chunk packs, a SQLite catalog, and byte-exact restore"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/AtlantisAnalytics/drmanhattan"
 readme = "../../README.md"
+keywords = ["deduplication", "content-addressed", "dataset", "snapshot", "reproducibility"]
+categories = ["filesystem", "compression", "data-structures"]
 
 [features]
 failpoints = ["fail/failpoints"]

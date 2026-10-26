@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="drmanhattan logo: an atom whose nucleus breaks apart into storage blocks" width="256">
+</p>
+
 # watchmaker (`wmk`)
 
 watchmaker (`wmk`) disassembles directories into storage units and rebuilds
@@ -32,6 +36,15 @@ builds the tree in a partial directory and renames it into place only when
 everything checked out. It refuses up front (writing nothing) if the
 destination filesystem would alter the tree, for example by folding case or
 normalizing Unicode names.
+
+## Install
+
+```sh
+cargo install drmanhattan    # installs the `wmk` binary
+```
+
+The library is published separately as
+[`drmanhattan-core`](https://crates.io/crates/drmanhattan-core).
 
 ## Build
 

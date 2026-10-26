@@ -1,4 +1,4 @@
-use crate::display::display_path;
+use crate::display::{display_path, display_text};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -71,8 +71,14 @@ impl Default for Config {
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
-        let cfg: Config = toml::from_str(&text)
-            .map_err(|e| Error::Config(format!("{}: {e}", display_path(path))))?;
+        let cfg: Config = toml::from_str(&text).map_err(|e| {
+            // The parser's report quotes the offending line verbatim.
+            Error::Config(format!(
+                "{}: {}",
+                display_path(path),
+                display_text(&e.to_string())
+            ))
+        })?;
         cfg.validate()?;
         Ok(cfg)
     }

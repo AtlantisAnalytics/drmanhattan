@@ -32,6 +32,23 @@ fn config_rejects_min_gt_avg() {
 }
 
 #[test]
+fn config_parse_error_escapes_terminal_controls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("r");
+    Repo::init(&root).unwrap();
+    std::fs::write(root.join("wmk.toml"), "format_version = \x1b[2J\n").unwrap();
+    match Repo::open(&root) {
+        Err(Error::Config(m)) => {
+            assert!(!m.contains('\x1b'), "{m:?}");
+            assert!(m.contains("\\x1b[2J"), "{m:?}");
+            // Line breaks in the parser's multi-line report survive.
+            assert!(m.contains('\n'), "{m:?}");
+        }
+        other => panic!("expected Config error, got {:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
 fn config_rejects_unknown_format_version() {
     match open_with(|c| c.format_version = 2) {
         Err(Error::Config(m)) => assert_eq!(m, "unsupported format_version 2"),
