@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="drmanhattan logo: an atom whose nucleus breaks apart into storage blocks" width="256">
+</p>
+
 # watchmaker (`wmk`)
 
 watchmaker (`wmk`) disassembles directories into storage units and rebuilds
