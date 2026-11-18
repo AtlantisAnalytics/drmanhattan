@@ -4,17 +4,35 @@ Working notes for the next session. For the design, see
 `docs/superpowers/specs/2026-10-24-wmk-v1-design.md`. For open items from
 Plan 1, see `docs/superpowers/plans/2026-10-24-wmk-core-roundtrip-decisions.md`.
 
-## Status (2026-11-06)
+## Status (2026-11-18)
 
-The first test on a real archive is ready to run but has not started. Only
-sample folders have been ingested, and those test repositories are deleted.
+The first test on a real archive passed. The archive is about 2 TiB of photos
+and video: 157k files, mostly JPEG, with some camera RAW and video. The largest
+file is 3.73 GiB. It sits on an exFAT drive, mounted read-only, attached to a
+Linux test server. The repository is on a separate NVMe drive and is kept.
 
-The archive is about 2 TiB of photos and video: 157k files, mostly JPEG, with
-some camera RAW and video. The largest file is 3.73 GiB. It sits on an exFAT
-drive attached to a Linux test server, and the repository will go on a separate
-NVMe drive.
+| Step | Result |
+|---|---|
+| Ingest, 4 workers | 47.3 min, 1,970 GiB at 0.69 GiB/s, peak RSS 16.6 GB |
+| `verify` (full) | 63.8 min, 0 problems (1,309,131 units, 5,896 packs) |
+| Contents | 117,500 distinct for 156,776 files |
+| Repository | 1.58 TB for 2.12 TB logical: dedup 1.33, storage ratio 0.746 |
+| Restore of 3 folders (141 GB) | byte-identical (`diff -r`); names, sizes, mtimes (ns) and modes identical |
 
-## Next: full ingest
+Restore ran at 1.1-1.4 GiB/s cold, with a peak RSS of about 1.1 GB. The
+restored folders included 54 GB of GoPro video and the filenames with accented
+characters.
+
+When comparing metadata between exFAT and ext4, leave out directory sizes:
+exFAT reports 1 MiB for every directory.
+
+## Next
+
+- Decide what to do with the test repository. Keep it to try a second ingest
+  and measure incremental dedup, or delete it to free the space.
+- Work on the code follow-ups below, starting with the `verify` read pattern.
+
+## How the full ingest was run
 
 1. Mount the source drive read-only. It is deliberately not in fstab.
 2. Check that nothing else needs the machine for about 2.5 hours, and that the
@@ -74,7 +92,16 @@ Found during this testing. None of them block the ingest.
 - **New-data throughput.** Ingest of new data stops scaling at about 4 workers.
   The single thread in `crates/core/src/ingest/storage.rs` is the likely limit,
   but this has not been profiled.
-- **Serial `verify`.** `crates/core/src/verify.rs` uses one thread.
+- **`verify` reads every unit twice.** `Checker::unit` in
+  `crates/core/src/verify.rs` checks headers with `PackReader::read_record`,
+  which reads the whole payload. `Checker::content` then reads the same units
+  again. This happens in `--quick` mode too, so `--quick` still reads the
+  entire repository. The second read mostly hits the page cache: on 1.58 TB
+  stored, a full `verify` read about 3.3 TB from disk (units, then the
+  whole-pack hashes) and spent more time in the kernel than in `wmk` itself
+  (2,159 s against 1,523 s). A header-only read would fix both modes.
+- **Serial `verify`.** `crates/core/src/verify.rs` uses one thread. On the full
+  archive it checked 1,469 GiB stored in 63.8 min (0.38 GiB/s).
 - **Format mapping.** `from_mime` in `crates/core/src/sniff.rs` does not know
   `.mov`, `.mkv` or camera RAW, so they get a zstd attempt. The measured cost
   was small on random bytes, so this is low priority.
