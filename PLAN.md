@@ -26,11 +26,37 @@ characters.
 When comparing metadata between exFAT and ext4, leave out directory sizes:
 exFAT reports 1 MiB for every directory.
 
+## Second ingest: incremental dedup (2026-11-19)
+
+A second machine held a superset of the same archive: the same 156,774 paths
+and sizes, plus 12,456 extra files (65.7 GiB). It was ingested into the same
+repository as a second snapshot, read over NFS 4.2 (read-only, `nconnect=4`)
+on a direct 10 GbE link.
+
+| Step | Result |
+|---|---|
+| Ingest, 4 workers | 36.3 min, 2,035 GiB at 0.94 GiB/s, peak RSS 14.7 GB |
+| Newly stored | 6 units, 2.58 MB (5 new contents) |
+| Repository after | 2 snapshots, 4.30 TB logical in 1.58 TB stored: dedup 2.71, storage ratio 0.367 |
+| Restore of the largest extra folder (12,567 files, 63 GiB) | 26.6 s; byte-identical, metadata identical |
+
+All of the extra files were copies of content already stored under other
+names, which only content-level dedup can find. Ingest of already-stored
+content ran faster than the first ingest (0.94 against 0.69 GiB/s), because
+known content is hashed but not written.
+
+Notes for repeating this:
+
+- The link measured 9.4 Gb/s raw TCP and 0.6-0.7 GB/s for a single cold file
+  over NFS, so 4 workers kept the ingest from waiting on the network.
+- NFS 4.2 preserves sub-second mtimes. `sshfs` (SFTP v3) rounds them to whole
+  seconds, so it is not suitable for snapshots that must keep mtimes exact.
+- Over 1 GbE the same ingest would have taken about 6 hours.
+
 ## Next
 
-- Decide what to do with the test repository. Keep it to try a second ingest
-  and measure incremental dedup, or delete it to free the space.
 - Work on the code follow-ups below, starting with the `verify` read pattern.
+- The test repository is kept for further tests.
 
 ## How the full ingest was run
 
