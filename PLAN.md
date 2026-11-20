@@ -53,9 +53,23 @@ Notes for repeating this:
   seconds, so it is not suitable for snapshots that must keep mtimes exact.
 - Over 1 GbE the same ingest would have taken about 6 hours.
 
+## Parallel verify (2026-11-20)
+
+`verify --quick` now reads only record headers, and a full `verify` checks
+contents and pack hashes on worker threads (`wmk verify --workers N`, 0 = one
+per CPU). Released in 0.1.2. On the same 1.58 TB repository:
+
+| Run | Before | After |
+|---|---|---|
+| Full `verify` | 63.8 min | 20.6 min (about 2.7 GB/s from disk), 0 problems |
+| `verify --quick` | read the whole repository | 110 s |
+
+The design, plan and measurement details are in
+`docs/superpowers/specs/2026-11-20-parallel-verify-design.md`.
+
 ## Next
 
-- Work on the code follow-ups below, starting with the `verify` read pattern.
+- Work on the code follow-ups below.
 - The test repository is kept for further tests.
 
 ## How the full ingest was run
@@ -75,7 +89,8 @@ Notes for repeating this:
    compare them byte for byte with the source. A full restore needs as much
    free space as the source, so it may not fit beside the repository.
 
-Expect about 40-90 minutes for the ingest and up to an hour for `verify`.
+Expect about 40-90 minutes for the ingest and about 20 minutes for `verify`
+(0.1.2 or later; 0.1.1 took about an hour).
 
 Stopping an ingest partway means deleting the repository and starting over,
 because `recover` does not exist yet. The source is not affected.
@@ -118,16 +133,19 @@ Found during this testing. None of them block the ingest.
 - **New-data throughput.** Ingest of new data stops scaling at about 4 workers.
   The single thread in `crates/core/src/ingest/storage.rs` is the likely limit,
   but this has not been profiled.
-- **`verify` reads every unit twice.** `Checker::unit` in
-  `crates/core/src/verify.rs` checks headers with `PackReader::read_record`,
-  which reads the whole payload. `Checker::content` then reads the same units
-  again. This happens in `--quick` mode too, so `--quick` still reads the
-  entire repository. The second read mostly hits the page cache: on 1.58 TB
-  stored, a full `verify` read about 3.3 TB from disk (units, then the
-  whole-pack hashes) and spent more time in the kernel than in `wmk` itself
-  (2,159 s against 1,523 s). A header-only read would fix both modes.
-- **Serial `verify`.** `crates/core/src/verify.rs` uses one thread. On the full
-  archive it checked 1,469 GiB stored in 63.8 min (0.38 GiB/s).
+- **`verify` header pass.** Still serial. It is what `--quick` runs, and it took
+  8.9% of a full `verify`, over the design's 5% threshold. Parallelize it,
+  keeping the report order.
+- **`verify` CPU use.** A full `verify` kept only 3 to 7 of 20 CPUs busy, and
+  max RSS rose from 246 MB to 977 MB. Contention on the shared 64-handle pack
+  cache or the unit-cache lock are candidates; neither was isolated.
+- **`verify` small gaps.** A failed catalog lookup for an already-seen unit
+  skips that check silently instead of reporting a problem (this predates the
+  parallel work). A content's check stops at its first bad unit. `--workers`
+  is not validated.
+- **One pass per pack.** A full `verify` still reads the data twice (units,
+  then whole-pack hashes). Reading each pack once would halve disk reads, for
+  much more complexity; the design leaves room for it.
 - **Format mapping.** `from_mime` in `crates/core/src/sniff.rs` does not know
   `.mov`, `.mkv` or camera RAW, so they get a zstd attempt. The measured cost
   was small on random bytes, so this is low priority.
