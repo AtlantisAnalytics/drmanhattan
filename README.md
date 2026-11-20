@@ -70,7 +70,7 @@ machine-readable output.
 | `wmk ingest <dir>` | Snapshot a directory into the repository |
 | `wmk manifest <dir>` | Compute the manifest hash of a live directory |
 | `wmk restore <snapshot> <dest>` | Rebuild a snapshot byte-exact in a new directory (`--path`, `--hardlinks`, `--xattrs`) |
-| `wmk verify [snapshot]` | Check that stored data is intact (`--quick` skips decompression) |
+| `wmk verify [snapshot]` | Check that stored data is intact (`--quick` skips decompression; `--workers N` sets worker threads, 0 = one per CPU) |
 | `wmk diff <snapshot> <dir>` | Show path-level differences between a snapshot and a live directory |
 | `wmk ls` | List snapshots |
 | `wmk show <snapshot> [path]` | Browse a snapshot's tree |

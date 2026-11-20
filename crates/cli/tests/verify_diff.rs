@@ -30,6 +30,8 @@ fn verify_and_diff_exit_codes() {
         &["verify"][..],
         &["verify", "--quick"],
         &["verify", "latest"],
+        &["verify", "--workers", "2"],
+        &["verify", "--quick", "--workers", "1"],
     ] {
         let out = wmk()
             .current_dir(t)

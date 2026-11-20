@@ -407,11 +407,23 @@ impl PackReader {
         Ok(Ok(h))
     }
 
+    /// Read and validate the record header at `offset`, without reading its
+    /// payload. The payload must still fit within the pack.
+    pub fn read_header(&self, offset: u64) -> Result<RecordHeader> {
+        self.parse_record_at(offset, self.len)?
+            .map_err(|why| self.corrupt(offset, why))
+    }
+
     /// Read and validate a record header and return it with its stored payload.
     pub fn read_record(&self, offset: u64) -> Result<(RecordHeader, Vec<u8>)> {
-        let h = self
-            .parse_record_at(offset, self.len)?
-            .map_err(|why| self.corrupt(offset, why))?;
+        let h = self.read_header(offset)?;
+        // Lets tests count chunk payload reads (compiled out without the
+        // `failpoints` feature).
+        fail::fail_point!(
+            "pack::read_chunk_payload",
+            h.kind == UnitKind::RawChunk,
+            |_| Err(self.corrupt(offset, "failpoint pack::read_chunk_payload"))
+        );
         let mut payload = vec![0u8; h.stored_len as usize];
         self.read_exact_at(&mut payload, offset + RECORD_HEADER_LEN as u64)?;
         Ok((h, payload))

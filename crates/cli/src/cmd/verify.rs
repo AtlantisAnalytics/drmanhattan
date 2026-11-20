@@ -4,7 +4,7 @@ use crate::{Cli, VerifyFailed};
 use anyhow::Result;
 use clap::Args;
 use drmanhattan_core::catalog::Catalog;
-use drmanhattan_core::verify;
+use drmanhattan_core::verify::{self, VerifyOptions};
 use serde::Serialize;
 use std::fmt;
 
@@ -15,6 +15,9 @@ pub struct VerifyArgs {
     /// Check pack files and record headers only; skip decompressing and hashing units
     #[arg(long)]
     pub quick: bool,
+    /// Worker threads for decompressing and hashing (0 = one per CPU; use 1 for spinning disks)
+    #[arg(long, default_value_t = 0)]
+    pub workers: usize,
 }
 
 #[derive(Serialize)]
@@ -49,7 +52,15 @@ pub fn run(cli: &Cli, args: &VerifyArgs) -> Result<i32> {
         Some(s) => Some(Catalog::open_readonly(&repo.catalog_path())?.resolve_snapshot(s)?),
         None => None,
     };
-    let r = verify::run(&repo, snapshot, args.quick)?;
+    let r = verify::run_with(
+        &repo,
+        snapshot,
+        &VerifyOptions {
+            quick: args.quick,
+            workers: args.workers,
+            ..VerifyOptions::default()
+        },
+    )?;
     let n = r.problems.len();
     emit(
         cli.json,
