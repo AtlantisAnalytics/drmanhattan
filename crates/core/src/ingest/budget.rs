@@ -7,9 +7,6 @@
 //! granted when nothing else is held, so peak held bytes are at most the
 //! larger of the limit and the largest request (plus re-read growth).
 
-// Wired into the pipeline in the next commit (plan Task 2).
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::BTreeSet;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;

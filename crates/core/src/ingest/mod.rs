@@ -34,13 +34,14 @@ use crate::model::{EntryKind, EntryRow, EntryStatus, SnapshotRow, SnapshotStatus
 use crate::repo::Repo;
 use crate::walk::{walk, SkipReason, WalkEntry, WalkItem, WalkOptions};
 use crate::xattrs::read_xattrs;
+use budget::{default_limit, Budget};
 use screen::{NoopScreener, Screener};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use storage::{Storage, StorageMsg, StorageStats};
 use worker::{FileJob, Worker};
@@ -55,6 +56,10 @@ pub struct IngestOptions {
     pub cross_fs: bool,
     /// Reader threads; 0 means `std::thread::available_parallelism()`.
     pub workers: usize,
+    /// Cap, in bytes, on file data buffered in memory at once (read but not
+    /// yet stored). `None` means a quarter of physical RAM. A file larger
+    /// than the cap is still ingested, alone. Not a whole-process limit.
+    pub max_memory: Option<u64>,
     /// Test seam: commit barrier after this many buffered catalog ops
     /// instead of 10_000. `None` (the default) is the production value.
     #[doc(hidden)]
@@ -105,10 +110,16 @@ pub struct IngestReport {
     pub withheld: u64,
     pub manifest_hash: Hash32,
     pub elapsed_ms: u64,
+    /// Test seam: the most file data held in memory at once, in bytes.
+    #[doc(hidden)]
+    pub peak_buffered: u64,
 }
 
 /// Snapshot `source` into `repo`.
 pub fn run(repo: &Repo, source: &Path, opts: &IngestOptions) -> Result<IngestReport> {
+    if opts.max_memory == Some(0) {
+        return Err(Error::Config("max_memory must be greater than zero".into()));
+    }
     let started = Instant::now();
     let _lock = repo.lock_writer()?;
     let source = canonical(source)?;
@@ -180,6 +191,7 @@ struct PipelineOutput {
     /// The final snapshot row, `record_unit` included.
     row: SnapshotRow,
     manifest_hash: Hash32,
+    peak_buffered: u64,
 }
 
 /// What the finish phase produced before storage was closed.
@@ -288,9 +300,11 @@ fn pipeline(
     let opened = cat_tx.send(CatalogOp::UpsertSnapshot(snap.clone())).is_ok()
         && cat_tx.send(CatalogOp::Commit).is_ok();
 
+    let budget = Budget::new(opts.max_memory.unwrap_or_else(default_limit));
     if opened {
         let claimed = Mutex::new(HashSet::new());
         let worker = Worker {
+            budget: Arc::clone(&budget),
             snapshot: snap.id,
             config: &repo.config,
             catalog_path: repo.catalog_path(),
@@ -375,6 +389,7 @@ fn pipeline(
         skipped,
         row: sealed.row,
         manifest_hash: sealed.manifest_hash,
+        peak_buffered: budget.peak(),
     })
 }
 
@@ -611,6 +626,7 @@ fn finish(repo: &Repo, out: PipelineOutput, started: Instant) -> Result<IngestRe
         skipped,
         row,
         manifest_hash,
+        peak_buffered,
     } = out;
     // The one commit that must survive power loss: after it, wmk exits 0.
     Catalog::open(&repo.catalog_path())?.upsert_snapshot_durable(&row)?;
@@ -632,6 +648,7 @@ fn finish(repo: &Repo, out: PipelineOutput, started: Instant) -> Result<IngestRe
         withheld: 0,
         manifest_hash,
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        peak_buffered,
     })
 }
 
