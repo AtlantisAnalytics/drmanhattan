@@ -61,3 +61,59 @@ fn ingest_without_repo_fails() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no repository"));
 }
+
+#[test]
+fn ingest_with_max_memory_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("r");
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(src.join("d")).unwrap();
+    std::fs::write(src.join("a.html"), b"<html>hi</html>").unwrap();
+    std::fs::write(src.join("d/b.bin"), vec![7u8; 100_000]).unwrap();
+    wmk().arg("init").arg(&repo).assert().success();
+
+    let out = wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .arg("ingest")
+        .arg(&src)
+        .args(["--max-memory", "1M", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let m = wmk().arg("manifest").arg(&src).output().unwrap();
+    assert_eq!(
+        String::from_utf8(m.stdout).unwrap().trim(),
+        v["manifest_hash"].as_str().unwrap()
+    );
+}
+
+#[test]
+fn ingest_rejects_zero_max_memory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("r");
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    wmk().arg("init").arg(&repo).assert().success();
+
+    let out = wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .arg("ingest")
+        .arg(&src)
+        .args(["--max-memory", "0"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("max-memory"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
