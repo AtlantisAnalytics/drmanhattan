@@ -94,3 +94,31 @@ dies has to be started over, because `recover` does not exist yet.
 The permit and semaphore types and where they live; how the test seam
 exposes peak held bytes; the exact size-suffix grammar beyond the examples;
 whether the measurement uses `/usr/bin/time -l` or another tool.
+
+## Results
+
+Measured on 2026-11-24 on a 14-core laptop with 36 GiB of RAM (so the
+default budget is 9 GiB), release builds, warm page cache. Source: 8
+incompressible files of 512 MiB plus 2,000 incompressible files of 64 KiB,
+4.43 GB in all; `wmk ingest --workers 8` into a fresh repository each time.
+Two rounds per row; figures from `/usr/bin/time -l`.
+
+| Build | Max RSS | Wall |
+| --- | --- | --- |
+| 0.1.2 (`main`, no budget) | 4.27, 4.28 GiB | 3.65, 3.39 s |
+| Branch, default budget (9 GiB) | 4.28, 4.28 GiB | 3.40, 3.39 s |
+| Branch, `--max-memory 1G` | 1.70, 1.79 GiB | 4.52, 4.59 s |
+
+- **Default budget:** no change here, as intended: the whole data set
+  (4.4 GB) fits in a quarter of this machine's RAM. The budget bites on
+  machines where the files in flight exceed a quarter of RAM.
+- **Small budget:** peak RSS fell from 4.3 GiB to about 1.75 GiB, at about
+  1.75x the budget rather than near it. The budget counts each file's size
+  once, but a worker briefly holds more: on data zstd cannot shrink, the
+  compression attempt's output buffer sits beside the raw chunks, and the
+  reader keeps its own buffer. So, per the design, `--max-memory` bounds
+  file data, not the process; plan for up to about twice the budget on
+  incompressible data.
+- **Speed:** with 1 GiB, at most two 512 MiB files are in flight, so the
+  run took about 33% longer (4.5 s against 3.4 s).
+- The real archive (16.6 GB peak with 4 workers) was not re-measured.
