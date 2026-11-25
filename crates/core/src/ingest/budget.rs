@@ -236,9 +236,9 @@ mod tests {
             })
         };
         let a = spawn("A", 50);
-        wait_for_queue(&b, 1);
+        wait_for_queue(&b, 2); // ticket 0 is `big`
         let c = spawn("B", 5);
-        wait_for_queue(&b, 2);
+        wait_for_queue(&b, 3);
         thread::sleep(Duration::from_millis(100));
         assert!(order.lock().unwrap().is_empty(), "B jumped the queue");
         drop(big);

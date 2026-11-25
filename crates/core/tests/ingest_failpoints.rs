@@ -85,32 +85,42 @@ fn storage_failure_after_commits_keeps_units_within_synced_packs() {
 }
 
 #[test]
-fn abort_while_waiting_on_budget_does_not_hang() {
+fn abort_with_permits_stranded_in_the_queue_does_not_hang() {
     let _serial = FAIL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let scenario = fail::FailScenario::setup();
-    fail::cfg("ingest::storage_before_sync", "return").unwrap();
+    // The first dirty barrier sleeps while `b` and `c` queue for storage
+    // holding the budget and `d_big` (larger than the budget) waits for it
+    // to empty. The next barrier fails. Queued permits are not freed when
+    // storage stops, so only the abort check can release `d_big`'s worker.
+    fail::cfg("ingest::storage_before_sync", "1*sleep(300)->return").unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
     let repo = Repo::init(&tmp.path().join("r")).unwrap();
     let src = tmp.path().join("src");
     let mut t = TreeBuilder::new(&src);
-    for i in 0..20u32 {
-        let body: Vec<u8> = (0..32 * 1024u32)
-            .map(|j| (j.wrapping_mul(2_654_435_761) ^ i.wrapping_mul(40_503)) as u8)
+    let files = [
+        ("a", 32 * 1024u32),
+        ("b", 32 * 1024),
+        ("c", 32 * 1024),
+        ("d_big", 200 * 1024),
+    ];
+    for (i, (name, len)) in files.iter().enumerate() {
+        let body: Vec<u8> = (0..*len)
+            .map(|j| (j.wrapping_mul(2_654_435_761) ^ (i as u32).wrapping_mul(40_503)) as u8)
             .collect();
-        t.file(format!("f{i:02}").as_bytes(), &body);
+        t.file(name.as_bytes(), &body);
     }
     let opts = IngestOptions {
         workers: 8,
-        max_memory: Some(32 * 1024),
-        barrier_ops: Some(2),
+        max_memory: Some(96 * 1024),
+        barrier_ops: Some(1),
         ..IngestOptions::default()
     };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(ingest::run(&repo, &src, &opts).map(|_| ()));
     });
-    let result = rx.recv_timeout(std::time::Duration::from_secs(30));
+    let result = rx.recv_timeout(std::time::Duration::from_secs(10));
     scenario.teardown();
     let err = result.expect("ingest hung").unwrap_err();
     assert!(

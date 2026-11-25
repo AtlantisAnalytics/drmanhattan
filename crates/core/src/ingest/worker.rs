@@ -101,7 +101,10 @@ impl Worker<'_> {
         let walked: Stamp = (entry.size, entry.mtime_ns);
         let before = stamp(&meta, &abs)?;
         // Held until this file's data is gone: dropped here, or by storage
-        // once a new content's units are appended.
+        // once a new content's units are appended. On abort, permits queued
+        // in the storage channel are not freed (crossbeam keeps a bounded
+        // channel's messages until every sender is gone too), so the abort
+        // check is what releases a worker waiting here.
         let Some(mut permit) = self
             .budget
             .acquire(entry.size.max(before.0), &|| self.shared.aborted())
