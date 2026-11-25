@@ -9,6 +9,7 @@
 //! Either way the entry's size is the number of bytes read and its mtime is
 //! the final fstat's. Open and read errors are never retried.
 
+use super::budget::Budget;
 use super::screen::{Screener, Verdict};
 use super::storage::StorageMsg;
 use super::{entry_row, to_i64, Halt, Shared, Stage};
@@ -30,7 +31,7 @@ use std::collections::HashSet;
 use std::fs::{File, Metadata};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Bytes read up front for format sniffing and image dimensions.
 const SNIFF_LEN: u64 = 8192;
@@ -66,6 +67,8 @@ pub(super) struct Worker<'a> {
     pub screener: &'a dyn Screener,
     pub shared: &'a Shared,
     pub allow_unstable: bool,
+    /// Bounds the file data held between a read and its storage.
+    pub budget: Arc<Budget>,
 }
 
 impl Worker<'_> {
@@ -85,7 +88,7 @@ impl Worker<'_> {
 
     /// Returns the `NewContent` message (if this worker claimed the content)
     /// and the entry message, in the order they must be sent.
-    fn process(&self, cat: &Catalog, job: FileJob) -> Result<(Option<StorageMsg>, StorageMsg)> {
+    fn process(&self, cat: &Catalog, job: FileJob) -> Stage<(Option<StorageMsg>, StorageMsg)> {
         let FileJob {
             id,
             parent,
@@ -97,7 +100,19 @@ impl Worker<'_> {
         let (mut file, meta) = open_walked_file(&abs, &entry)?;
         let walked: Stamp = (entry.size, entry.mtime_ns);
         let before = stamp(&meta, &abs)?;
+        // Held until this file's data is gone: dropped here, or by storage
+        // once a new content's units are appended. On abort, permits queued
+        // in the storage channel are not freed (crossbeam keeps a bounded
+        // channel's messages until every sender is gone too), so the abort
+        // check is what releases a worker waiting here.
+        let Some(mut permit) = self
+            .budget
+            .acquire(entry.size.max(before.0), &|| self.shared.aborted())
+        else {
+            return Err(Halt::Aborted);
+        };
         let pass = self.read_pass(&mut file, before.0, &entry.name, &abs)?;
+        permit.grow_to(pass.digest.size);
         fail::fail_point!("ingest::after_read");
         let after = fstamp(&file, &abs)?;
         let (pass, after, status) = if walked == before && before == after {
@@ -107,6 +122,7 @@ impl Worker<'_> {
             drop(pass);
             let before = fstamp(&file, &abs)?;
             let pass = self.read_pass(&mut file, before.0, &entry.name, &abs)?;
+            permit.grow_to(pass.digest.size);
             fail::fail_point!("ingest::after_read");
             let after = fstamp(&file, &abs)?;
             if before == after {
@@ -114,7 +130,7 @@ impl Worker<'_> {
             } else if self.allow_unstable {
                 (pass, after, EntryStatus::Unstable)
             } else {
-                return Err(Error::Unstable(abs));
+                return Err(Error::Unstable(abs).into());
             }
         };
         let xattrs = read_file_xattrs(&file, &abs)?;
@@ -139,7 +155,8 @@ impl Worker<'_> {
                     return Err(Error::Corrupt(format!(
                         "screener returned {v:?} for {}; withholding is not supported yet",
                         display_path(&abs)
-                    )))
+                    ))
+                    .into())
                 }
             }
             let content = ContentRow {
@@ -158,6 +175,7 @@ impl Worker<'_> {
                 content,
                 units,
                 media: image_dims(format, &head),
+                permit: Some(permit),
             })
         } else {
             None

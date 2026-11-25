@@ -67,7 +67,7 @@ machine-readable output.
 | Command | What it does |
 |---|---|
 | `wmk init <dir>` | Create a new repository |
-| `wmk ingest <dir>` | Snapshot a directory into the repository |
+| `wmk ingest <dir>` | Snapshot a directory into the repository (`--workers N`; `--max-memory SIZE` caps buffered file data, default a quarter of RAM) |
 | `wmk manifest <dir>` | Compute the manifest hash of a live directory |
 | `wmk restore <snapshot> <dest>` | Rebuild a snapshot byte-exact in a new directory (`--path`, `--hardlinks`, `--xattrs`) |
 | `wmk verify [snapshot]` | Check that stored data is intact (`--quick` skips decompression; `--workers N` sets worker threads, 0 = one per CPU) |

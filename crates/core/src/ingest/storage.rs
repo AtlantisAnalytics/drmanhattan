@@ -18,6 +18,7 @@
 //! storage runs a barrier, waits until the catalog writer has committed
 //! everything forwarded so far, and only then replies.
 
+use super::budget::Permit;
 use super::{Halt, Shared, Stage};
 use crate::catalog::writer::CatalogOp;
 use crate::catalog::Catalog;
@@ -52,6 +53,9 @@ pub(super) enum StorageMsg {
         content: ContentRow,
         units: Vec<(RecordHeader, Vec<u8>)>,
         media: Option<(u32, u32)>,
+        /// The file data's budget reservation, released once the units are
+        /// appended (dropped with this message on any path).
+        permit: Option<Permit>,
     },
     /// A unit outside any content (the snapshot record's units), stored
     /// unless it already exists.
@@ -164,7 +168,12 @@ impl Storage {
                 content,
                 units,
                 media,
-            } => Ok(self.new_content(content, units, media)?),
+                permit,
+            } => {
+                let stored = self.new_content(content, units, media);
+                drop(permit);
+                Ok(stored?)
+            }
             StorageMsg::Unit(header, payload) => Ok(self.store_unit(&header, &payload)?),
             StorageMsg::MarkUnstable(marks) => {
                 self.buf.extend(
@@ -404,6 +413,7 @@ mod tests {
                 data.to_vec(),
             )],
             media: None,
+            permit: None,
         }
     }
 

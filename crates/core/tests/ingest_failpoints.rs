@@ -84,6 +84,74 @@ fn storage_failure_after_commits_keeps_units_within_synced_packs() {
     );
 }
 
+#[test]
+fn abort_with_permits_stranded_in_the_queue_does_not_hang() {
+    let _serial = FAIL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let scenario = fail::FailScenario::setup();
+    // The first dirty barrier sleeps while `b` and `c` queue for storage
+    // holding the budget and `d_big` (larger than the budget) waits for it
+    // to empty. The next barrier fails. Queued permits are not freed when
+    // storage stops, so only the abort check can release `d_big`'s worker.
+    fail::cfg("ingest::storage_before_sync", "1*sleep(300)->return").unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repo::init(&tmp.path().join("r")).unwrap();
+    let src = tmp.path().join("src");
+    let mut t = TreeBuilder::new(&src);
+    let files = [
+        ("a", 32 * 1024u32),
+        ("b", 32 * 1024),
+        ("c", 32 * 1024),
+        ("d_big", 200 * 1024),
+    ];
+    for (i, (name, len)) in files.iter().enumerate() {
+        let body: Vec<u8> = (0..*len)
+            .map(|j| (j.wrapping_mul(2_654_435_761) ^ (i as u32).wrapping_mul(40_503)) as u8)
+            .collect();
+        t.file(name.as_bytes(), &body);
+    }
+    let opts = IngestOptions {
+        workers: 8,
+        max_memory: Some(96 * 1024),
+        barrier_ops: Some(1),
+        ..IngestOptions::default()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(ingest::run(&repo, &src, &opts).map(|_| ()));
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(10));
+    scenario.teardown();
+    let err = result.expect("ingest hung").unwrap_err();
+    assert!(
+        matches!(&err, Error::Corrupt(m) if m.contains("ingest::storage_before_sync")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn grow_during_read_with_small_budget() {
+    let _serial = FAIL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let scenario = fail::FailScenario::setup();
+    let body: Vec<u8> = (0..64 * 1024u32).map(|j| (j % 251) as u8).collect();
+    let (_tmp, repo, src, f) = one_file(&body);
+    let seen = grow_after_read(&f, 1);
+    let opts = IngestOptions {
+        max_memory: Some(16 * 1024),
+        ..opts()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(ingest::run(&repo, &src, &opts).map(|r| r.peak_buffered));
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(30));
+    scenario.teardown();
+    let peak = result.expect("ingest hung").unwrap();
+    assert_eq!(seen.load(Ordering::SeqCst), 2);
+    // The re-read found one more byte than was reserved; the permit grew.
+    assert_eq!(peak, body.len() as u64 + 1);
+}
+
 /// A repo plus a source holding the single file `src/f`, returned as the
 /// canonical path ingest reports in errors. Failpoint callbacks fire for
 /// every file, so these tests use exactly one.
