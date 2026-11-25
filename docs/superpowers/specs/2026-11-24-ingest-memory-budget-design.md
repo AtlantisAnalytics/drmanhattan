@@ -113,12 +113,12 @@ Two rounds per row; figures from `/usr/bin/time -l`.
   (4.4 GB) fits in a quarter of this machine's RAM. The budget bites on
   machines where the files in flight exceed a quarter of RAM.
 - **Small budget:** peak RSS fell from 4.3 GiB to about 1.75 GiB, at about
-  1.75x the budget rather than near it. The budget counts each file's size
-  once, but a worker briefly holds more: on data zstd cannot shrink, the
-  compression attempt's output buffer sits beside the raw chunks, and the
-  reader keeps its own buffer. So, per the design, `--max-memory` bounds
-  file data, not the process; plan for up to about twice the budget on
-  incompressible data.
+  1.75x the budget rather than near it. The cause was not isolated. The
+  budget counts each file's size once, and a worker likely holds more for
+  a moment: on data zstd cannot shrink, the compression attempt's output
+  buffer sits beside the raw chunks, and the reader keeps its own buffer.
+  So, per the design, `--max-memory` bounds file data, not the process;
+  plan for up to about twice the budget on incompressible data.
 - **Speed:** with 1 GiB, at most two 512 MiB files are in flight, so the
   run took about 33% longer (4.5 s against 3.4 s).
 - The real archive (16.6 GB peak with 4 workers) was not re-measured.
