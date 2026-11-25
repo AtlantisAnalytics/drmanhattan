@@ -30,7 +30,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --all-features
+        # Run every test binary even after one fails, so a failure cannot hide others.
+        run: cargo test --all-features --no-fail-fast
       - name: Round-trip property tests (256 cases)
         run: cargo test --release -p drmanhattan-core --test roundtrip_prop
         env:
