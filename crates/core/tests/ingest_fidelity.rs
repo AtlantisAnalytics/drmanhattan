@@ -271,9 +271,23 @@ fn snapshot_record_roundtrip() {
         .file(b"empty", b"")
         .symlink(b"d/l", b"../a.html");
     xattr::set(src.join("dup1"), XATTR, b"x1").unwrap();
-    xattr::set(src.join("d"), XATTR, &vec![0xAB; 9000]).unwrap();
+    set_large_xattr(&src.join("d"));
     let r = ingest(&repo, &src);
     assert_record_matches_catalog(&repo, &r);
+}
+
+/// Set a value larger than a filesystem block where the filesystem allows
+/// it. ext4 without `ea_inode` (as on GitHub's Ubuntu runners) keeps an
+/// inode's xattrs within one block and refuses larger values with ENOSPC
+/// (or E2BIG), so fall back to a value that fits there.
+fn set_large_xattr(path: &Path) {
+    match xattr::set(path, XATTR, &[0xAB; 9000]) {
+        Ok(()) => {}
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::E2BIG)) => {
+            xattr::set(path, XATTR, &[0xAB; 3000]).unwrap();
+        }
+        Err(e) => panic!("setting a 9000-byte xattr on {}: {e}", path.display()),
+    }
 }
 
 /// The test-only host and source-root overrides replace what the snapshot
