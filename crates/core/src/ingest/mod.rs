@@ -19,6 +19,7 @@
 //! then is storage closed (sealing the open pack), every thread joined, and
 //! the snapshot row marked complete with its `record_unit`.
 
+mod budget;
 pub mod record;
 pub mod screen;
 mod storage;
