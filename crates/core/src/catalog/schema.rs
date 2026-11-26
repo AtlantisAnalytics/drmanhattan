@@ -1,7 +1,10 @@
 //! Catalog schema (spec §6.1). Table names, column names and value strings
 //! are a published contract for external readers.
 
-pub const USER_VERSION: i64 = 1;
+/// The version new catalogs are created at.
+pub const USER_VERSION: i64 = 2;
+/// Versions this build opens; an existing catalog keeps its version.
+pub const SUPPORTED_VERSIONS: [i64; 2] = [1, 2];
 
 pub const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS snapshot(
@@ -129,5 +132,5 @@ CREATE INDEX IF NOT EXISTS unit_pack_offset ON unit(pack_id, pack_offset);
 CREATE INDEX IF NOT EXISTS label_scheme_value ON label(scheme, value);
 CREATE INDEX IF NOT EXISTS media_phash ON media(phash);
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 ";

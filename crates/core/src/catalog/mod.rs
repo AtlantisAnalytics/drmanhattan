@@ -171,7 +171,7 @@ impl Catalog {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let cat = Catalog { conn };
         match cat.user_version()? {
-            schema::USER_VERSION => {}
+            v if schema::SUPPORTED_VERSIONS.contains(&v) => {}
             0 => {
                 let tables: i64 = cat.conn.query_row(
                     "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
@@ -201,7 +201,7 @@ impl Catalog {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let cat = Catalog { conn };
         let v = cat.user_version()?;
-        if v != schema::USER_VERSION {
+        if !schema::SUPPORTED_VERSIONS.contains(&v) {
             return Err(unsupported_version(v));
         }
         Ok(cat)
@@ -542,8 +542,8 @@ impl Catalog {
 
 fn unsupported_version(v: i64) -> Error {
     Error::Corrupt(format!(
-        "unsupported catalog user_version {v} (this build supports {})",
-        schema::USER_VERSION
+        "unsupported catalog user_version {v} (this build supports {:?})",
+        schema::SUPPORTED_VERSIONS
     ))
 }
 

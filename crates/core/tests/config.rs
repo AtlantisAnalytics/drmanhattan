@@ -49,9 +49,9 @@ fn config_parse_error_escapes_terminal_controls() {
 }
 
 #[test]
-fn config_rejects_unknown_format_version() {
-    match open_with(|c| c.format_version = 2) {
-        Err(Error::Config(m)) => assert_eq!(m, "unsupported format_version 2"),
+fn format_version_3_is_refused() {
+    match open_with(|c| c.format_version = 3) {
+        Err(Error::Config(m)) => assert_eq!(m, "unsupported format_version 3"),
         other => panic!("expected Config error, got {:?}", other.map(|_| ())),
     }
 }

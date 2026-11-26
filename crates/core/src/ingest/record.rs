@@ -323,6 +323,7 @@ impl TryFrom<WireSnapshot> for SnapshotRow {
         Ok(SnapshotRow {
             id: s.id.0,
             status: SnapshotStatus::parse(&s.status)
+                .filter(|st| *st != SnapshotStatus::Damaged)
                 .ok_or_else(|| corrupt(format!("unknown snapshot status {:?}", s.status)))?,
             source_root: s.source_root.0,
             host: s.host,
@@ -954,6 +955,19 @@ mod tests {
                 detected_at: 42,
             }]
         );
+    }
+
+    #[test]
+    fn damaged_status_is_rejected_in_records() {
+        let s = SnapshotRow {
+            status: SnapshotStatus::Damaged,
+            ..snapshot()
+        };
+        let doc = encode_items(&[header(&s)]);
+        assert!(matches!(
+            parse_document(&mut &doc[..]),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     #[test]
