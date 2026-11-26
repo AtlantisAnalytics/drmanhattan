@@ -14,6 +14,7 @@ use crate::pack::UnitKind;
 use crate::sniff::{Format, ProfileKind};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -249,6 +250,32 @@ impl Catalog {
 
     pub fn has_content(&self, h: &Hash32) -> Result<bool> {
         self.exists("SELECT 1 FROM content WHERE hash = ?1", h)
+    }
+
+    /// The content row exists and every one of its units is listed. A
+    /// content of zero units (an empty file) is complete.
+    pub fn content_complete(&self, h: &Hash32) -> Result<bool> {
+        self.exists(
+            "SELECT 1 FROM content c WHERE c.hash = ?1 AND \
+             (SELECT COUNT(*) FROM content_unit cu WHERE cu.content_hash = c.hash) \
+             >= c.unit_count",
+            h,
+        )
+    }
+
+    /// Contents referenced by the snapshot's entries that list fewer units
+    /// than their `unit_count`.
+    pub fn incomplete_contents(&self, snapshot: Id) -> Result<HashSet<Hash32>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT c.hash FROM content c \
+             JOIN (SELECT DISTINCT content_hash FROM entry \
+                   WHERE snapshot_id = ?1 AND content_hash IS NOT NULL) e \
+               ON e.content_hash = c.hash \
+             LEFT JOIN content_unit cu ON cu.content_hash = c.hash \
+             GROUP BY c.hash HAVING COUNT(cu.seq) < c.unit_count",
+        )?;
+        let rows = stmt.query_map([snapshot], |r| r.get::<_, Hash32>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     pub fn has_unit(&self, h: &Hash32) -> Result<bool> {

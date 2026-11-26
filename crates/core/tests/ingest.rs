@@ -462,3 +462,71 @@ fn ingest_sweeps_stale_record_temp_files() {
     assert!(!stale.exists());
     assert!(keep.exists());
 }
+
+#[test]
+fn reingest_heals_an_incomplete_content() {
+    let (tmp, repo, src) = setup();
+    let a = random(7, 3 << 20);
+    TreeBuilder::new(&src)
+        .file(b"a", &a)
+        .file(b"b", &random(8, 1000))
+        .finish();
+    let live = manifest_dir(&src, &mopts()).unwrap();
+    let r1 = ingest(&repo, &src);
+    let a_hash = drmanhattan_core::ids::Hash32::of(&a);
+
+    // Drop one unit of `a` (and the content_unit row that references it).
+    {
+        let conn = db(&repo);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM content_unit WHERE content_hash = ?1",
+                [&a_hash],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT unit_count FROM content WHERE hash = ?1",
+                [&a_hash],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+        );
+        let unit: Vec<u8> = conn
+            .query_row(
+                "SELECT unit_hash FROM content_unit WHERE content_hash = ?1 AND seq = 1",
+                [&a_hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute("DELETE FROM content_unit WHERE unit_hash = ?1", [&unit])
+            .unwrap();
+        conn.execute("DELETE FROM unit WHERE hash = ?1", [&unit])
+            .unwrap();
+    }
+
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    assert_eq!(
+        cat.incomplete_contents(r1.snapshot).unwrap(),
+        HashSet::from([a_hash])
+    );
+    assert!(!cat.content_complete(&a_hash).unwrap());
+    drop(cat);
+
+    let r2 = ingest(&repo, &src);
+    assert!(r2.new_units > 0);
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    assert!(cat.content_complete(&a_hash).unwrap());
+    assert!(cat.incomplete_contents(r1.snapshot).unwrap().is_empty());
+    assert!(cat.incomplete_contents(r2.snapshot).unwrap().is_empty());
+
+    let dest = tmp.path().join("out");
+    drmanhattan_core::restore::run(
+        &repo,
+        r1.snapshot,
+        &dest,
+        &drmanhattan_core::restore::RestoreOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(manifest_dir(&dest, &mopts()).unwrap().core, live.core);
+}

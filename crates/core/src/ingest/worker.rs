@@ -142,7 +142,7 @@ impl Worker<'_> {
             digest,
         } = pass;
 
-        let content_known = cat.has_content(&digest.hash)?;
+        let content_known = cat.content_complete(&digest.hash)?;
         let new_content = if !content_known && self.claim(digest.hash) {
             match self
                 .screener
