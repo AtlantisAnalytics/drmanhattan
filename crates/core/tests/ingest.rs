@@ -424,3 +424,41 @@ fn non_directory_source_is_refused_before_any_snapshot_row() {
         "a snapshot row was created"
     );
 }
+
+#[test]
+fn ingest_refuses_when_catalog_missing_but_packs_exist() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"a.txt", b"hello");
+    ingest(&repo, &src);
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = repo.catalog_path().into_os_string();
+        name.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(name));
+    }
+    let err = ingest::run(&repo, &src, &opts()).unwrap_err();
+    assert!(matches!(err, Error::CatalogMissing), "{err:?}");
+    assert!(!repo.catalog_path().exists());
+}
+
+#[test]
+fn ingest_into_fresh_repo_without_catalog_file_still_works() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"a.txt", b"hello");
+    std::fs::remove_file(repo.catalog_path()).unwrap();
+    ingest(&repo, &src);
+    assert!(repo.catalog_path().exists());
+}
+
+#[test]
+fn ingest_sweeps_stale_record_temp_files() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"a.txt", b"hello");
+    std::fs::create_dir_all(repo.tmp_dir()).unwrap();
+    let stale = repo.tmp_dir().join("record-stale.cbor");
+    let keep = repo.tmp_dir().join("keep.txt");
+    std::fs::write(&stale, b"x").unwrap();
+    std::fs::write(&keep, b"x").unwrap();
+    ingest(&repo, &src);
+    assert!(!stale.exists());
+    assert!(keep.exists());
+}

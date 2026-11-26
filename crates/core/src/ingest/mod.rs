@@ -122,6 +122,11 @@ pub fn run(repo: &Repo, source: &Path, opts: &IngestOptions) -> Result<IngestRep
     }
     let started = Instant::now();
     let _lock = repo.lock_writer()?;
+    repo.sweep_tmp()?;
+    // Before anything opens or creates the catalog (including `mark_failed`).
+    if !repo.catalog_path().exists() && repo.has_packs()? {
+        return Err(Error::CatalogMissing);
+    }
     let source = canonical(source)?;
     let root = canonical(&repo.root)?;
     // Component-wise, so `/x/r2` is not inside `/x/r`.
@@ -136,6 +141,9 @@ pub fn run(repo: &Repo, source: &Path, opts: &IngestOptions) -> Result<IngestRep
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a directory"),
         ));
     }
+    // A fresh repository may lack the file (no packs, guard passed); the
+    // readers below open it read-only, so create it first.
+    drop(Catalog::open(&repo.catalog_path())?);
     let (host, source_root) = recorded_identity(opts, &source);
     let snap = SnapshotRow {
         id: Id::new_v7(),
