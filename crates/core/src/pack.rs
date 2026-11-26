@@ -198,7 +198,7 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-fn fsync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
     File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| Error::io(dir, e))

@@ -5,13 +5,16 @@ mod common;
 use common::TreeBuilder;
 use drmanhattan_core::catalog::Catalog;
 use drmanhattan_core::compress::Compression;
+use drmanhattan_core::error::Error;
 use drmanhattan_core::ids::{Hash32, Id};
 use drmanhattan_core::ingest::record::record_chunks;
 use drmanhattan_core::ingest::{self, IngestOptions};
+use drmanhattan_core::manifest::{manifest_dir, ManifestOptions};
 use drmanhattan_core::pack::RECORD_HEADER_LEN;
 use drmanhattan_core::pack::{pack_path, PackReader, PackWriter, RecordHeader, UnitKind};
 use drmanhattan_core::recover::{self, RecoverOptions, RecoverReport};
 use drmanhattan_core::repo::Repo;
+use drmanhattan_core::restore::{self, RestoreOptions};
 use drmanhattan_core::unitread::UnitReader;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{Rng, SeedableRng};
@@ -756,4 +759,244 @@ fn bad_footer_hash_is_a_warning() {
     assert_eq!(p.blake3, None);
     assert_eq!(p.size, data_end);
     assert_eq!(status(&dest, s), "complete");
+}
+
+// ---- recover::run ----
+
+fn mopts() -> ManifestOptions {
+    ManifestOptions {
+        mtime_precision_ns: 1,
+        cross_fs: false,
+    }
+}
+
+fn two_snapshots(repo: &Repo, src: &Path) -> (Id, Id) {
+    let mut t = TreeBuilder::new(src);
+    t.file(b"a.bin", &random(5, 100_000))
+        .file(b"sub/f.txt", b"text\n")
+        .symlink(b"l", b"sub/f.txt");
+    let s1 = ingest(repo, src);
+    t.file(b"b.bin", &random(6, 50_000));
+    let s2 = ingest(repo, src);
+    (s1, s2)
+}
+
+/// Restore `snapshot` from `repo` and check it against the stored manifest.
+fn assert_restores(repo: &Repo, snapshot: Id, out: &Path) {
+    restore::run(
+        repo,
+        snapshot,
+        out,
+        &RestoreOptions {
+            path: Vec::new(),
+            hardlinks: false,
+            xattrs: false,
+        },
+    )
+    .unwrap();
+    let want = catalog(repo).snapshot(snapshot).unwrap().manifest_hash;
+    assert_eq!(Some(manifest_dir(out, &mopts()).unwrap().core), want);
+}
+
+fn user_version(path: &Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn backups(repo: &Repo) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = fs::read_dir(&repo.root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("catalog.sqlite.pre-recover-")
+                && !p.to_string_lossy().ends_with("-wal")
+                && !p.to_string_lossy().ends_with("-shm")
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn remove_catalog(repo: &Repo) {
+    for s in ["", "-wal", "-shm"] {
+        let mut p = repo.catalog_path().into_os_string();
+        p.push(s);
+        let _ = fs::remove_file(p);
+    }
+}
+
+fn no_tmp_leftovers(repo: &Repo) {
+    let left: Vec<PathBuf> = fs::read_dir(repo.tmp_dir())
+        .map(|rd| rd.map(|e| e.unwrap().path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "left in tmp/: {left:?}");
+}
+
+#[test]
+fn recover_after_deleting_catalog_restores_byte_exact() {
+    let (tmp, repo, src) = setup();
+    let (s1, s2) = two_snapshots(&repo, &src);
+    remove_catalog(&repo);
+
+    let report = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    assert!(report.intact(), "{report:#?}");
+    assert_eq!(report.old_catalog, None);
+    assert!(report.not_recovered.is_empty());
+    assert_eq!(report.snapshots, vec![s1, s2]);
+    assert_eq!(user_version(&repo.catalog_path()), 2);
+    assert_eq!(Repo::open(&repo.root).unwrap().config.format_version, 2);
+    assert!(backups(&repo).is_empty());
+    no_tmp_leftovers(&repo);
+    for (i, s) in [s1, s2].into_iter().enumerate() {
+        assert_restores(&repo, s, &tmp.path().join(format!("out{i}")));
+    }
+}
+
+#[test]
+fn recover_over_healthy_catalog_keeps_old_one() {
+    let (_tmp, repo, src) = setup();
+    let (s1, s2) = two_snapshots(&repo, &src);
+    let before = fs::read(repo.catalog_path()).unwrap();
+
+    let report = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    assert!(report.intact(), "{report:#?}");
+    assert!(report.not_recovered.is_empty());
+    let old = report.old_catalog.clone().unwrap();
+    assert!(old
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("catalog.sqlite.pre-recover-"));
+    assert_eq!(fs::read(&old).unwrap(), before);
+    let old_cat = Catalog::open_readonly(&old).unwrap();
+    assert_eq!(old_cat.snapshots().unwrap().len(), 2);
+    assert_eq!(catalog(&repo).snapshots().unwrap().len(), 2);
+    assert_eq!(report.snapshots, vec![s1, s2]);
+    assert_eq!(backups(&repo), vec![old]);
+}
+
+#[test]
+fn recover_twice_keeps_both_old_catalogs() {
+    let (_tmp, repo, src) = setup();
+    two_snapshots(&repo, &src);
+    let a = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    let b = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    let (a, b) = (a.old_catalog.unwrap(), b.old_catalog.unwrap());
+    assert_ne!(a, b);
+    assert!(a.exists() && b.exists());
+    assert_eq!(backups(&repo).len(), 2);
+}
+
+#[test]
+fn recover_empty_repository() {
+    let (_tmp, repo, _src) = setup();
+    let report = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    assert!(report.intact(), "{report:#?}");
+    assert!(report.snapshots.is_empty());
+    assert!(catalog(&repo).snapshots().unwrap().is_empty());
+    assert!(report.old_catalog.is_some());
+}
+
+#[test]
+fn unreadable_pack_is_an_error_and_changes_nothing() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("running as root: permissions are not enforced");
+        return;
+    }
+    let (_tmp, repo, src) = setup();
+    let (s1, _s2) = two_snapshots(&repo, &src);
+    let unit = first_unit(&repo, s1, b"a.bin");
+    let pack = catalog(&repo).unit(&unit).unwrap().pack_id;
+    let before = untouchable(&repo);
+    let path = pack_path(&repo.packs_dir(), pack);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let result = recover::run(&repo, &RecoverOptions::default());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(result, Err(Error::Io { .. })), "{result:?}");
+    assert_eq!(untouchable(&repo), before);
+    assert!(backups(&repo).is_empty());
+    no_tmp_leftovers(&repo);
+}
+
+#[test]
+fn unfinished_snapshot_is_listed_as_not_recovered() {
+    let (_tmp, repo, src) = setup();
+    two_snapshots(&repo, &src);
+    let id = Id::new_v7();
+    rusqlite::Connection::open(repo.catalog_path())
+        .unwrap()
+        .execute(
+            "INSERT INTO snapshot(id, status, source_root, host, tool_version, started_at) \
+             VALUES (?1, 'in_progress', x'2f', 'h', 't', 1)",
+            [id.as_bytes().to_vec()],
+        )
+        .unwrap();
+    let report = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    assert_eq!(report.not_recovered, vec![id]);
+    assert_eq!(report.snapshots.len(), 2);
+}
+
+#[test]
+fn recover_refuses_while_locked() {
+    let (_tmp, repo, src) = setup();
+    two_snapshots(&repo, &src);
+    let before = untouchable(&repo);
+    let _lock = repo.lock_writer().unwrap();
+    let r = recover::run(&repo, &RecoverOptions::default());
+    assert!(matches!(r, Err(Error::Locked)), "{r:?}");
+    assert_eq!(untouchable(&repo), before);
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir(to).unwrap();
+    for e in fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dest);
+        } else {
+            fs::copy(e.path(), dest).unwrap();
+        }
+    }
+}
+
+#[test]
+fn moved_repository_recovers() {
+    let (tmp, repo, src) = setup();
+    let (s1, s2) = two_snapshots(&repo, &src);
+    let moved = tmp.path().join("moved");
+    copy_tree(&repo.root, &moved);
+    let copy = Repo::open(&moved).unwrap();
+    remove_catalog(&copy);
+    let report = recover::run(&copy, &RecoverOptions::default()).unwrap();
+    assert!(report.intact(), "{report:#?}");
+    assert_eq!(report.snapshots, vec![s1, s2]);
+    assert_restores(&copy, s2, &tmp.path().join("out"));
+}
+
+#[test]
+fn damage_then_reingest_then_recover_clears_damage() {
+    let (_tmp, repo, src) = setup();
+    let mut t = TreeBuilder::new(&src);
+    t.file(b"big.bin", &random(7, 100_000)).file(b"ok", b"fine");
+    let s = ingest(&repo, &src);
+    let unit = first_unit(&repo, s, b"big.bin");
+    flip_unit(&repo, &unit);
+
+    let first = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    assert!(!first.intact(), "{first:#?}");
+    assert_eq!(status(&repo.catalog_path(), s), "damaged");
+
+    // Re-ingesting the intact source stores the lost units again.
+    let again = ingest(&repo, &src);
+    let second = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    assert!(second.intact(), "{second:#?}");
+    assert_eq!(second.snapshots, vec![s, again]);
+    assert_eq!(status(&repo.catalog_path(), s), "complete");
+    assert_eq!(status(&repo.catalog_path(), again), "complete");
 }

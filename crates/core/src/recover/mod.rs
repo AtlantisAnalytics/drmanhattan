@@ -15,6 +15,10 @@
 //! 5. **Check**: SQLite integrity and foreign keys, and every recovered
 //!    snapshot's manifest hash against its stored one.
 //! 6. Checkpoint, so no `-wal` is left beside the new catalog.
+//!
+//! `run` wraps `build`: it holds the writer lock, builds into `tmp/`, keeps
+//! the old catalog as `catalog.sqlite.pre-recover-<UTC time>`, swaps the new
+//! one in and records `format_version = 2`.
 
 mod scan;
 
@@ -32,7 +36,7 @@ use crate::verify::worker_count;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Default)]
 pub struct RecoverOptions {
@@ -143,6 +147,159 @@ pub fn build(repo: &Repo, dest: &Path, opts: &RecoverOptions) -> Result<RecoverR
     cat.conn.close().map_err(|(_, e)| e)?;
     report.elapsed_ms = start.elapsed().as_millis() as u64;
     Ok(report)
+}
+
+/// Rebuild the catalog from the packs and swap it in, keeping the old one.
+///
+/// Holds the writer lock throughout. The new catalog is built in `tmp/`;
+/// until the final rename, any error removes it and leaves `catalog.sqlite`
+/// (with its `-wal` / `-shm`) and `wmk.toml` as they were. The old catalog is
+/// never deleted: it is hard-linked to `catalog.sqlite.pre-recover-<stamp>`.
+pub fn run(repo: &Repo, opts: &RecoverOptions) -> Result<RecoverReport> {
+    let _lock = repo.lock_writer()?;
+    repo.sweep_tmp()?;
+    let old_ids = old_snapshot_ids(&repo.catalog_path());
+    checkpoint_old(&repo.catalog_path());
+
+    let tmp_dir = repo.tmp_dir();
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| Error::io(&tmp_dir, e))?;
+    let tmp = tmp_dir.join(format!("recover-{}.sqlite", uuid::Uuid::now_v7()));
+    let built = build(repo, &tmp, opts).and_then(|report| Ok((swap_in(repo, &tmp)?, report)));
+    let (old_catalog, mut report) = match built {
+        Ok(v) => v,
+        Err(e) => {
+            remove_sqlite_files(&tmp);
+            return Err(e);
+        }
+    };
+    report.old_catalog = old_catalog;
+    report.not_recovered = old_ids
+        .into_iter()
+        .filter(|id| !report.snapshots.contains(id))
+        .collect();
+
+    let mut config = repo.config.clone();
+    config.format_version = 2;
+    config.save(&repo.root.join("wmk.toml"))?;
+    Ok(report)
+}
+
+/// Snapshot ids in the old catalog, or none when it cannot be read.
+fn old_snapshot_ids(path: &Path) -> Vec<Id> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    match Catalog::open_readonly(path).and_then(|c| c.snapshots()) {
+        Ok(rows) => rows.into_iter().map(|r| r.id).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Fold the old catalog's WAL into it, best effort; never creates the file.
+fn checkpoint_old(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if let Ok(conn) = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+    {
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        let _ = conn.close();
+    }
+}
+
+fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+fn remove_sqlite_files(p: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(with_suffix(p, suffix));
+    }
+}
+
+/// Preserve the old catalog (if any) and rename `tmp` over `catalog.sqlite`.
+/// Returns the backup path. On error the old catalog is back in place.
+fn swap_in(repo: &Repo, tmp: &Path) -> Result<Option<PathBuf>> {
+    let cat = repo.catalog_path();
+    let backup = match std::fs::symlink_metadata(&cat) {
+        Ok(_) => Some(backup_link(&cat)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(Error::io(&cat, e)),
+    };
+    let mut moved: Vec<&str> = Vec::new();
+    let swapped = (|| -> Result<()> {
+        if let Some(b) = &backup {
+            for suffix in ["-wal", "-shm"] {
+                let from = with_suffix(&cat, suffix);
+                if from.exists() {
+                    let to = with_suffix(b, suffix);
+                    std::fs::rename(&from, &to).map_err(|e| Error::io(&from, e))?;
+                    moved.push(suffix);
+                }
+            }
+        }
+        std::fs::rename(tmp, &cat).map_err(|e| Error::io(&cat, e))?;
+        crate::pack::fsync_dir(&repo.root)
+    })();
+    match swapped {
+        Ok(()) => Ok(backup),
+        Err(e) => {
+            // Undo only while the new catalog has not replaced the old one.
+            if let Some(b) = &backup {
+                if std::fs::symlink_metadata(tmp).is_ok() {
+                    for suffix in moved {
+                        let _ = std::fs::rename(with_suffix(b, suffix), with_suffix(&cat, suffix));
+                    }
+                    let _ = std::fs::remove_file(b);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Hard-link `cat` to the first free `<cat>.pre-recover-<stamp>[-n]`.
+fn backup_link(cat: &Path) -> Result<PathBuf> {
+    let base = with_suffix(cat, &format!(".pre-recover-{}", utc_stamp()));
+    for n in 1u32.. {
+        let target = if n == 1 {
+            base.clone()
+        } else {
+            with_suffix(&base, &format!("-{n}"))
+        };
+        match std::fs::hard_link(cat, &target) {
+            Ok(()) => return Ok(target),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(Error::io(&target, e)),
+        }
+    }
+    unreachable!("the suffix counter does not run out")
+}
+
+/// Now as `YYYYMMDDTHHMMSSZ` (UTC).
+fn utc_stamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 fn check_dest(repo: &Repo, dest: &Path) -> Result<()> {
