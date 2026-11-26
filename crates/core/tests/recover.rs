@@ -565,6 +565,115 @@ fn committed_bytes_lost_from_an_unsealed_pack_are_unaccounted() {
     assert!(report.torn_tails.is_empty(), "{:?}", report.torn_tails);
 }
 
+/// Leave `snapshot`'s record as an ingest killed right after the record was
+/// durable leaves it: the last record of an unsealed pack (footer cut off)
+/// whose catalog row says those bytes were committed. Returns the pack id,
+/// the record's offset and the pack's data end.
+fn unseal_record_pack(repo: &Repo, snapshot: Id) -> (Id, u64, u64) {
+    let cat = catalog(repo);
+    let record = cat.snapshot(snapshot).unwrap().record_unit.unwrap();
+    let unit = cat.unit(&record).unwrap();
+    drop(cat);
+    let path = pack_path(&repo.packs_dir(), unit.pack_id);
+    let bytes = fs::read(&path).unwrap();
+    let footer = u64::from_le_bytes(bytes[bytes.len() - 16..bytes.len() - 8].try_into().unwrap());
+    let offset = unit.pack_offset as u64;
+    assert_eq!(
+        offset + RECORD_HEADER_LEN as u64 + unit.stored_size as u64,
+        footer,
+        "the record is the pack's last record"
+    );
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&path, &bytes[..footer as usize]).unwrap();
+    rusqlite::Connection::open(repo.catalog_path())
+        .unwrap()
+        .execute(
+            "UPDATE pack SET sealed = 0, blake3 = NULL, size = ?2 WHERE id = ?1",
+            rusqlite::params![unit.pack_id.as_bytes().to_vec(), footer as i64],
+        )
+        .unwrap();
+    (unit.pack_id, offset, footer)
+}
+
+#[test]
+fn second_recover_still_reports_lost_committed_bytes() {
+    let (_tmp, repo, src) = setup();
+    let mut t = TreeBuilder::new(&src);
+    t.file(b"one", b"1");
+    let s1 = ingest(&repo, &src);
+    t.file(b"two", b"2");
+    let s2 = ingest(&repo, &src);
+    let (pack, offset, end) = unseal_record_pack(&repo, s2);
+    flip(&repo, pack, offset + 54);
+
+    for run in 1..=2 {
+        let report = recover::run(&repo, &RecoverOptions::default()).unwrap();
+        assert!(!report.intact(), "run {run}: {report:#?}");
+        assert_eq!(report.snapshots, vec![s1], "run {run}");
+        assert_eq!(report.unaccounted.len(), 1, "run {run}: {report:#?}");
+        let r = &report.unaccounted[0];
+        assert_eq!(
+            (r.pack_id, r.start, r.end),
+            (pack, offset, end),
+            "run {run}"
+        );
+        assert!(report.torn_tails.is_empty(), "run {run}: {report:#?}");
+    }
+}
+
+#[test]
+fn torn_tail_stays_harmless_across_recovers() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"f", b"body");
+    let s = ingest(&repo, &src);
+    let raw = b"committed unit".to_vec();
+    let header = RecordHeader {
+        kind: UnitKind::RawChunk,
+        compression: Compression::None,
+        unit_hash: Hash32::of(&raw),
+        raw_len: raw.len() as u64,
+        stored_len: raw.len() as u64,
+    };
+    let id = Id::new_v7();
+    let mut w = PackWriter::create(&repo.packs_dir(), id).unwrap();
+    w.append(&header, &raw).unwrap();
+    let end = w.len();
+    w.sync().unwrap();
+    drop(w);
+    rusqlite::Connection::open(repo.catalog_path())
+        .unwrap()
+        .execute(
+            "INSERT INTO pack(id, size, sealed, blake3) VALUES (?1, ?2, 0, NULL)",
+            rusqlite::params![id.as_bytes().to_vec(), end as i64],
+        )
+        .unwrap();
+    // Bytes past every recorded size: an unfinished write.
+    let path = pack_path(&repo.packs_dir(), id);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.extend_from_slice(&[0x52, 0x4B, 0x4D, 0x57, 1, 0, 9, 9, 9]);
+    fs::write(&path, &bytes).unwrap();
+
+    for run in 1..=2 {
+        let report = recover::run(&repo, &RecoverOptions::default()).unwrap();
+        assert!(report.intact(), "run {run}: {report:#?}");
+        assert_eq!(report.snapshots, vec![s], "run {run}");
+        assert_eq!(report.torn_tails.len(), 1, "run {run}: {report:#?}");
+        let tail = &report.torn_tails[0];
+        assert_eq!(
+            (tail.pack_id, tail.start, tail.end),
+            (id, end, bytes.len() as u64),
+            "run {run}"
+        );
+    }
+    // Reading the kept catalogs left nothing beside them.
+    let sidecars: Vec<_> = fs::read_dir(&repo.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("catalog.sqlite.pre-recover-") && n.ends_with("-shm"))
+        .collect();
+    assert!(sidecars.is_empty(), "{sidecars:?}");
+}
+
 #[test]
 fn symlinked_shard_directory_is_followed() {
     let (tmp, repo, src) = setup();

@@ -208,7 +208,7 @@ pub fn run(repo: &Repo, opts: &RecoverOptions) -> Result<RecoverReport> {
     repo.sweep_tmp()?;
     let tmp_dir = repo.tmp_dir();
     sweep_stale_catalogs(&tmp_dir)?;
-    let (old_ids, old_sizes) = read_old(&repo.catalog_path());
+    let (old_ids, old_sizes) = read_old(repo);
 
     std::fs::create_dir_all(&tmp_dir).map_err(|e| Error::io(&tmp_dir, e))?;
     let tmp = tmp_dir.join(format!("recover-{}.sqlite", uuid::Uuid::now_v7()));
@@ -265,31 +265,98 @@ pub(crate) fn sweep_stale_catalogs(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Snapshot ids and pack sizes in the old catalog, best effort: each is
-/// empty when it cannot be read.
-fn read_old(path: &Path) -> (Vec<Id>, HashMap<Id, u64>) {
-    if !path.exists() {
-        return (Vec::new(), HashMap::new());
+/// Snapshot ids in the old catalog, and each pack's committed size: the
+/// largest `pack.size` that the old catalog or any kept
+/// `catalog.sqlite.pre-recover-*` records for it. All best effort: an
+/// unreadable catalog contributes nothing.
+///
+/// The backups matter because a rebuilt catalog records an unsealed pack
+/// only up to its last intact record: read alone on a later run, it would
+/// turn committed bytes lost before into a torn tail. Packs are append-only
+/// and backups are never deleted, so the maximum is safe.
+fn read_old(repo: &Repo) -> (Vec<Id>, HashMap<Id, u64>) {
+    let path = repo.catalog_path();
+    let old = path
+        .exists()
+        .then(|| Catalog::open_readonly(&path).ok())
+        .flatten();
+    let ids = old
+        .as_ref()
+        .and_then(|c| c.snapshots().ok())
+        .map_or_else(Vec::new, |rows| rows.into_iter().map(|r| r.id).collect());
+    let mut sizes = HashMap::new();
+    if let Some(cat) = &old {
+        add_pack_sizes(&cat.conn, &mut sizes);
     }
-    let Ok(cat) = Catalog::open_readonly(path) else {
-        return (Vec::new(), HashMap::new());
-    };
-    let ids = match cat.snapshots() {
-        Ok(rows) => rows.into_iter().map(|r| r.id).collect(),
-        Err(_) => Vec::new(),
-    };
-    let sizes = (|| -> Result<HashMap<Id, u64>> {
-        let mut stmt = cat.conn.prepare("SELECT id, size FROM pack")?;
+    for backup in backup_catalogs(repo) {
+        if let Ok(conn) = open_backup(&backup) {
+            add_pack_sizes(&conn, &mut sizes);
+        }
+    }
+    (ids, sizes)
+}
+
+/// Open a kept catalog read-only without creating files beside it: as
+/// immutable, unless it has a non-empty `-wal` of its own, whose rows count
+/// (an ordinary read-only open then adds a `-shm` beside them).
+fn open_backup(path: &Path) -> Result<Connection> {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let has_wal = std::fs::metadata(with_suffix(path, "-wal")).is_ok_and(|m| m.len() > 0);
+    if has_wal {
+        return Ok(Connection::open_with_flags(path, flags)?);
+    }
+    // Percent-encode what a URI path would misread.
+    let mut uri = String::from("file:");
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            c => uri.push(c),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Ok(Connection::open_with_flags(
+        uri,
+        flags | OpenFlags::SQLITE_OPEN_URI,
+    )?)
+}
+
+/// Raise each pack's entry in `sizes` to the size `conn`'s catalog records,
+/// if larger.
+fn add_pack_sizes(conn: &Connection, sizes: &mut HashMap<Id, u64>) {
+    let _ = (|| -> Result<()> {
+        let mut stmt = conn.prepare("SELECT id, size FROM pack")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?)))?;
-        let mut out = HashMap::new();
         for row in rows {
             let (id, size) = row?;
-            out.insert(id, u64::try_from(size).unwrap_or(0));
+            let size = u64::try_from(size).unwrap_or(0);
+            let e = sizes.entry(id).or_insert(0);
+            *e = (*e).max(size);
         }
-        Ok(out)
-    })()
-    .unwrap_or_default();
-    (ids, sizes)
+        Ok(())
+    })();
+}
+
+/// The kept `catalog.sqlite.pre-recover-*` catalogs in the repository root
+/// (their `-wal`, `-shm` and `-journal` sidecars excluded), best effort.
+fn backup_catalogs(repo: &Repo) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(&repo.root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("catalog.sqlite.pre-recover-")
+                && !SIDECARS.iter().any(|s| name.ends_with(s))
+                && e.file_type().is_ok_and(|t| t.is_file())
+        })
+        .map(|e| e.path())
+        .collect();
+    out.sort();
+    out
 }
 
 /// Fold the old catalog's WAL into it, best effort; never creates the file.
