@@ -425,9 +425,8 @@ impl PackReader {
     /// Offset of the first record marker in `[from, limit)`, reading in
     /// `SCAN_BLOCK` blocks that overlap by the marker length minus one so a
     /// marker straddling a block edge is still found.
-    fn find_marker(&self, from: u64, limit: u64) -> Result<Option<u64>> {
+    fn find_marker(&self, from: u64, limit: u64, buf: &mut [u8]) -> Result<Option<u64>> {
         let marker = RECORD_MARKER.to_le_bytes();
-        let mut buf = vec![0u8; SCAN_BLOCK];
         let mut at = from;
         while at + marker.len() as u64 <= limit {
             let want = buf.len().min((limit - at) as usize);
@@ -556,12 +555,18 @@ const SCAN_BLOCK: usize = 1 << 20;
 pub struct Salvage {
     /// From the file header; None if the header is unreadable (file skipped).
     pub id: Option<Id>,
-    /// (offset, header) of every record whose header validates, in offset order.
+    /// (offset, header) of every record whose header validates, in strictly
+    /// increasing offset order. Records may overlap: a header embedded in a
+    /// damaged record's payload can validate on its own. Recover reads and
+    /// hashes each record independently, so overlaps are harmless.
     pub records: Vec<(u64, RecordHeader)>,
     /// Consistent end-anchored footer whose BLAKE3 matches the bytes before it.
     pub sealed_blake3: Option<Hash32>,
-    /// End of the last valid record (the pack row's size when not sealed).
+    /// Greatest end offset of any valid record (the pack row's size when not sealed).
     pub valid_end: u64,
+    /// Unsealed packs only: offset where trailing bytes that never formed a
+    /// valid record begin (a normal crash leftover, not reported in `problems`).
+    pub torn_tail: Option<u64>,
     /// Human-readable problems: bad magic/format, id/name mismatch,
     /// damaged ranges, unsupported kinds, failing index entries, footer mismatch.
     pub problems: Vec<String>,
@@ -578,6 +583,7 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
         records: Vec::new(),
         sealed_blake3: None,
         valid_end: FILE_HEADER_LEN,
+        torn_tail: None,
         problems: Vec::new(),
     };
     let unreadable = |out: &mut Salvage, why: String| {
@@ -612,43 +618,88 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
     let footer = r.find_footer()?;
     let data_end = footer.map_or(r.len, |(off, _)| off);
 
+    let mut buf = vec![0u8; SCAN_BLOCK];
     let mut pos = FILE_HEADER_LEN;
-    // Start of the damaged range being skipped, if any.
-    let mut damage: Option<u64> = None;
-    let close_damage = |damage: &mut Option<u64>, end: u64, problems: &mut Vec<String>| {
-        if let Some(start) = damage.take() {
-            problems.push(format!(
-                "pack {shown}: damaged range at offset {start}..{end}"
-            ));
-        }
-    };
+    // The damaged range being skipped: (start, first reason).
+    let mut damage: Option<(u64, String)> = None;
+    // Set once a marker search has happened; `chain_last` is then the offset
+    // of the last record accepted since that search's hit.
+    let mut resynced = false;
+    let mut chain_last: Option<u64> = None;
+    let close_damage =
+        |damage: &mut Option<(u64, String)>, end: u64, problems: &mut Vec<String>| {
+            // A restart can accept a record behind the open range's start; that
+            // range is already covered, so it is dropped.
+            if let Some((start, why)) = damage.take().filter(|(start, _)| *start < end) {
+                problems.push(format!(
+                    "pack {shown}: damaged range at offset {start}..{end}: {why}"
+                ));
+            }
+        };
     while pos < data_end {
         match r.parse_record_classified(pos, data_end)? {
             Ok(h) => {
                 close_damage(&mut damage, pos, &mut out.problems);
                 out.records.push((pos, h));
+                if resynced {
+                    chain_last = Some(pos);
+                }
                 pos += RECORD_HEADER_LEN as u64 + h.stored_len;
-                out.valid_end = pos;
+                out.valid_end = out.valid_end.max(pos);
             }
             Err(HeaderError::Unsupported(why)) => {
                 close_damage(&mut damage, pos, &mut out.problems);
                 out.problems
                     .push(format!("pack {shown} at offset {pos}: {why}; skipped"));
                 pos = r
-                    .find_marker(pos + RECORD_HEADER_LEN as u64, data_end)?
+                    .find_marker(pos + RECORD_HEADER_LEN as u64, data_end, &mut buf)?
                     .unwrap_or(data_end);
+                resynced = true;
+                chain_last = None;
             }
-            Err(HeaderError::Invalid(_)) => {
-                damage.get_or_insert(pos);
-                pos = r.find_marker(pos + 1, data_end)?.unwrap_or(data_end);
+            Err(HeaderError::Invalid(why)) => {
+                damage.get_or_insert((pos, why));
+                // After a chain that began at a resync hit, the chain may have
+                // overshot a real record (an embedded header with a long
+                // payload), so search again from just past its last record.
+                let from = chain_last.unwrap_or(pos) + 1;
+                pos = r.find_marker(from, data_end, &mut buf)?.unwrap_or(data_end);
+                resynced = true;
+                chain_last = None;
             }
         }
+    }
+    if footer.is_none() {
+        // Trailing bytes with no valid record after them are a torn tail.
+        out.torn_tail = damage.take().map(|(start, _)| start);
     }
     close_damage(&mut damage, data_end, &mut out.problems);
 
     if let Some((footer_offset, count)) = footer {
         let mut index = vec![0u8; (r.len - footer_offset) as usize];
         r.read_exact_at(&mut index, footer_offset)?;
+        // As `scan` does, also try every indexed offset: resync may have
+        // stepped over a record that validates on its own.
+        let mut extra = Vec::new();
+        for i in 0..count as usize {
+            let off = u64_at(&index[8 + 40 * i..8 + 40 * (i + 1)], 32);
+            if off >= FILE_HEADER_LEN
+                && off < footer_offset
+                && out.records.binary_search_by_key(&off, |(o, _)| *o).is_err()
+            {
+                if let Ok(h) = r.parse_record_at(off, footer_offset)? {
+                    extra.push((off, h));
+                    out.valid_end = out
+                        .valid_end
+                        .max(off + RECORD_HEADER_LEN as u64 + h.stored_len);
+                }
+            }
+        }
+        if !extra.is_empty() {
+            out.records.extend(extra);
+            out.records.sort_unstable_by_key(|(off, _)| *off);
+            out.records.dedup_by_key(|(off, _)| *off);
+        }
         for i in 0..count as usize {
             let e = &index[8 + 40 * i..8 + 40 * (i + 1)];
             let off = u64_at(e, 32);
@@ -832,6 +883,8 @@ mod salvage_tests {
         let s = salvage(&path).unwrap();
         assert_eq!(found(&s), vec![offs[0], offs[1], offs[3], offs[4]]);
         assert_eq!(s.problems.len(), 1, "{:?}", s.problems);
+        assert!(s.problems[0].contains("CRC"), "{:?}", s.problems);
+        assert_eq!(s.torn_tail, None);
         assert_eq!(s.sealed_blake3, None);
     }
 
@@ -883,6 +936,43 @@ mod salvage_tests {
         let s = salvage(&path).unwrap();
         assert_eq!(found(&s).len(), offs.len());
         assert_eq!(s.valid_end, end);
+        assert_eq!(s.torn_tail, Some(end));
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+    }
+
+    #[test]
+    fn salvage_resync_does_not_shadow_a_real_record() {
+        // A damaged record embeds a valid header whose payload reaches past the
+        // next real record's header; the real record must still be found.
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Id::new_v7();
+        let mut w = PackWriter::create(tmp.path(), id).unwrap();
+        let (h, p) = raw(b"a");
+        let oa = w.append(&h, &p).unwrap();
+        let damaged_at = w.len();
+        let inner_in_d = 40u64; // bytes of the embedded record's payload inside D
+        let stored = inner_in_d + RECORD_HEADER_LEN as u64 + 2;
+        let embedded = RecordHeader {
+            kind: UnitKind::RawChunk,
+            compression: Compression::None,
+            unit_hash: Hash32::of(b"embedded"),
+            raw_len: stored,
+            stored_len: stored,
+        };
+        let mut payload = vec![0u8; 10];
+        payload.extend_from_slice(&encode_record_header(&embedded));
+        payload.extend_from_slice(&[0u8; 40]);
+        let (hd, pd) = raw(&payload);
+        w.append(&hd, &pd).unwrap();
+        let (hr, pr) = raw(&[7u8; 100]);
+        let or = w.append(&hr, &pr).unwrap();
+        w.sync().unwrap();
+        let path = pack_path(tmp.path(), id);
+        corrupt_crc(&path, damaged_at);
+        let s = salvage(&path).unwrap();
+        let offs = found(&s);
+        assert!(offs.contains(&oa) && offs.contains(&or), "{offs:?}");
+        assert_eq!(s.torn_tail, None);
     }
 
     #[test]
