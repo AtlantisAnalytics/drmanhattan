@@ -87,9 +87,11 @@ Exit codes: 0 success, 1 error, 2 verification failure or differences found,
 
 ## v1 limits
 
-- **Memory:** v1 buffers each file in memory during ingest; very large files
-  (multi-GB) need correspondingly large RAM. Streaming large files comes
-  later (Plan 3).
+- **Memory:** ingest still reads each file whole into memory, but the total
+  held at once is capped (`--max-memory`, default a quarter of RAM). A
+  single file larger than the cap is read on its own while other workers
+  wait, so it still needs that much RAM. Streaming large files comes later
+  (Plan 3).
 - **No `recover` yet:** rebuilding the catalog from the packs alone is
   Plan 2. The packs and snapshot records already carry everything it needs.
 - **No screening yet:** hash-list screening, provenance capture and `purge`

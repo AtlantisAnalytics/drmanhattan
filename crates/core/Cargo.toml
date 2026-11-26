@@ -1,6 +1,6 @@
 [package]
 name = "drmanhattan-core"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.87"
 description = "Core library of watchmaker (wmk): deduplicated chunk packs, a SQLite catalog, and byte-exact restore"
