@@ -155,17 +155,22 @@ pub fn build(repo: &Repo, dest: &Path, opts: &RecoverOptions) -> Result<RecoverR
 /// until the final rename, any error removes it and leaves `catalog.sqlite`
 /// (with its `-wal` / `-shm`) and `wmk.toml` as they were. The old catalog is
 /// never deleted: it is hard-linked to `catalog.sqlite.pre-recover-<stamp>`.
+/// Once the rename has happened, later problems are warnings in the report.
 pub fn run(repo: &Repo, opts: &RecoverOptions) -> Result<RecoverReport> {
     let _lock = repo.lock_writer()?;
     repo.sweep_tmp()?;
-    let old_ids = old_snapshot_ids(&repo.catalog_path());
-    checkpoint_old(&repo.catalog_path());
-
     let tmp_dir = repo.tmp_dir();
+    sweep_stale_catalogs(&tmp_dir)?;
+    let old_ids = old_snapshot_ids(&repo.catalog_path());
+
     std::fs::create_dir_all(&tmp_dir).map_err(|e| Error::io(&tmp_dir, e))?;
     let tmp = tmp_dir.join(format!("recover-{}.sqlite", uuid::Uuid::now_v7()));
-    let built = build(repo, &tmp, opts).and_then(|report| Ok((swap_in(repo, &tmp)?, report)));
-    let (old_catalog, mut report) = match built {
+    let built = build(repo, &tmp, opts).and_then(|report| {
+        // Only now: a failed build must not have touched the old catalog.
+        checkpoint_old(&repo.catalog_path());
+        Ok((swap_in(repo, &tmp)?, report))
+    });
+    let ((old_catalog, warning), mut report) = match built {
         Ok(v) => v,
         Err(e) => {
             remove_sqlite_files(&tmp);
@@ -173,6 +178,7 @@ pub fn run(repo: &Repo, opts: &RecoverOptions) -> Result<RecoverReport> {
         }
     };
     report.old_catalog = old_catalog;
+    report.warnings.extend(warning);
     report.not_recovered = old_ids
         .into_iter()
         .filter(|id| !report.snapshots.contains(id))
@@ -180,8 +186,35 @@ pub fn run(repo: &Repo, opts: &RecoverOptions) -> Result<RecoverReport> {
 
     let mut config = repo.config.clone();
     config.format_version = 2;
-    config.save(&repo.root.join("wmk.toml"))?;
+    if let Err(e) = config.save(&repo.root.join("wmk.toml")) {
+        report.warnings.push(format!(
+            "new catalog is in place; could not set wmk.toml format_version to 2: {e}; \
+             run `wmk recover` again"
+        ));
+    }
     Ok(report)
+}
+
+/// Delete `recover-*.sqlite` (and sidecars) left in `tmp/` by a crashed run.
+fn sweep_stale_catalogs(dir: &Path) -> Result<()> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::io(dir, e)),
+    };
+    for entry in rd {
+        let entry = entry.map_err(|e| Error::io(dir, e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let stale = name.starts_with("recover-")
+            && ["", "-wal", "-shm", "-journal"]
+                .iter()
+                .any(|s| name.ends_with(&format!(".sqlite{s}")));
+        if stale {
+            let p = entry.path();
+            std::fs::remove_file(&p).map_err(|e| Error::io(&p, e))?;
+        }
+    }
+    Ok(())
 }
 
 /// Snapshot ids in the old catalog, or none when it cannot be read.
@@ -219,60 +252,118 @@ fn remove_sqlite_files(p: &Path) {
     }
 }
 
-/// Preserve the old catalog (if any) and rename `tmp` over `catalog.sqlite`.
-/// Returns the backup path. On error the old catalog is back in place.
-fn swap_in(repo: &Repo, tmp: &Path) -> Result<Option<PathBuf>> {
+/// Sidecar files SQLite keeps beside a database.
+const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// Preserve whatever is left of the old catalog and rename `tmp` over
+/// `catalog.sqlite`. Returns the backup path (`None` when there was no
+/// `catalog.sqlite`) and a warning if the directory fsync failed.
+///
+/// Every old sidecar is moved aside, even with no main file: a stale `-wal`
+/// beside the new catalog would be replayed into it. On error before the
+/// rename, everything is put back.
+fn swap_in(repo: &Repo, tmp: &Path) -> Result<(Option<PathBuf>, Option<String>)> {
     let cat = repo.catalog_path();
-    let backup = match std::fs::symlink_metadata(&cat) {
-        Ok(_) => Some(backup_link(&cat)?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+    let has_main = match std::fs::symlink_metadata(&cat) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => return Err(Error::io(&cat, e)),
     };
+    let sidecars: Vec<&str> = SIDECARS
+        .into_iter()
+        .filter(|s| std::fs::symlink_metadata(with_suffix(&cat, s)).is_ok())
+        .collect();
+    let base = if has_main || !sidecars.is_empty() {
+        Some(reserve_backup(&cat, &utc_stamp(), has_main)?)
+    } else {
+        None
+    };
+
     let mut moved: Vec<&str> = Vec::new();
     let swapped = (|| -> Result<()> {
-        if let Some(b) = &backup {
-            for suffix in ["-wal", "-shm"] {
+        if let Some(b) = &base {
+            for suffix in &sidecars {
                 let from = with_suffix(&cat, suffix);
-                if from.exists() {
-                    let to = with_suffix(b, suffix);
-                    std::fs::rename(&from, &to).map_err(|e| Error::io(&from, e))?;
-                    moved.push(suffix);
-                }
+                std::fs::rename(&from, with_suffix(b, suffix)).map_err(|e| Error::io(&from, e))?;
+                moved.push(suffix);
             }
         }
-        std::fs::rename(tmp, &cat).map_err(|e| Error::io(&cat, e))?;
-        crate::pack::fsync_dir(&repo.root)
+        fail::fail_point!("recover::before_rename", |_| Err(Error::io(
+            &cat,
+            std::io::Error::other("failpoint recover::before_rename")
+        )));
+        std::fs::rename(tmp, &cat).map_err(|e| Error::io(&cat, e))
     })();
-    match swapped {
-        Ok(()) => Ok(backup),
-        Err(e) => {
-            // Undo only while the new catalog has not replaced the old one.
-            if let Some(b) = &backup {
-                if std::fs::symlink_metadata(tmp).is_ok() {
-                    for suffix in moved {
-                        let _ = std::fs::rename(with_suffix(b, suffix), with_suffix(&cat, suffix));
-                    }
-                    let _ = std::fs::remove_file(b);
+    if let Err(e) = swapped {
+        let mut stuck = Vec::new();
+        if let Some(b) = &base {
+            for suffix in moved {
+                if let Err(u) = std::fs::rename(with_suffix(b, suffix), with_suffix(&cat, suffix)) {
+                    stuck.push(format!("{}: {u}", with_suffix(b, suffix).display()));
                 }
             }
-            Err(e)
+            // Keep the link if anything could not be put back.
+            if has_main && stuck.is_empty() {
+                let _ = std::fs::remove_file(b);
+            }
         }
+        return Err(if stuck.is_empty() {
+            e
+        } else {
+            Error::Corrupt(format!(
+                "{e}; additionally could not move back: {}",
+                stuck.join("; ")
+            ))
+        });
     }
+    let warning = (|| -> Result<()> {
+        fail::fail_point!("recover::after_rename", |_| Err(Error::io(
+            &repo.root,
+            std::io::Error::other("failpoint recover::after_rename")
+        )));
+        crate::pack::fsync_dir(&repo.root)
+    })()
+    .err()
+    .map(|e| {
+        format!("new catalog is in place but the repository directory could not be synced: {e}")
+    });
+    let backup = base.filter(|_| has_main);
+    Ok((backup, warning))
 }
 
-/// Hard-link `cat` to the first free `<cat>.pre-recover-<stamp>[-n]`.
-fn backup_link(cat: &Path) -> Result<PathBuf> {
-    let base = with_suffix(cat, &format!(".pre-recover-{}", utc_stamp()));
+/// Pick the first `<cat>.pre-recover-<stamp>[-n]` whose name and sidecar
+/// names are all free and, when `link_main`, hard-link `cat` to it.
+fn reserve_backup(cat: &Path, stamp: &str, link_main: bool) -> Result<PathBuf> {
+    let base = with_suffix(cat, &format!(".pre-recover-{stamp}"));
     for n in 1u32.. {
         let target = if n == 1 {
             base.clone()
         } else {
             with_suffix(&base, &format!("-{n}"))
         };
+        let taken = std::iter::once("")
+            .chain(SIDECARS)
+            .any(|s| std::fs::symlink_metadata(with_suffix(&target, s)).is_ok());
+        if taken {
+            continue;
+        }
+        if !link_main {
+            return Ok(target);
+        }
         match std::fs::hard_link(cat, &target) {
             Ok(()) => return Ok(target),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(Error::io(&target, e)),
+            Err(e) => {
+                return Err(Error::io(
+                    &target,
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "cannot preserve the old catalog: filesystem refused a hard link: {e}"
+                        ),
+                    ),
+                ))
+            }
         }
     }
     unreachable!("the suffix counter does not run out")
@@ -603,4 +694,36 @@ fn column_strings(conn: &Connection, sql: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_stamp_gets_distinct_backups_and_skips_taken_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = dir.path().join("catalog.sqlite");
+        std::fs::write(&cat, b"db").unwrap();
+        let stamp = "20260101T000000Z";
+        let a = reserve_backup(&cat, stamp, true).unwrap();
+        let b = reserve_backup(&cat, stamp, true).unwrap();
+        assert_ne!(a, b);
+        assert!(b.to_string_lossy().ends_with("Z-2"));
+        // A base whose sidecar name exists is taken too.
+        std::fs::write(with_suffix(&with_suffix(&a, "-3"), "-wal"), b"w").unwrap();
+        let c = reserve_backup(&cat, stamp, true).unwrap();
+        assert!(c.to_string_lossy().ends_with("Z-4"), "{c:?}");
+        // Without a main file the base is only reserved by name.
+        let d = reserve_backup(&cat, stamp, false).unwrap();
+        assert!(d.to_string_lossy().ends_with("Z-5"), "{d:?}");
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn utc_stamp_has_the_documented_shape() {
+        let s = utc_stamp();
+        assert_eq!(s.len(), 16);
+        assert!(s.ends_with('Z') && s.as_bytes()[8] == b'T');
+    }
 }

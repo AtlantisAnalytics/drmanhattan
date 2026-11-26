@@ -5,6 +5,7 @@ mod common;
 use common::TreeBuilder;
 use drmanhattan_core::catalog::Catalog;
 use drmanhattan_core::compress::Compression;
+use drmanhattan_core::config::Config;
 use drmanhattan_core::error::Error;
 use drmanhattan_core::ids::{Hash32, Id};
 use drmanhattan_core::ingest::record::record_chunks;
@@ -999,4 +1000,90 @@ fn damage_then_reingest_then_recover_clears_damage() {
     assert_eq!(second.snapshots, vec![s, again]);
     assert_eq!(status(&repo.catalog_path(), s), "complete");
     assert_eq!(status(&repo.catalog_path(), again), "complete");
+}
+
+/// A non-empty WAL for a catalog: copied while a connection holds
+/// uncheckpointed writes. Returns its bytes.
+fn live_wal_bytes(repo: &Repo) -> Vec<u8> {
+    let conn = rusqlite::Connection::open(repo.catalog_path()).unwrap();
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    conn.execute(
+        "INSERT INTO snapshot(id, status, source_root, host, tool_version, started_at) \
+         VALUES (?1, 'in_progress', x'2f', 'h', 't', 1)",
+        [Id::new_v7().as_bytes().to_vec()],
+    )
+    .unwrap();
+    let mut wal = repo.catalog_path().into_os_string();
+    wal.push("-wal");
+    let bytes = fs::read(&wal).unwrap();
+    assert!(!bytes.is_empty());
+    bytes
+}
+
+#[test]
+fn stale_wal_without_main_file_is_kept_aside_not_replayed() {
+    let (_tmp, repo, src) = setup();
+    two_snapshots(&repo, &src);
+    let wal = live_wal_bytes(&repo);
+    remove_catalog(&repo);
+    let mut wal_path = repo.catalog_path().into_os_string();
+    wal_path.push("-wal");
+    fs::write(&wal_path, &wal).unwrap();
+
+    let report = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    assert!(report.intact(), "{report:#?}");
+    assert_eq!(report.old_catalog, None);
+    assert_eq!(report.snapshots.len(), 2);
+    let conn = rusqlite::Connection::open(repo.catalog_path()).unwrap();
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+    let kept: Vec<_> = fs::read_dir(&repo.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("catalog.sqlite.pre-recover-") && n.ends_with("-wal"))
+        .collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(fs::read(repo.root.join(&kept[0])).unwrap(), wal);
+}
+
+#[test]
+fn recover_upgrades_a_version_1_repository() {
+    let (_tmp, repo, src) = setup();
+    two_snapshots(&repo, &src);
+    rusqlite::Connection::open(repo.catalog_path())
+        .unwrap()
+        .pragma_update(None, "user_version", 1)
+        .unwrap();
+    let cfg = Config {
+        format_version: 1,
+        ..Config::default()
+    };
+    cfg.save(&repo.root.join("wmk.toml")).unwrap();
+    let repo = Repo::open(&repo.root).unwrap();
+    assert_eq!(repo.config.format_version, 1);
+
+    let report = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    assert!(report.intact(), "{report:#?}");
+    assert_eq!(user_version(&repo.catalog_path()), 2);
+    assert_eq!(
+        Config::load(&repo.root.join("wmk.toml"))
+            .unwrap()
+            .format_version,
+        2
+    );
+    assert_eq!(user_version(backups(&repo)[0].as_path()), 1);
+}
+
+#[test]
+fn stale_recover_temp_files_are_swept() {
+    let (_tmp, repo, src) = setup();
+    two_snapshots(&repo, &src);
+    fs::create_dir_all(repo.tmp_dir()).unwrap();
+    for n in ["recover-old.sqlite", "recover-old.sqlite-wal"] {
+        fs::write(repo.tmp_dir().join(n), b"junk").unwrap();
+    }
+    recover::run(&repo, &RecoverOptions::default()).unwrap();
+    no_tmp_leftovers(&repo);
 }
