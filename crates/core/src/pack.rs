@@ -422,24 +422,32 @@ impl PackReader {
         Ok(Ok(h))
     }
 
-    /// Offset of the first record marker in `[from, limit)`, reading in
-    /// `SCAN_BLOCK` blocks that overlap by the marker length minus one so a
-    /// marker straddling a block edge is still found.
-    fn find_marker(&self, from: u64, limit: u64, buf: &mut [u8]) -> Result<Option<u64>> {
+    /// Call `f` with the offset of every record marker in `[from, limit)`, in
+    /// order. Reads `buf.len()`-byte blocks that overlap by the marker length
+    /// minus one, so a marker straddling a block edge is found exactly once.
+    fn for_each_marker(
+        &self,
+        from: u64,
+        limit: u64,
+        buf: &mut [u8],
+        mut f: impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         let marker = RECORD_MARKER.to_le_bytes();
         let mut at = from;
         while at + marker.len() as u64 <= limit {
             let want = buf.len().min((limit - at) as usize);
             self.read_exact_at(&mut buf[..want], at)?;
-            if let Some(i) = buf[..want].windows(marker.len()).position(|w| w == marker) {
-                return Ok(Some(at + i as u64));
+            for (i, w) in buf[..want].windows(marker.len()).enumerate() {
+                if w == marker {
+                    f(at + i as u64)?;
+                }
             }
             if at + want as u64 >= limit {
                 break;
             }
             at += (want - (marker.len() - 1)) as u64;
         }
-        Ok(None)
+        Ok(())
     }
 
     /// Read and validate the record header at `offset`, without reading its
@@ -555,26 +563,29 @@ const SCAN_BLOCK: usize = 1 << 20;
 pub struct Salvage {
     /// From the file header; None if the header is unreadable (file skipped).
     pub id: Option<Id>,
-    /// (offset, header) of every record whose header validates, in strictly
-    /// increasing offset order. Records may overlap: a header embedded in a
-    /// damaged record's payload can validate on its own. Recover reads and
-    /// hashes each record independently, so overlaps are harmless.
+    /// (offset, header) of every candidate record: each offset whose header
+    /// validates, in strictly increasing offset order. Candidates may overlap
+    /// and may include false positives (a header embedded in some payload), so
+    /// the caller must verify each payload against its hash. Only verified
+    /// records establish what is intact; see `coverage_gaps`.
     pub records: Vec<(u64, RecordHeader)>,
     /// Consistent end-anchored footer whose BLAKE3 matches the bytes before it.
     pub sealed_blake3: Option<Hash32>,
-    /// Greatest end offset of any valid record (the pack row's size when not sealed).
+    /// End of the data region: the footer offset when a consistent footer
+    /// exists, else the file length.
+    pub data_end: u64,
+    /// Greatest end offset of any candidate (26 if none).
     pub valid_end: u64,
-    /// Unsealed packs only: offset where trailing bytes that never formed a
-    /// valid record begin (a normal crash leftover, not reported in `problems`).
-    pub torn_tail: Option<u64>,
-    /// Human-readable problems: bad magic/format, id/name mismatch,
-    /// damaged ranges, unsupported kinds, failing index entries, footer mismatch.
+    /// Structural problems only: unreadable header, id/name mismatch,
+    /// unsupported kinds, index entries without a valid record, an
+    /// inconsistent footer, a footer hash mismatch. Damage is not judged here.
     pub problems: Vec<String>,
 }
 
-/// Find every record in a pack that still validates, resynchronising on the
-/// record marker after damage. Headers (marker, CRC, size invariants, payload
-/// fits) are validated, payloads are not read. Errs only on I/O errors.
+/// Find every candidate record in a pack: parse sequentially while records
+/// validate, then test every record marker in the rest of the data region.
+/// Headers (marker, CRC, size invariants, payload fits) are validated, payloads
+/// are not read. Errs only on I/O errors.
 pub fn salvage(path: &Path) -> Result<Salvage> {
     let shown = display_path(path);
     let r = PackReader::open(path)?;
@@ -582,8 +593,8 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
         id: None,
         records: Vec::new(),
         sealed_blake3: None,
+        data_end: FILE_HEADER_LEN,
         valid_end: FILE_HEADER_LEN,
-        torn_tail: None,
         problems: Vec::new(),
     };
     let unreadable = |out: &mut Salvage, why: String| {
@@ -617,76 +628,52 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
 
     let footer = r.find_footer()?;
     let data_end = footer.map_or(r.len, |(off, _)| off);
+    out.data_end = data_end;
 
-    let mut buf = vec![0u8; SCAN_BLOCK];
-    let mut pos = FILE_HEADER_LEN;
-    // The damaged range being skipped: (start, first reason).
-    let mut damage: Option<(u64, String)> = None;
-    // Set once a marker search has happened; `chain_last` is then the offset
-    // of the last record accepted since that search's hit.
-    let mut resynced = false;
-    let mut chain_last: Option<u64> = None;
     // Offsets of records with a valid CRC but an unsupported kind (already reported).
     let mut unsupported: Vec<u64> = Vec::new();
-    // `covered_to` is the greatest end of any accepted record. A range that
-    // starts inside an accepted record (a chain overshoot, then a restart
-    // behind it) is not damage; any other opened range is always reported.
-    let close_damage = |damage: &mut Option<(u64, String)>,
-                        end: u64,
-                        covered_to: u64,
-                        problems: &mut Vec<String>| {
-        if let Some((start, why)) = damage.take() {
-            if start < end {
-                problems.push(format!(
-                    "pack {shown}: damaged range at offset {start}..{end}: {why}"
-                ));
-            } else if start >= covered_to {
-                problems.push(format!(
-                    "pack {shown}: damaged record at offset {start}: {why}"
-                ));
-            }
-        }
-    };
+    let mut pos = FILE_HEADER_LEN;
     while pos < data_end {
         match r.parse_record_classified(pos, data_end)? {
             Ok(h) => {
                 out.records.push((pos, h));
-                if resynced {
-                    chain_last = Some(pos);
+                pos += RECORD_HEADER_LEN as u64 + h.stored_len;
+                out.valid_end = out.valid_end.max(pos);
+            }
+            Err(e) => {
+                if let HeaderError::Unsupported(why) = e {
+                    out.problems
+                        .push(format!("pack {shown} at offset {pos}: {why}; skipped"));
+                    unsupported.push(pos);
                 }
-                let end = pos + RECORD_HEADER_LEN as u64 + h.stored_len;
-                out.valid_end = out.valid_end.max(end);
-                close_damage(&mut damage, pos, out.valid_end, &mut out.problems);
-                pos = end;
-            }
-            Err(HeaderError::Unsupported(why)) => {
-                close_damage(&mut damage, pos, out.valid_end, &mut out.problems);
-                out.problems
-                    .push(format!("pack {shown} at offset {pos}: {why}; skipped"));
-                unsupported.push(pos);
-                pos = r
-                    .find_marker(pos + RECORD_HEADER_LEN as u64, data_end, &mut buf)?
-                    .unwrap_or(data_end);
-                resynced = true;
-                chain_last = None;
-            }
-            Err(HeaderError::Invalid(why)) => {
-                damage.get_or_insert((pos, why));
-                // After a chain that began at a resync hit, the chain may have
-                // overshot a real record (an embedded header with a long
-                // payload), so search again from just past its last record.
-                let from = chain_last.unwrap_or(pos) + 1;
-                pos = r.find_marker(from, data_end, &mut buf)?.unwrap_or(data_end);
-                resynced = true;
-                chain_last = None;
+                break;
             }
         }
     }
-    if footer.is_none() {
-        // Trailing bytes with no valid record after them are a torn tail.
-        out.torn_tail = damage.take().map(|(start, _)| start);
+    if pos < data_end {
+        // The sequential parse stopped early. From here, test every marker
+        // and keep every header that validates, without skipping over spans:
+        // a header embedded in a damaged or valid payload must not hide a
+        // genuine record behind it.
+        let mut buf = vec![0u8; SCAN_BLOCK];
+        r.for_each_marker(pos + 1, data_end, &mut buf, |off| {
+            match r.parse_record_classified(off, data_end)? {
+                Ok(h) => {
+                    out.records.push((off, h));
+                    out.valid_end = out
+                        .valid_end
+                        .max(off + RECORD_HEADER_LEN as u64 + h.stored_len);
+                }
+                Err(HeaderError::Unsupported(why)) => {
+                    out.problems
+                        .push(format!("pack {shown} at offset {off}: {why}; skipped"));
+                    unsupported.push(off);
+                }
+                Err(HeaderError::Invalid(_)) => {}
+            }
+            Ok(())
+        })?;
     }
-    close_damage(&mut damage, data_end, out.valid_end, &mut out.problems);
     if footer.is_none() && r.len >= FILE_HEADER_LEN + 8 {
         let mut tail = [0u8; 8];
         r.read_exact_at(&mut tail, r.len - 8)?;
@@ -700,8 +687,8 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
     if let Some((footer_offset, count)) = footer {
         let mut index = vec![0u8; (r.len - footer_offset) as usize];
         r.read_exact_at(&mut index, footer_offset)?;
-        // As `scan` does, also try every indexed offset: resync may have
-        // stepped over a record that validates on its own.
+        // As `scan` does, also try every indexed offset. The marker scan
+        // already tests these, so this is cheap insurance.
         let mut extra = Vec::new();
         for i in 0..count as usize {
             let off = u64_at(&index[8 + 40 * i..8 + 40 * (i + 1)], 32);
@@ -755,6 +742,57 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
         }
     }
     Ok(out)
+}
+
+/// Byte ranges of a pack's data region not covered by verified records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gaps {
+    /// Uncovered `[start, end)` ranges: damage.
+    pub damaged: Vec<(u64, u64)>,
+    /// Unsealed packs only: where a final uncovered range reaching the end of
+    /// the data begins. That is a crash leftover, not damage.
+    pub torn_tail: Option<u64>,
+}
+
+/// Compute the uncovered ranges of `[data_start, data_end)`. `verified` holds
+/// `(offset, total record length including the header)` of records whose
+/// header CRC and payload hash were both checked, so a verified span never
+/// contains damaged bytes and every gap in their union is exact. Spans may
+/// overlap and need not be sorted. On an unsealed pack a final gap reaching
+/// `data_end` is a `torn_tail`; on a sealed pack every gap is damage.
+pub fn coverage_gaps(
+    verified: &[(u64, u64)],
+    data_start: u64,
+    data_end: u64,
+    sealed: bool,
+) -> Gaps {
+    let mut spans: Vec<(u64, u64)> = verified
+        .iter()
+        .map(|&(off, len)| (off, off.saturating_add(len)))
+        .collect();
+    spans.sort_unstable();
+    let mut gaps = Gaps {
+        damaged: Vec::new(),
+        torn_tail: None,
+    };
+    let mut cursor = data_start;
+    for (start, end) in spans {
+        if cursor >= data_end {
+            break;
+        }
+        if start > cursor {
+            gaps.damaged.push((cursor, start.min(data_end)));
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < data_end {
+        if sealed {
+            gaps.damaged.push((cursor, data_end));
+        } else {
+            gaps.torn_tail = Some(cursor);
+        }
+    }
+    gaps
 }
 
 /// Scan a pack. A pack ending in a consistent end-anchored footer is sealed:
@@ -912,9 +950,8 @@ mod salvage_tests {
         corrupt_crc(&path, offs[2]);
         let s = salvage(&path).unwrap();
         assert_eq!(found(&s), vec![offs[0], offs[1], offs[3], offs[4]]);
-        assert_eq!(s.problems.len(), 1, "{:?}", s.problems);
-        assert!(s.problems[0].contains("CRC"), "{:?}", s.problems);
-        assert_eq!(s.torn_tail, None);
+        // Damage is judged from verified payloads (`coverage_gaps`), not here.
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
         assert_eq!(s.sealed_blake3, None);
     }
 
@@ -983,10 +1020,10 @@ mod salvage_tests {
     }
 
     #[test]
-    fn salvage_footer_index_rescues_record_skipped_by_resync() {
+    fn salvage_sealed_finds_record_stepped_over_by_embedded_header() {
         // The damaged record embeds a valid header whose payload ends exactly at
-        // the record after the next real one, so the resync chain steps over the
-        // real record R1 without ever failing; only the footer index finds it.
+        // the record after the next real one R1; a chain that skipped spans would
+        // step over R1. Every marker is tested, so R1 is still found.
         let tmp = tempfile::tempdir().unwrap();
         let id = Id::new_v7();
         let mut w = PackWriter::create(tmp.path(), id).unwrap();
@@ -1021,7 +1058,7 @@ mod salvage_tests {
     }
 
     #[test]
-    fn salvage_inconsistent_footer_is_a_problem_not_a_torn_tail() {
+    fn salvage_inconsistent_footer_is_a_problem() {
         let tmp = tempfile::tempdir().unwrap();
         let (path, _, offs) = build(tmp.path(), true);
         let mut b = std::fs::read(&path).unwrap();
@@ -1048,8 +1085,16 @@ mod salvage_tests {
         let s = salvage(&path).unwrap();
         assert_eq!(found(&s).len(), offs.len());
         assert_eq!(s.valid_end, end);
-        assert_eq!(s.torn_tail, Some(end));
+        assert_eq!(s.data_end, end + 30);
         assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let gaps = coverage_gaps(&verified(&path, &s), FILE_HEADER_LEN, s.data_end, false);
+        assert_eq!(
+            gaps,
+            Gaps {
+                damaged: vec![],
+                torn_tail: Some(end)
+            }
+        );
     }
 
     #[test]
@@ -1084,7 +1129,136 @@ mod salvage_tests {
         let s = salvage(&path).unwrap();
         let offs = found(&s);
         assert!(offs.contains(&oa) && offs.contains(&or), "{offs:?}");
-        assert_eq!(s.torn_tail, None);
+    }
+
+    struct Layout {
+        path: PathBuf,
+        x: u64,
+        p: u64,
+        d: u64,
+        r: u64,
+        r2_end: u64,
+    }
+
+    /// Unsealed pack: A, X (CRC-corrupt), P (intact; its payload embeds a valid
+    /// header E whose span runs past D into R), D (CRC-corrupt), R, R2.
+    fn overshoot_layout(dir: &Path) -> Layout {
+        let id = Id::new_v7();
+        let mut w = PackWriter::create(dir, id).unwrap();
+        let (h, p) = raw(b"a");
+        w.append(&h, &p).unwrap();
+        let (hx, px) = raw(&[3u8; 40]);
+        let x = w.append(&hx, &px).unwrap();
+        let (m, d_payload) = (30u64, 64u64);
+        let d_total = RECORD_HEADER_LEN as u64 + d_payload;
+        let stored = m + d_total + RECORD_HEADER_LEN as u64 + 20;
+        let embedded = RecordHeader {
+            kind: UnitKind::RawChunk,
+            compression: Compression::None,
+            unit_hash: Hash32::of(b"embedded"),
+            raw_len: stored,
+            stored_len: stored,
+        };
+        let mut payload = vec![0u8; 10];
+        payload.extend_from_slice(&encode_record_header(&embedded));
+        payload.extend_from_slice(&vec![0u8; m as usize]);
+        let (hp, pp) = raw(&payload);
+        let p_off = w.append(&hp, &pp).unwrap();
+        let (hd, pd) = raw(&vec![5u8; d_payload as usize]);
+        let d = w.append(&hd, &pd).unwrap();
+        let (hr, pr) = raw(&[7u8; 100]);
+        let r = w.append(&hr, &pr).unwrap();
+        let (h2, p2) = raw(&[8u8; 50]);
+        let r2 = w.append(&h2, &p2).unwrap();
+        w.sync().unwrap();
+        let path = pack_path(dir, id);
+        corrupt_crc(&path, x);
+        corrupt_crc(&path, d);
+        Layout {
+            path,
+            x,
+            p: p_off,
+            d,
+            r,
+            r2_end: r2 + RECORD_HEADER_LEN as u64 + 50,
+        }
+    }
+
+    /// (offset, total length) of every candidate whose payload really verifies.
+    fn verified(path: &Path, s: &Salvage) -> Vec<(u64, u64)> {
+        let rd = PackReader::open(path).unwrap();
+        s.records
+            .iter()
+            .filter(|(off, h)| rd.read_unit(*off, &h.unit_hash).is_ok())
+            .map(|(off, h)| (*off, RECORD_HEADER_LEN as u64 + h.stored_len))
+            .collect()
+    }
+
+    #[test]
+    fn salvage_finds_real_records_behind_overshooting_embedded_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = overshoot_layout(tmp.path());
+        let s = salvage(&l.path).unwrap();
+        let offs = found(&s);
+        assert!(offs.contains(&l.r), "{offs:?}");
+        assert!(offs.contains(&(l.r2_end - RECORD_HEADER_LEN as u64 - 50)));
+        assert!(offs.windows(2).all(|w| w[0] < w[1]));
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+    }
+
+    #[test]
+    fn coverage_gaps_end_to_end_reports_exactly_the_damage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = overshoot_layout(tmp.path());
+        let s = salvage(&l.path).unwrap();
+        let gaps = coverage_gaps(&verified(&l.path, &s), FILE_HEADER_LEN, s.data_end, false);
+        assert_eq!(gaps.damaged, vec![(l.x, l.p), (l.d, l.r)]);
+        assert_eq!(gaps.torn_tail, None);
+        assert!(gaps.damaged.iter().all(|&(_, e)| e <= l.r));
+        assert_eq!(s.data_end, l.r2_end);
+    }
+
+    #[test]
+    fn coverage_gaps_cases() {
+        let g = |v: &[(u64, u64)], sealed| coverage_gaps(v, 26, 200, sealed);
+        let none = Gaps {
+            damaged: vec![],
+            torn_tail: None,
+        };
+        // No gaps, with overlapping and unsorted spans.
+        assert_eq!(g(&[(100, 100), (26, 80), (60, 60)], true), none);
+        assert_eq!(g(&[(26, 174)], false), none);
+        // Mid-file gap on an unsealed pack is damage.
+        assert_eq!(
+            g(&[(26, 34), (100, 100)], false),
+            Gaps {
+                damaged: vec![(60, 100)],
+                torn_tail: None
+            }
+        );
+        // Final gap: torn tail when unsealed, damage when sealed.
+        assert_eq!(
+            g(&[(26, 74)], false),
+            Gaps {
+                damaged: vec![],
+                torn_tail: Some(100)
+            }
+        );
+        assert_eq!(
+            g(&[(26, 74)], true),
+            Gaps {
+                damaged: vec![(100, 200)],
+                torn_tail: None
+            }
+        );
+        // Nothing verified: the whole region is a gap.
+        assert_eq!(
+            g(&[], true),
+            Gaps {
+                damaged: vec![(26, 200)],
+                torn_tail: None
+            }
+        );
     }
 
     #[test]
