@@ -492,3 +492,37 @@ fn verify_detects_unit_kind_disagreeing_with_record_header() {
         );
     }
 }
+
+#[test]
+fn verify_reports_incomplete_content() {
+    let (_tmp, repo, snap) = setup();
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    let content = cat
+        .entry_by_path(snap, b"sub/keep.bin")
+        .unwrap()
+        .content_hash
+        .unwrap();
+    let units = cat.content_units(&content).unwrap();
+    let last = units.last().unwrap().hash;
+    drop(cat);
+    let conn = rusqlite::Connection::open(repo.catalog_path()).unwrap();
+    conn.execute(
+        "DELETE FROM content_unit WHERE content_hash = ?1 AND unit_hash = ?2",
+        (content, last),
+    )
+    .unwrap();
+    conn.execute("DELETE FROM unit WHERE hash = ?1", [last])
+        .unwrap();
+    conn.execute("UPDATE snapshot SET status = 'damaged'", [])
+        .unwrap();
+    drop(conn);
+
+    let want = format!("missing 1 of {} units", units.len());
+    for (sel, quick) in [(None, true), (None, false), (Some(snap), false)] {
+        let r = verify::run(&repo, sel, quick).unwrap();
+        assert_eq!(r.snapshots, 1, "{:?}", r.problems);
+        assert_eq!(r.problems.len(), 1, "{:?}", r.problems);
+        let p = &r.problems[0];
+        assert!(p.contains("sub/keep.bin") && p.contains(&want), "{p}");
+    }
+}

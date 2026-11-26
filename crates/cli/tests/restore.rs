@@ -108,3 +108,41 @@ fn restore_preflight_failure_exits_1() {
         "{err}"
     );
 }
+
+#[test]
+fn restore_of_damaged_snapshot_exits_2_and_names_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    ingested(tmp.path());
+    let conn = rusqlite::Connection::open(tmp.path().join("r/catalog.sqlite")).unwrap();
+    let (content, unit): (Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT cu.content_hash, cu.unit_hash FROM content_unit cu \
+             JOIN entry e ON e.content_hash = cu.content_hash \
+             WHERE e.path = CAST('d/b.bin' AS BLOB) ORDER BY cu.seq DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    conn.execute(
+        "DELETE FROM content_unit WHERE content_hash = ?1 AND unit_hash = ?2",
+        (&content, &unit),
+    )
+    .unwrap();
+    conn.execute("DELETE FROM unit WHERE hash = ?1", [&unit])
+        .unwrap();
+    let id: String = conn
+        .query_row("SELECT lower(hex(id)) FROM snapshot", [], |r| r.get(0))
+        .unwrap();
+    conn.execute("UPDATE snapshot SET status = 'damaged'", [])
+        .unwrap();
+    drop(conn);
+    let out = wmk()
+        .current_dir(tmp.path())
+        .args(["--repo", "r", "restore", &id, "out"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("d/b.bin"));
+    assert!(tmp.path().join("out/a.html").exists());
+    assert!(!tmp.path().join("out/d/b.bin").exists());
+}

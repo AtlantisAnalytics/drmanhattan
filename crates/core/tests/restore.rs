@@ -636,3 +636,92 @@ fn linux_tree_on_macos_collides() {
     assert!(!dest.exists());
     assert!(!partial(&dest, r.snapshot).exists());
 }
+
+/// Simulate a repair gap: drop the last unit of `path`'s content from the
+/// catalog and mark the snapshot damaged.
+fn damage(repo: &Repo, snapshot: Id, path: &[u8]) {
+    let cat = catalog(repo);
+    let content = cat
+        .entry_by_path(snapshot, path)
+        .unwrap()
+        .content_hash
+        .unwrap();
+    let last = cat.content_units(&content).unwrap().pop().unwrap().hash;
+    drop(cat);
+    let conn = rusqlite::Connection::open(repo.catalog_path()).unwrap();
+    conn.execute(
+        "DELETE FROM content_unit WHERE content_hash = ?1 AND unit_hash = ?2",
+        (content, last),
+    )
+    .unwrap();
+    conn.execute("DELETE FROM unit WHERE hash = ?1", [last])
+        .unwrap();
+    conn.execute(
+        "UPDATE snapshot SET status = 'damaged' WHERE id = ?1",
+        [snapshot],
+    )
+    .unwrap();
+}
+
+#[test]
+fn restore_withholds_damaged_files_and_restores_the_rest() {
+    let (tmp, repo, src) = setup();
+    TreeBuilder::new(&src)
+        .file(b"dir/a", &random(1, 50_000))
+        .file(b"dir/b", &random(2, 50_000))
+        .file(b"other/c", b"small")
+        .finish();
+    let r = ingest(&repo, &src);
+    damage(&repo, r.snapshot, b"dir/a");
+    let dest = tmp.path().join("out");
+    let rep = restore(&repo, r.snapshot, &dest, &whole());
+    assert_eq!(rep.damaged, vec![b"dir/a".to_vec()]);
+    assert_eq!(rep.withheld, 0);
+    assert!(!dest.join("dir/a").exists());
+    for p in ["dir/b", "other/c"] {
+        assert_eq!(
+            fs::read(dest.join(p)).unwrap(),
+            fs::read(src.join(p)).unwrap()
+        );
+    }
+}
+
+#[test]
+fn restore_path_of_undamaged_folder_has_no_damage() {
+    let (tmp, repo, src) = setup();
+    TreeBuilder::new(&src)
+        .file(b"dir/a", &random(1, 50_000))
+        .file(b"other/c", b"small")
+        .finish();
+    let r = ingest(&repo, &src);
+    damage(&repo, r.snapshot, b"dir/a");
+    let dest = tmp.path().join("out");
+    let opts = RestoreOptions {
+        path: b"other".to_vec(),
+        ..whole()
+    };
+    let rep = restore(&repo, r.snapshot, &dest, &opts);
+    assert!(rep.damaged.is_empty());
+    assert_eq!(fs::read(dest.join("c")).unwrap(), b"small");
+}
+
+#[test]
+fn restore_hardlinked_damaged_file_withholds_every_member() {
+    let (tmp, repo, src) = setup();
+    TreeBuilder::new(&src)
+        .file(b"x", &random(3, 50_000))
+        .hardlink(b"y", b"x")
+        .file(b"z", b"fine")
+        .finish();
+    let r = ingest(&repo, &src);
+    damage(&repo, r.snapshot, b"x");
+    let dest = tmp.path().join("out");
+    let opts = RestoreOptions {
+        hardlinks: true,
+        ..whole()
+    };
+    let rep = restore(&repo, r.snapshot, &dest, &opts);
+    assert_eq!(rep.damaged, vec![b"x".to_vec(), b"y".to_vec()]);
+    assert!(!dest.join("x").exists() && !dest.join("y").exists());
+    assert_eq!(fs::read(dest.join("z")).unwrap(), b"fine");
+}

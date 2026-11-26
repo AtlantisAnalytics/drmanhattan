@@ -17,7 +17,7 @@
 //! numbered job, and a merger emits the results in job order, so the
 //! report is the same for any worker count.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -25,12 +25,12 @@ use std::sync::Mutex;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::catalog::Catalog;
-use crate::display::display_path;
+use crate::display::{display_bytes, display_path};
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::ingest::record;
 use crate::manifest::{manifest_snapshot, ManifestOptions};
-use crate::model::{ContentRow, SnapshotRow, SnapshotStatus, UnitRow};
+use crate::model::{ContentRow, EntryKind, SnapshotRow, SnapshotStatus, UnitRow};
 use crate::pack::{pack_path, scan};
 use crate::repo::Repo;
 use crate::unitread::UnitReader;
@@ -431,7 +431,10 @@ impl Checker<'_> {
         for h in units {
             rows.push(self.unit(snap, h, false));
         }
-        if self.quick || !self.hashed.insert(c.hash) {
+        // An incomplete content is reported per file by `snapshot`; reading
+        // its remaining units could only repeat that as a hash mismatch.
+        let incomplete = (units.len() as i64) < c.unit_count;
+        if self.quick || incomplete || !self.hashed.insert(c.hash) {
             return self.send(None);
         }
         let mut prefix = Vec::with_capacity(units.len());
@@ -483,7 +486,28 @@ impl Checker<'_> {
         }
 
         let cat = self.cat;
-        cat.for_each_snapshot_content(id, |content, units| self.content(id, content, &units))?;
+        // Contents with fewer units than they declare: hash -> (have, want).
+        let mut incomplete: HashMap<Hash32, (i64, i64)> = HashMap::new();
+        cat.for_each_snapshot_content(id, |content, units| {
+            let have = units.len() as i64;
+            if have < content.unit_count {
+                incomplete.insert(content.hash, (have, content.unit_count));
+            }
+            self.content(id, content, &units)
+        })?;
+        if !incomplete.is_empty() {
+            cat.for_each_entry(id, |e| {
+                let missing = e.content_hash.and_then(|h| incomplete.get(&h));
+                if let (EntryKind::File, Some(&(have, want))) = (e.kind, missing) {
+                    self.pending.push(format!(
+                        "snapshot {id}: {}: missing {} of {want} units",
+                        display_bytes(&e.path),
+                        want - have
+                    ));
+                }
+                Ok(())
+            })?;
+        }
 
         match &s.record_unit {
             None => self
@@ -516,7 +540,7 @@ impl Checker<'_> {
     fn walk(&mut self, selected: &[SnapshotRow]) -> Result<u64> {
         let mut snapshots = 0;
         for s in selected {
-            if s.status != SnapshotStatus::Complete {
+            if !matches!(s.status, SnapshotStatus::Complete | SnapshotStatus::Damaged) {
                 self.pending.push(format!(
                     "snapshot {}: status is {}, not complete",
                     s.id,
@@ -555,7 +579,7 @@ pub fn run_with(repo: &Repo, snapshot: Option<Id>, opts: &VerifyOptions) -> Resu
         None => cat
             .snapshots()?
             .into_iter()
-            .filter(|s| s.status == SnapshotStatus::Complete)
+            .filter(|s| matches!(s.status, SnapshotStatus::Complete | SnapshotStatus::Damaged))
             .collect(),
     };
     let reader = UnitReader::new(repo, 64 << 20);
