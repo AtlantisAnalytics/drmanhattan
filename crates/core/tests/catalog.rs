@@ -275,14 +275,20 @@ fn writer_commits_only_on_commit() {
     tx.send(CatalogOp::InsertEntry(entry(sid, None, b"", b"")))
         .unwrap();
     // The writer holds SQLite's write lock exactly while a transaction is
-    // open, so wait until a competing BEGIN IMMEDIATE is refused. That proves
-    // the writer applied the entry op without committing it.
-    wait_until(|| writer_holds_lock(&path));
+    // open. The snapshot row being visible proves the first transaction
+    // committed, so a held lock after that can only be the second transaction,
+    // which has applied the entry op without committing it.
+    let snapshots = |p: &std::path::Path| -> i64 {
+        let c = rusqlite::Connection::open(p).unwrap();
+        c.query_row("SELECT count(*) FROM snapshot", [], |r| r.get(0))
+            .unwrap()
+    };
+    wait_until(|| snapshots(&path) == 1 && writer_holds_lock(&path));
     assert_eq!(count(&path), 0);
     tx.send(CatalogOp::Commit).unwrap();
-    // Once the lock is free again the transaction has been committed.
-    wait_until(|| !writer_holds_lock(&path));
-    assert_eq!(count(&path), 1);
+    // Wait for the entry itself to become visible rather than for the lock to
+    // be free, which is also true in the gap between the two transactions.
+    wait_until(|| count(&path) == 1);
     drop(tx);
     assert_eq!(h.join().unwrap().unwrap().commits, 2);
 }
