@@ -526,3 +526,60 @@ fn verify_reports_incomplete_content() {
         assert!(p.contains("sub/keep.bin") && p.contains(&want), "{p}");
     }
 }
+
+#[test]
+fn verify_still_reads_present_units_of_incomplete_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = Repo::init(&tmp.path().join("r")).unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    TreeBuilder::new(&src)
+        .file(b"big.bin", &random(11, 40_000_000))
+        .finish();
+    let snap = ingest::run(&repo, &src, &IngestOptions::default())
+        .unwrap()
+        .snapshot;
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    let content = cat
+        .entry_by_path(snap, b"big.bin")
+        .unwrap()
+        .content_hash
+        .unwrap();
+    let units = cat.content_units(&content).unwrap();
+    drop(cat);
+    assert!(units.len() >= 2, "need a multi-unit content");
+    let last = units.last().unwrap().hash;
+    let conn = rusqlite::Connection::open(repo.catalog_path()).unwrap();
+    conn.execute(
+        "DELETE FROM content_unit WHERE content_hash = ?1 AND unit_hash = ?2",
+        (content, last),
+    )
+    .unwrap();
+    conn.execute("DELETE FROM unit WHERE hash = ?1", [last])
+        .unwrap();
+    conn.execute("UPDATE snapshot SET status = 'damaged'", [])
+        .unwrap();
+    drop(conn);
+
+    // Rot a surviving unit.
+    let first = &units[0];
+    let pack = pack_path(&repo.packs_dir(), first.pack_id);
+    fs::set_permissions(&pack, fs::Permissions::from_mode(0o644)).unwrap();
+    let mut bytes = fs::read(&pack).unwrap();
+    bytes[first.pack_offset as usize + RECORD_HEADER_LEN + 10] ^= 0x01;
+    fs::write(&pack, &bytes).unwrap();
+
+    let r = verify::run(&repo, Some(snap), false).unwrap();
+    assert!(
+        r.problems
+            .iter()
+            .any(|p| p.contains(&format!("unit {}", first.hash))),
+        "{:?}",
+        r.problems
+    );
+    assert!(
+        r.problems.iter().any(|p| p.contains("missing 1 of")),
+        "{:?}",
+        r.problems
+    );
+}

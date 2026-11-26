@@ -107,7 +107,7 @@ pub fn run_with_probe(
         )]));
     }
     let (entries, withheld) = collect(&cat, snapshot, &opts.path)?;
-    let (entries, damaged) = withhold_damaged(&cat, snapshot, entries)?;
+    let (entries, damaged) = withhold_damaged(&cat, snapshot, &opts.path, entries)?;
     check_xattr_names(&cat, snapshot, &entries)?;
     let probe = match probe {
         Some(p) => p,
@@ -252,10 +252,11 @@ fn collect(cat: &Catalog, snapshot: Id, root_path: &[u8]) -> Result<(Vec<EntryRo
 /// Drop file entries whose content lacks units from the restored set and
 /// return their paths, sorted. Separate from `included` screening, which
 /// feeds the manifest. The root entry is never dropped: a damaged root file
-/// is an error, since nothing could be restored.
+/// is `Error::Damaged`, since nothing could be restored.
 fn withhold_damaged(
     cat: &Catalog,
     snapshot: Id,
+    path: &[u8],
     entries: Vec<EntryRow>,
 ) -> Result<(Vec<EntryRow>, Vec<Vec<u8>>)> {
     let incomplete = cat.incomplete_contents(snapshot)?;
@@ -265,10 +266,18 @@ fn withhold_damaged(
     let is_damaged = |e: &EntryRow| {
         e.kind == EntryKind::File && e.content_hash.is_some_and(|h| incomplete.contains(&h))
     };
-    if entries.first().is_some_and(is_damaged) {
-        return Err(Error::Corrupt(format!(
-            "the requested file has missing units in snapshot {snapshot}"
-        )));
+    if let Some(hash) = entries
+        .first()
+        .filter(|e| is_damaged(e))
+        .and_then(|e| e.content_hash)
+    {
+        let total = cat.content(&hash)?.unit_count;
+        let have = cat.content_units(&hash)?.len() as i64;
+        return Err(Error::Damaged {
+            path: display_bytes(path),
+            missing: total - have,
+            total,
+        });
     }
     let (bad, kept): (Vec<_>, Vec<_>) = entries.into_iter().partition(is_damaged);
     let mut damaged: Vec<Vec<u8>> = bad.into_iter().map(|e| e.path).collect();

@@ -2,7 +2,7 @@
 //! `problems`, never as an `Err`; `Err` is reserved for failures to even
 //! look (e.g. the catalog will not open).
 //!
-//! `quick` checks, for every unit a selected complete snapshot references
+//! `quick` checks, for every unit a selected complete or damaged snapshot references
 //! (its contents' units, its record unit, and the chunks the record index
 //! names): the pack file exists, the record header at the unit's offset
 //! parses, and its hash, kind and lengths equal the unit row; plus the
@@ -431,10 +431,11 @@ impl Checker<'_> {
         for h in units {
             rows.push(self.unit(snap, h, false));
         }
-        // An incomplete content is reported per file by `snapshot`; reading
-        // its remaining units could only repeat that as a hash mismatch.
+        // An incomplete content is reported per file by `snapshot`; its
+        // present units are still read, but there is no content hash to
+        // compare.
         let incomplete = (units.len() as i64) < c.unit_count;
-        if self.quick || incomplete || !self.hashed.insert(c.hash) {
+        if self.quick || !self.hashed.insert(c.hash) {
             return self.send(None);
         }
         let mut prefix = Vec::with_capacity(units.len());
@@ -444,7 +445,7 @@ impl Checker<'_> {
                 _ => break,
             }
         }
-        let partial = prefix.len() < units.len();
+        let partial = prefix.len() < units.len() || incomplete;
         if partial && prefix.is_empty() {
             return self.send(None);
         }
@@ -556,7 +557,7 @@ impl Checker<'_> {
     }
 }
 
-/// Verify `snapshot`, or every complete snapshot when `None`, reading
+/// Verify `snapshot`, or every complete or damaged snapshot when `None`, reading
 /// contents on one thread per CPU.
 pub fn run(repo: &Repo, snapshot: Option<Id>, quick: bool) -> Result<VerifyReport> {
     run_with(
@@ -570,7 +571,7 @@ pub fn run(repo: &Repo, snapshot: Option<Id>, quick: bool) -> Result<VerifyRepor
     )
 }
 
-/// Verify `snapshot`, or every complete snapshot when `None`. The report
+/// Verify `snapshot`, or every complete or damaged snapshot when `None`. The report
 /// does not depend on `opts.workers`.
 pub fn run_with(repo: &Repo, snapshot: Option<Id>, opts: &VerifyOptions) -> Result<VerifyReport> {
     let cat = Catalog::open_readonly(&repo.catalog_path())?;

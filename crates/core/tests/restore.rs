@@ -725,3 +725,28 @@ fn restore_hardlinked_damaged_file_withholds_every_member() {
     assert!(!dest.join("x").exists() && !dest.join("y").exists());
     assert_eq!(fs::read(dest.join("z")).unwrap(), b"fine");
 }
+
+#[test]
+fn restore_path_of_damaged_file_is_damaged_error_and_writes_nothing() {
+    let (tmp, repo, src) = setup();
+    TreeBuilder::new(&src)
+        .file(b"dir/a", &random(1, 50_000))
+        .finish();
+    let r = ingest(&repo, &src);
+    damage(&repo, r.snapshot, b"dir/a");
+    let dest = tmp.path().join("out");
+    let opts = RestoreOptions {
+        path: b"dir/a".to_vec(),
+        ..whole()
+    };
+    let err = restore::run(&repo, r.snapshot, &dest, &opts).unwrap_err();
+    match &err {
+        Error::Damaged { path, missing, .. } => {
+            assert_eq!(path, "dir/a");
+            assert_eq!(*missing, 1);
+        }
+        e => panic!("{e}"),
+    }
+    assert!(err.to_string().contains("missing 1 of"), "{err}");
+    assert!(!dest.exists() && !partial(&dest, r.snapshot).exists());
+}

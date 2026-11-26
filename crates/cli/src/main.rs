@@ -80,7 +80,11 @@ impl std::error::Error for DiffFound {}
 /// Map an error to a process exit code: 2 for verification failure or
 /// differences found, otherwise 1. (3, entries withheld, is a success-path code.)
 pub fn exit_code(err: &anyhow::Error) -> i32 {
-    if err.is::<VerifyFailed>() || err.is::<DiffFound>() {
+    let damaged = matches!(
+        err.downcast_ref::<drmanhattan_core::error::Error>(),
+        Some(drmanhattan_core::error::Error::Damaged { .. })
+    );
+    if damaged || err.is::<VerifyFailed>() || err.is::<DiffFound>() {
         2
     } else {
         1
