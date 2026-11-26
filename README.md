@@ -83,8 +83,9 @@ machine-readable output.
 A snapshot is named by `latest`, its full UUID, or a prefix of at least
 8 hex characters.
 
-Exit codes: 0 success, 1 error, 2 verification failure or differences found,
-3 entries withheld by screening.
+Exit codes: 0 success, 1 error, 2 verification failure or differences found
+(also: `restore` withheld damaged files, or `recover` found damage or lost
+snapshot records), 3 entries withheld by screening.
 
 ## v1 limits
 
@@ -103,6 +104,9 @@ Copy the whole repository folder while nothing is writing to it, then run
 if `catalog.sqlite` is lost or damaged, `wmk recover` rebuilds it from the
 packs, keeping the old catalog beside the new one. Never run `wmk` over a
 network file system.
+
+`wmk recover` upgrades a repository to format version 2, which wmk 0.2
+cannot open.
 
 ## Design
 

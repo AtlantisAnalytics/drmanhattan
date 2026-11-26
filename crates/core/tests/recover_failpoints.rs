@@ -41,9 +41,15 @@ fn root_names(repo: &Repo) -> Vec<String> {
 fn failure_before_rename_puts_everything_back() {
     let _serial = FAIL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (_tmp, repo) = setup();
-    // A reader pins the WAL, so recover's checkpoint cannot empty it.
+    // A reader whose transaction began before the insert pins the WAL: the
+    // checkpoint recover runs on the old catalog can copy none of it, so
+    // the main file and the WAL must come back byte for byte.
     let writer = rusqlite::Connection::open(repo.catalog_path()).unwrap();
     writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    let reader = rusqlite::Connection::open(repo.catalog_path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM snapshot;")
+        .unwrap();
     writer
         .execute(
             "INSERT INTO snapshot(id, status, source_root, host, tool_version, started_at) \
@@ -51,13 +57,12 @@ fn failure_before_rename_puts_everything_back() {
             [Id::new_v7().as_bytes().to_vec()],
         )
         .unwrap();
-    let reader = rusqlite::Connection::open(repo.catalog_path()).unwrap();
-    reader
-        .execute_batch("BEGIN; SELECT count(*) FROM snapshot;")
-        .unwrap();
     let names_before = root_names(&repo);
     assert!(names_before.contains(&"catalog.sqlite-wal".to_string()));
     let cfg_before = fs::read(repo.root.join("wmk.toml")).unwrap();
+    let main_before = fs::read(repo.catalog_path()).unwrap();
+    let wal_before = fs::read(repo.root.join("catalog.sqlite-wal")).unwrap();
+    assert!(!wal_before.is_empty());
 
     let scenario = fail::FailScenario::setup();
     fail::cfg("recover::before_rename", "return").unwrap();
@@ -66,12 +71,8 @@ fn failure_before_rename_puts_everything_back() {
 
     assert!(matches!(r, Err(Error::Io { .. })), "{r:?}");
     assert_eq!(root_names(&repo), names_before);
-    assert!(
-        fs::metadata(repo.root.join("catalog.sqlite-wal"))
-            .unwrap()
-            .len()
-            > 0
-    );
+    assert!(fs::read(repo.catalog_path()).unwrap() == main_before);
+    assert!(fs::read(repo.root.join("catalog.sqlite-wal")).unwrap() == wal_before);
     assert!(fs::read_dir(repo.tmp_dir()).map_or(true, |mut d| d.next().is_none()));
     assert_eq!(fs::read(repo.root.join("wmk.toml")).unwrap(), cfg_before);
     // The old catalog, WAL included, still shows the uncheckpointed row.

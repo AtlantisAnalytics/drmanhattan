@@ -441,6 +441,45 @@ fn ingest_refuses_when_catalog_missing_but_packs_exist() {
 }
 
 #[test]
+fn ingest_refuses_an_empty_catalog_file_beside_packs() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"a.txt", b"hello");
+    ingest(&repo, &src);
+    let packs_before = pack_bytes(&repo);
+    for suffix in ["-wal", "-shm"] {
+        let mut name = repo.catalog_path().into_os_string();
+        name.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(name));
+    }
+    // A zero-length file, then a SQLite database with no schema.
+    std::fs::write(repo.catalog_path(), b"").unwrap();
+    let err = ingest::run(&repo, &src, &opts()).unwrap_err();
+    assert!(matches!(err, Error::CatalogMissing), "{err:?}");
+    assert_eq!(std::fs::metadata(repo.catalog_path()).unwrap().len(), 0);
+    std::fs::remove_file(repo.catalog_path()).unwrap();
+    rusqlite::Connection::open(repo.catalog_path())
+        .unwrap()
+        .execute_batch("CREATE TABLE t(x); DROP TABLE t;")
+        .unwrap();
+    let err = ingest::run(&repo, &src, &opts()).unwrap_err();
+    assert!(matches!(err, Error::CatalogMissing), "{err:?}");
+    assert_eq!(pack_bytes(&repo), packs_before);
+}
+
+/// Every pack file's path and bytes.
+fn pack_bytes(repo: &Repo) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for shard in std::fs::read_dir(repo.packs_dir()).unwrap() {
+        for f in std::fs::read_dir(shard.unwrap().path()).unwrap() {
+            let p = f.unwrap().path();
+            out.push((p.clone(), std::fs::read(&p).unwrap()));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
 fn ingest_into_fresh_repo_without_catalog_file_still_works() {
     let (_tmp, repo, src) = setup();
     TreeBuilder::new(&src).file(b"a.txt", b"hello");
@@ -454,12 +493,20 @@ fn ingest_sweeps_stale_record_temp_files() {
     let (_tmp, repo, src) = setup();
     TreeBuilder::new(&src).file(b"a.txt", b"hello");
     std::fs::create_dir_all(repo.tmp_dir()).unwrap();
-    let stale = repo.tmp_dir().join("record-stale.cbor");
+    let stale = [
+        "record-stale.cbor",
+        "recover-stale.sqlite",
+        "recover-stale.sqlite-wal",
+    ]
+    .map(|n| repo.tmp_dir().join(n));
     let keep = repo.tmp_dir().join("keep.txt");
-    std::fs::write(&stale, b"x").unwrap();
-    std::fs::write(&keep, b"x").unwrap();
+    for p in stale.iter().chain([&keep]) {
+        std::fs::write(p, b"x").unwrap();
+    }
     ingest(&repo, &src);
-    assert!(!stale.exists());
+    for p in &stale {
+        assert!(!p.exists(), "{p:?} was not swept");
+    }
     assert!(keep.exists());
 }
 
@@ -556,4 +603,34 @@ fn large_record_streams_across_chunks() {
     .unwrap();
     assert_eq!(header.id, r.snapshot);
     assert_eq!(entries, 10_001);
+
+    // Recover replays the multi-chunk record into the same entry rows.
+    let dest = repo.root.parent().unwrap().join("rebuilt.sqlite");
+    let report = drmanhattan_core::recover::build(
+        &repo,
+        &dest,
+        &drmanhattan_core::recover::RecoverOptions::default(),
+    )
+    .unwrap();
+    assert!(report.intact(), "{report:#?}");
+    assert_eq!(report.snapshots, vec![r.snapshot]);
+    let rows = |path: &Path| -> Vec<Vec<String>> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let mut stmt = conn.prepare("SELECT * FROM entry ORDER BY id").unwrap();
+        let n = stmt.column_count();
+        let rows = stmt
+            .query_map([], |row| {
+                (0..n)
+                    .map(|i| {
+                        row.get::<_, rusqlite::types::Value>(i)
+                            .map(|v| format!("{v:?}"))
+                    })
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    };
+    let want = rows(&repo.catalog_path());
+    assert_eq!(want.len(), 10_001);
+    assert_eq!(rows(&dest), want);
 }

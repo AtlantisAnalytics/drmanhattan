@@ -15,7 +15,7 @@ pub enum Error {
     NotARepo,
     #[error("directory is not empty; refusing to initialize a repository there")]
     RepoNotEmpty,
-    #[error("catalog.sqlite is missing but packs/ holds data; run `wmk recover`")]
+    #[error("catalog.sqlite is missing or empty but packs/ holds data; run `wmk recover`")]
     CatalogMissing,
     #[error("repository is corrupt: {0}")]
     Corrupt(String),

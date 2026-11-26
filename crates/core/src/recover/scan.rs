@@ -5,8 +5,16 @@
 //! Workers send rows over a bounded channel; the caller is the only writer.
 //! Per pack, a placeholder `pack` row goes first (units reference it), then
 //! its units, then the final `pack` row. Memory per worker is one pack's
-//! candidate list and one unit.
+//! candidate list and footer index, and one unit.
+//!
+//! Damaged bytes (`coverage_gaps`) that a header-valid candidate covers are
+//! judged by that candidate (a corrupt unit: a warning, a damaged file or a
+//! lost record). Damaged bytes no candidate covers could have held anything,
+//! a snapshot record included, so they are unaccounted (fatal to
+//! `RecoverReport::intact`) unless a consistent footer's index shows that
+//! every unit it places there has an intact copy.
 
+use super::{TornTail, UnaccountedRange};
 use crate::catalog::writer::{apply, CatalogOp};
 use crate::catalog::Catalog;
 use crate::display::display_path;
@@ -15,6 +23,7 @@ use crate::ids::{Hash32, Id};
 use crate::model::{PackRow, UnitRow};
 use crate::pack::{coverage_gaps, pack_path, salvage, PackReader, UnitKind, RECORD_HEADER_LEN};
 use crossbeam_channel::{Receiver, Sender};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -41,6 +50,10 @@ pub(super) struct Scanned {
     /// `snapshot_record` units found only corrupt (hash, why), each once:
     /// their snapshots are lost, and nothing else would say so.
     pub lost_records: Vec<(Hash32, String)>,
+    /// Damaged bytes that may have held data, by pack path and offset.
+    pub unaccounted: Vec<UnaccountedRange>,
+    /// Unfinished writes ignored at the end of unsealed packs, likewise.
+    pub torn_tails: Vec<TornTail>,
 }
 
 enum Msg {
@@ -49,9 +62,20 @@ enum Msg {
     Unit(UnitRow),
     /// A candidate record whose payload does not match its hash.
     Corrupt(Hash32, UnitKind, String),
+    /// Damaged bytes no candidate covers, with the unit hashes a consistent
+    /// footer's index places inside them (`None` without such a footer).
+    Unaccounted(UnaccountedRange, Option<Vec<Hash32>>),
+    TornTail(TornTail),
     Warning(String),
     /// Last message of a pack: its final row and file length.
     Done(PackRow, u64),
+}
+
+/// What can be judged only once every pack's units are in.
+#[derive(Default)]
+struct Deferred {
+    corrupt: Vec<(Hash32, UnitKind, String)>,
+    unaccounted: Vec<(UnaccountedRange, Option<Vec<Hash32>>)>,
 }
 
 /// Every pack file under `packs_dir`, in path order. Files not named like
@@ -115,26 +139,34 @@ fn sorted_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(v)
 }
 
-/// Does not follow symlinks: a symlinked directory is not a shard.
+/// Follows symlinks, as ingest and the unit reader do: a symlink to a
+/// directory is a shard. A dangling symlink is not a directory.
 fn is_dir(path: &Path) -> Result<bool> {
-    Ok(std::fs::symlink_metadata(path)
-        .map_err(|e| Error::io(path, e))?
-        .is_dir())
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(m.is_dir()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::io(path, e)),
+    }
 }
 
 /// Salvage `packs` on `workers` threads and insert their `pack` and `unit`
 /// rows into `cat`, keeping the first intact copy of each unit. Every
-/// structural problem, uncovered (damaged) byte range and corrupt record is
+/// structural problem, cost-free damaged byte range and corrupt record is
 /// appended to `warnings`, sorted.
+///
+/// `old_sizes` holds the `pack.size` of each pack in the previous catalog
+/// (empty when there is none): an unsealed pack's bytes below that size
+/// were committed, so they cannot be a torn tail.
 pub(super) fn scan(
     cat: &Catalog,
     packs: &[PackFile],
     workers: usize,
+    old_sizes: &HashMap<Id, u64>,
     warnings: &mut Vec<String>,
 ) -> Result<Scanned> {
     let next = AtomicUsize::new(0);
     let abort = AtomicBool::new(false);
-    let mut corrupt = Vec::new();
+    let mut deferred = Deferred::default();
     let (written, worker_results) = std::thread::scope(|s| {
         let (tx, rx) = crossbeam_channel::bounded::<Msg>(1024);
         let handles: Vec<_> = (0..workers.min(packs.len()))
@@ -146,7 +178,7 @@ pub(super) fn scan(
                         let Some(p) = packs.get(next.fetch_add(1, Ordering::Relaxed)) else {
                             break;
                         };
-                        if let Err(e) = scan_pack(p, &tx) {
+                        if let Err(e) = scan_pack(p, old_sizes.get(&p.id).copied(), &tx) {
                             abort.store(true, Ordering::Relaxed);
                             return Err(e);
                         }
@@ -157,7 +189,7 @@ pub(super) fn scan(
             .collect();
         drop(tx);
         // Returning drops `rx`, so workers blocked on a send stop too.
-        let written = write(cat, rx, warnings, &mut corrupt);
+        let written = write(cat, rx, warnings, &mut deferred);
         if written.is_err() {
             abort.store(true, Ordering::Relaxed);
         }
@@ -174,7 +206,27 @@ pub(super) fn scan(
         r?;
     }
     // Whether an intact copy exists is known only once every pack is in.
-    for (hash, kind, why) in corrupt {
+    for (range, index) in deferred.unaccounted {
+        let mut spare = index.as_ref().is_some_and(|h| !h.is_empty());
+        for h in index.iter().flatten() {
+            if !cat.has_unit(h)? {
+                spare = false;
+                break;
+            }
+        }
+        if spare {
+            warnings.push(format!(
+                "pack {}: bytes {}..{} hold no readable record, but every unit its footer \
+                 index places there has an intact copy",
+                display_path(&range.pack),
+                range.start,
+                range.end
+            ));
+        } else {
+            scanned.unaccounted.push(range);
+        }
+    }
+    for (hash, kind, why) in deferred.corrupt {
         if cat.has_unit(&hash)? {
             warnings.push(format!("{why}; an intact copy is used"));
             continue;
@@ -186,17 +238,23 @@ pub(super) fn scan(
         }
     }
     scanned.lost_records.sort();
+    scanned
+        .unaccounted
+        .sort_by(|a, b| (&a.pack, a.start).cmp(&(&b.pack, b.start)));
+    scanned
+        .torn_tails
+        .sort_by(|a, b| (&a.pack, a.start).cmp(&(&b.pack, b.start)));
     warnings.sort();
     Ok(scanned)
 }
 
 /// Apply the workers' rows in batched transactions until every sender is
-/// gone, collecting their warnings and corrupt records.
+/// gone, collecting their warnings, torn tails and what must be judged later.
 fn write(
     cat: &Catalog,
     rx: Receiver<Msg>,
     warnings: &mut Vec<String>,
-    corrupt: &mut Vec<(Hash32, UnitKind, String)>,
+    deferred: &mut Deferred,
 ) -> Result<Scanned> {
     let conn = &cat.conn;
     let mut out = Scanned {
@@ -204,6 +262,8 @@ fn write(
         bytes_read: 0,
         units: 0,
         lost_records: Vec::new(),
+        unaccounted: Vec::new(),
+        torn_tails: Vec::new(),
     };
     let mut pending = 0u64;
     conn.execute_batch("BEGIN")?;
@@ -215,7 +275,9 @@ fn write(
                     apply(conn, CatalogOp::InsertUnit(row))?;
                     out.units += conn.changes();
                 }
-                Msg::Corrupt(hash, kind, why) => corrupt.push((hash, kind, why)),
+                Msg::Corrupt(hash, kind, why) => deferred.corrupt.push((hash, kind, why)),
+                Msg::Unaccounted(range, index) => deferred.unaccounted.push((range, index)),
+                Msg::TornTail(t) => out.torn_tails.push(t),
                 Msg::Warning(w) => warnings.push(w),
                 Msg::Done(row, len) => {
                     apply(conn, CatalogOp::UpsertPack(row))?;
@@ -247,9 +309,33 @@ fn to_i64(v: u64, what: &str) -> Result<i64> {
     i64::try_from(v).map_err(|_| Error::Corrupt(format!("{what} {v} out of range")))
 }
 
-/// Salvage one pack and send its rows. Errs only on I/O errors (or when the
-/// writer has stopped).
-fn scan_pack(p: &PackFile, tx: &Sender<Msg>) -> Result<()> {
+/// The parts of `[start, end)` that no span in `spans` (`(start, end)`,
+/// sorted by start, possibly overlapping) covers.
+fn uncovered((start, end): (u64, u64), spans: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut cursor = start;
+    for &(s, e) in spans {
+        if s >= end {
+            break;
+        }
+        if e <= cursor {
+            continue;
+        }
+        if s > cursor {
+            out.push((cursor, s));
+        }
+        cursor = e;
+    }
+    if cursor < end {
+        out.push((cursor, end));
+    }
+    out
+}
+
+/// Salvage one pack and send its rows. `old_size` is its size in the
+/// previous catalog, if known. Errs only on I/O errors (or when the writer
+/// has stopped).
+fn scan_pack(p: &PackFile, old_size: Option<u64>, tx: &Sender<Msg>) -> Result<()> {
     let shown = display_path(&p.path);
     let s = salvage(&p.path)?;
     for w in s.problems {
@@ -272,6 +358,8 @@ fn scan_pack(p: &PackFile, tx: &Sender<Msg>) -> Result<()> {
 
     let reader = PackReader::open(&p.path)?;
     let mut verified: Vec<(u64, u64)> = Vec::new();
+    // `(start, end)` of candidates whose payload failed its hash, in order.
+    let mut failed: Vec<(u64, u64)> = Vec::new();
     // End of the verified spans so far. Genuine records never overlap and
     // candidates come in offset order, so a candidate starting inside a
     // verified record is a header embedded in its payload (a pack file
@@ -297,7 +385,10 @@ fn scan_pack(p: &PackFile, tx: &Sender<Msg>) -> Result<()> {
                 };
                 send(tx, Msg::Unit(row))?;
             }
-            Err(Error::Corrupt(why)) => send(tx, Msg::Corrupt(h.unit_hash, h.kind, why))?,
+            Err(Error::Corrupt(why)) => {
+                failed.push((*offset, offset + RECORD_HEADER_LEN as u64 + h.stored_len));
+                send(tx, Msg::Corrupt(h.unit_hash, h.kind, why))?
+            }
             Err(e) => return Err(e),
         }
     }
@@ -307,13 +398,54 @@ fn scan_pack(p: &PackFile, tx: &Sender<Msg>) -> Result<()> {
     // a final uncovered range is a torn tail: a crash leftover, not damage.
     let has_footer = s.data_end < len;
     let gaps = coverage_gaps(&verified, PACK_HEADER_LEN, s.data_end, has_footer);
+    let range = |start, end| UnaccountedRange {
+        pack: p.path.clone(),
+        pack_id: p.id,
+        start,
+        end,
+    };
     for (from, to) in gaps.damaged {
-        send(
-            tx,
-            Msg::Warning(format!(
-                "pack {shown}: bytes {from}..{to} hold no intact record"
-            )),
-        )?;
+        let pieces = uncovered((from, to), &failed);
+        if pieces.is_empty() {
+            // Each failed candidate here is reported on its own.
+            send(
+                tx,
+                Msg::Warning(format!(
+                    "pack {shown}: bytes {from}..{to} hold no intact record"
+                )),
+            )?;
+        }
+        for (a, b) in pieces {
+            let index = has_footer.then(|| {
+                s.index
+                    .iter()
+                    .filter(|(off, _)| (a..b).contains(off))
+                    .map(|(_, h)| *h)
+                    .collect()
+            });
+            send(tx, Msg::Unaccounted(range(a, b), index))?;
+        }
+    }
+    if !has_footer {
+        // Bytes below the size the previous catalog recorded were committed:
+        // missing or unreadable there, they are damage, not an unfinished
+        // write (a truncated file included).
+        let tail = gaps.torn_tail.unwrap_or(s.data_end);
+        let committed = old_size.unwrap_or(0).max(tail);
+        for (a, b) in uncovered((tail, committed), &failed) {
+            send(tx, Msg::Unaccounted(range(a, b), None))?;
+        }
+        if committed < s.data_end {
+            send(
+                tx,
+                Msg::TornTail(TornTail {
+                    pack: p.path.clone(),
+                    pack_id: p.id,
+                    start: committed,
+                    end: s.data_end,
+                }),
+            )?;
+        }
     }
     let row = match s.sealed_blake3 {
         Some(b) => PackRow {
@@ -330,4 +462,21 @@ fn scan_pack(p: &PackFile, tx: &Sender<Msg>) -> Result<()> {
         },
     };
     send(tx, Msg::Done(row, len))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uncovered;
+
+    #[test]
+    fn uncovered_subtracts_overlapping_spans() {
+        assert_eq!(uncovered((10, 100), &[]), vec![(10, 100)]);
+        assert_eq!(
+            uncovered((10, 100), &[(0, 20), (15, 30), (40, 50), (90, 200)]),
+            vec![(30, 40), (50, 90)]
+        );
+        assert_eq!(uncovered((10, 100), &[(5, 100)]), vec![]);
+        assert_eq!(uncovered((50, 50), &[]), vec![]);
+        assert_eq!(uncovered((50, 40), &[]), vec![]);
+    }
 }

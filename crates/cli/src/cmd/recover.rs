@@ -30,6 +30,15 @@ struct LostRecord {
     why: String,
 }
 
+/// A byte range of one pack.
+#[derive(Serialize)]
+struct PackRange {
+    pack: String,
+    pack_id: String,
+    start: u64,
+    end: u64,
+}
+
 #[derive(Serialize)]
 struct Report {
     ok: bool,
@@ -39,6 +48,8 @@ struct Report {
     snapshots: Vec<String>,
     damaged: Vec<DamagedSnapshot>,
     lost: Vec<LostRecord>,
+    unaccounted: Vec<PackRange>,
+    torn_tails: Vec<PackRange>,
     warnings: Vec<String>,
     not_recovered: Vec<String>,
     old_catalog: Option<String>,
@@ -70,6 +81,26 @@ impl Report {
                     why: l.why.clone(),
                 })
                 .collect(),
+            unaccounted: r
+                .unaccounted
+                .iter()
+                .map(|u| PackRange {
+                    pack: display_path(&u.pack),
+                    pack_id: u.pack_id.to_string(),
+                    start: u.start,
+                    end: u.end,
+                })
+                .collect(),
+            torn_tails: r
+                .torn_tails
+                .iter()
+                .map(|t| PackRange {
+                    pack: display_path(&t.pack),
+                    pack_id: t.pack_id.to_string(),
+                    start: t.start,
+                    end: t.end,
+                })
+                .collect(),
             warnings: r.warnings.clone(),
             not_recovered: r.not_recovered.iter().map(|s| s.to_string()).collect(),
             old_catalog: r.old_catalog.as_deref().map(display_path),
@@ -97,6 +128,23 @@ impl fmt::Display for Report {
             let snap = l.snapshot.as_deref().unwrap_or("unknown snapshot");
             writeln!(f, "lost snapshot record {} ({snap}): {}", l.unit, l.why)?;
         }
+        for u in &self.unaccounted {
+            writeln!(
+                f,
+                "damaged: pack {}: bytes {}..{} hold no readable record; what they held \
+                 (possibly a snapshot record) is unknown",
+                u.pack, u.start, u.end
+            )?;
+        }
+        for t in &self.torn_tails {
+            writeln!(
+                f,
+                "{}: {} bytes after offset {} ignored (unfinished write)",
+                t.pack,
+                t.end - t.start,
+                t.start
+            )?;
+        }
         for w in &self.warnings {
             writeln!(f, "warning: {w}")?;
         }
@@ -119,7 +167,8 @@ impl fmt::Display for Report {
     }
 }
 
-/// Returns 0 when every recovered snapshot is intact, else 2. Needs only
+/// Returns 0 when every recovered snapshot is intact, no snapshot record
+/// was lost and no damaged bytes are unaccounted for, else 2. Needs only
 /// `wmk.toml`: the catalog may be missing or unusable.
 pub fn run(cli: &Cli, args: &RecoverArgs) -> Result<i32> {
     let repo = open_repo(cli)?;

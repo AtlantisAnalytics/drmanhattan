@@ -453,6 +453,13 @@ fn torn_tail_is_ignored_and_pack_untouched() {
     let (dest, report) = build(&repo);
     assert!(report.intact(), "{report:#?}");
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(report.unaccounted.is_empty(), "{:?}", report.unaccounted);
+    assert_eq!(report.torn_tails.len(), 1, "{:?}", report.torn_tails);
+    let tail = &report.torn_tails[0];
+    assert_eq!(
+        (tail.pack_id, tail.start, tail.end),
+        (id, end, bytes.len() as u64)
+    );
     assert_eq!(report.snapshots, vec![s]);
     let cat = Catalog::open_readonly(&dest).unwrap();
     let p = cat.pack(id).unwrap();
@@ -461,6 +468,121 @@ fn torn_tail_is_ignored_and_pack_untouched() {
     assert_eq!(p.blake3, None);
     let u = cat.unit(&header.unit_hash).unwrap();
     assert_eq!((u.pack_id, u.pack_offset as u64), (id, offset));
+}
+
+/// Break the record header of the unit `hash` (its CRC no longer matches).
+fn break_header(repo: &Repo, hash: &Hash32) -> (Id, u64) {
+    let u = catalog(repo).unit(hash).unwrap();
+    flip(repo, u.pack_id, u.pack_offset as u64 + 54);
+    (u.pack_id, u.pack_offset as u64)
+}
+
+#[test]
+fn broken_header_of_only_record_copy_is_unaccounted() {
+    let (_tmp, repo, src) = setup();
+    let mut t = TreeBuilder::new(&src);
+    t.file(b"one", b"1");
+    let s1 = ingest(&repo, &src);
+    t.file(b"two", b"2");
+    let s2 = ingest(&repo, &src);
+    let record = catalog(&repo).snapshot(s2).unwrap().record_unit.unwrap();
+    let span = RECORD_HEADER_LEN as u64 + catalog(&repo).unit(&record).unwrap().stored_size as u64;
+    let (pack, offset) = break_header(&repo, &record);
+
+    let (_dest, report) = build(&repo);
+    assert!(!report.intact(), "{report:#?}");
+    assert_eq!(report.snapshots, vec![s1]);
+    assert_eq!(report.unaccounted.len(), 1, "{:?}", report.unaccounted);
+    let r = &report.unaccounted[0];
+    assert_eq!((r.pack_id, r.start, r.end), (pack, offset, offset + span));
+    assert_eq!(r.pack, pack_path(&repo.packs_dir(), pack));
+}
+
+#[test]
+fn broken_header_with_an_intact_copy_is_a_warning() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"x", &random(4, 50_000));
+    let s = ingest(&repo, &src);
+    let unit = catalog(&repo).unit(&first_unit(&repo, s, b"x")).unwrap();
+    let reader = PackReader::open(&pack_path(&repo.packs_dir(), unit.pack_id)).unwrap();
+    let (header, payload) = reader.read_record(unit.pack_offset as u64).unwrap();
+    drop(reader);
+    let copy = Id::new_v7();
+    let mut w = PackWriter::create(&repo.packs_dir(), copy).unwrap();
+    w.append(&header, &payload).unwrap();
+    w.seal().unwrap();
+    break_header(&repo, &unit.hash);
+
+    let (dest, report) = build(&repo);
+    assert!(report.intact(), "{report:#?}");
+    assert!(report.unaccounted.is_empty(), "{:?}", report.unaccounted);
+    assert!(
+        report.warnings.iter().any(|w| w.contains("intact copy")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(status(&dest, s), "complete");
+}
+
+#[test]
+fn committed_bytes_lost_from_an_unsealed_pack_are_unaccounted() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"f", b"body");
+    let s = ingest(&repo, &src);
+    // An unsealed pack holding two committed units, as the old catalog says.
+    let unit = |raw: &[u8]| RecordHeader {
+        kind: UnitKind::RawChunk,
+        compression: Compression::None,
+        unit_hash: Hash32::of(raw),
+        raw_len: raw.len() as u64,
+        stored_len: raw.len() as u64,
+    };
+    let (a, b) = (b"first unit".to_vec(), b"second unit".to_vec());
+    let id = Id::new_v7();
+    let mut w = PackWriter::create(&repo.packs_dir(), id).unwrap();
+    w.append(&unit(&a), &a).unwrap();
+    let second = w.append(&unit(&b), &b).unwrap();
+    let end = w.len();
+    w.sync().unwrap();
+    drop(w);
+    rusqlite::Connection::open(repo.catalog_path())
+        .unwrap()
+        .execute(
+            "INSERT INTO pack(id, size, sealed, blake3) VALUES (?1, ?2, 0, NULL)",
+            rusqlite::params![id.as_bytes().to_vec(), end as i64],
+        )
+        .unwrap();
+    // The final record's header breaks: without the old catalog this looks
+    // like a torn tail, but those bytes were committed.
+    flip(&repo, id, second + 54);
+
+    let report = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    assert!(!report.intact(), "{report:#?}");
+    assert_eq!(report.snapshots, vec![s]);
+    assert_eq!(report.unaccounted.len(), 1, "{:?}", report.unaccounted);
+    let r = &report.unaccounted[0];
+    assert_eq!((r.pack_id, r.start, r.end), (id, second, end));
+    assert!(report.torn_tails.is_empty(), "{:?}", report.torn_tails);
+}
+
+#[test]
+fn symlinked_shard_directory_is_followed() {
+    let (tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"f", b"body");
+    let s = ingest(&repo, &src);
+    let cat = catalog(&repo);
+    let record = cat.snapshot(s).unwrap().record_unit.unwrap();
+    let home = pack_path(&repo.packs_dir(), cat.unit(&record).unwrap().pack_id);
+    drop(cat);
+    let shard = home.parent().unwrap().to_path_buf();
+    let elsewhere = tmp.path().join("shard-elsewhere");
+    fs::rename(&shard, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &shard).unwrap();
+
+    let (_dest, report) = build(&repo);
+    assert!(report.intact(), "{report:#?}");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(report.snapshots, vec![s]);
 }
 
 #[test]
@@ -666,7 +788,12 @@ fn records_embedded_in_a_payload_are_not_units() {
     flip(&repo, id, victim_at + 10);
 
     let (dest, report) = build(&repo);
-    assert!(report.intact(), "{report:#?}");
+    // The victim had no other copy: its bytes are unaccounted.
+    assert!(!report.intact(), "{report:#?}");
+    assert_eq!(report.unaccounted.len(), 1, "{:?}", report.unaccounted);
+    let r = &report.unaccounted[0];
+    assert_eq!((r.pack_id, r.start, r.end), (id, victim_at, outer_at));
+    assert!(report.damaged.is_empty() && report.lost.is_empty());
     assert_eq!(report.snapshots, vec![s1]);
     assert_eq!(
         report.units,
@@ -1039,6 +1166,13 @@ fn stale_wal_without_main_file_is_kept_aside_not_replayed() {
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .unwrap();
     assert_eq!(check, "ok");
+    // A replayed WAL would bring back its in_progress row.
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(count("SELECT count(*) FROM snapshot"), 2);
+    assert_eq!(
+        count("SELECT count(*) FROM snapshot WHERE status = 'in_progress'"),
+        0
+    );
     let kept: Vec<_> = fs::read_dir(&repo.root)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1046,6 +1180,11 @@ fn stale_wal_without_main_file_is_kept_aside_not_replayed() {
         .collect();
     assert_eq!(kept.len(), 1, "{kept:?}");
     assert_eq!(fs::read(repo.root.join(&kept[0])).unwrap(), wal);
+    assert!(
+        report.warnings.iter().any(|w| w.contains(&kept[0])),
+        "{:?}",
+        report.warnings
+    );
 }
 
 #[test]

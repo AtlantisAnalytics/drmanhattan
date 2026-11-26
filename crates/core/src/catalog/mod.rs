@@ -192,6 +192,31 @@ impl Catalog {
         Ok(cat)
     }
 
+    /// Whether `path` holds no catalog that `open` would keep: the file is
+    /// missing, empty, or a SQLite database with no schema (user_version 0
+    /// and no tables), where `open` would create a fresh, empty catalog.
+    /// A file that cannot be read as SQLite is not blank: `open` fails on it.
+    pub fn is_blank(path: &Path) -> Result<bool> {
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => return Err(Error::io(path, e)),
+            Ok(m) if m.len() == 0 => return Ok(true),
+            Ok(_) => {}
+        }
+        let blank = (|| -> rusqlite::Result<bool> {
+            let conn = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            conn.busy_timeout(BUSY_TIMEOUT)?;
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            let tables: i64 =
+                conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+            Ok(version == 0 && tables == 0)
+        })();
+        Ok(blank.unwrap_or(false))
+    }
+
     /// Open an existing catalog read-only.
     pub fn open_readonly(path: &Path) -> Result<Catalog> {
         let conn = Connection::open_with_flags(

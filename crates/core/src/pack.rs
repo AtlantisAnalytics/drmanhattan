@@ -560,6 +560,7 @@ const SCAN_BLOCK: usize = 1 << 20;
 
 /// Result of `salvage`: every record of a pack whose header still validates.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Salvage {
     /// From the file header; None if the header is unreadable (file skipped).
     pub id: Option<Id>,
@@ -576,6 +577,10 @@ pub struct Salvage {
     pub data_end: u64,
     /// Greatest end offset of any candidate (26 if none).
     pub valid_end: u64,
+    /// `(offset, unit hash)` of every entry in a consistent footer's index,
+    /// in index order; empty without one. Whether each entry names a valid
+    /// record is reported in `problems`.
+    pub index: Vec<(u64, Hash32)>,
     /// Structural problems only: unreadable header, id/name mismatch,
     /// unsupported kinds, index entries without a valid record, an
     /// inconsistent footer, a footer hash mismatch. Damage is not judged here.
@@ -595,6 +600,7 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
         sealed_blake3: None,
         data_end: FILE_HEADER_LEN,
         valid_end: FILE_HEADER_LEN,
+        index: Vec::new(),
         problems: Vec::new(),
     };
     let unreadable = |out: &mut Salvage, why: String| {
@@ -720,6 +726,9 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
         for i in 0..count as usize {
             let e = &index[8 + 40 * i..8 + 40 * (i + 1)];
             let off = u64_at(e, 32);
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&e[..32]);
+            out.index.push((off, Hash32(hash)));
             let ok = out
                 .records
                 .binary_search_by_key(&off, |(o, _)| *o)
@@ -746,6 +755,7 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
 
 /// Byte ranges of a pack's data region not covered by verified records.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Gaps {
     /// Uncovered `[start, end)` ranges: damage.
     pub damaged: Vec<(u64, u64)>,

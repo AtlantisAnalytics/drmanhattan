@@ -34,7 +34,7 @@ use crate::sniff::{image_dims, Format, SNIFF_LEN};
 use crate::unitread::UnitReader;
 use crate::verify::worker_count;
 use rusqlite::Connection;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -46,6 +46,7 @@ pub struct RecoverOptions {
 
 /// A recovered snapshot whose files are not all intact.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DamagedSnapshot {
     pub id: Id,
     /// Paths of the file entries whose content lost units, sorted bytewise.
@@ -54,6 +55,7 @@ pub struct DamagedSnapshot {
 
 /// A `snapshot_record` unit whose snapshot could not be rebuilt.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LostRecord {
     pub unit: Hash32,
     /// The snapshot, when the record's index unit names it.
@@ -61,7 +63,31 @@ pub struct LostRecord {
     pub why: String,
 }
 
+/// Damaged pack bytes `[start, end)` that hold no record recover could even
+/// try (no valid record header), and that may have held data: what they
+/// held, a snapshot record included, is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UnaccountedRange {
+    pub pack: PathBuf,
+    pub pack_id: Id,
+    pub start: u64,
+    pub end: u64,
+}
+
+/// The end `[start, end)` of an unsealed pack after its last intact record:
+/// an unfinished write, ignored and left in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TornTail {
+    pub pack: PathBuf,
+    pub pack_id: Id,
+    pub start: u64,
+    pub end: u64,
+}
+
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RecoverReport {
     /// Pack files given a `pack` row.
     pub packs: u64,
@@ -73,6 +99,12 @@ pub struct RecoverReport {
     pub snapshots: Vec<Id>,
     pub damaged: Vec<DamagedSnapshot>,
     pub lost: Vec<LostRecord>,
+    /// Damaged bytes that may have held a unit or snapshot record that
+    /// nothing else accounts for, in pack path and offset order.
+    pub unaccounted: Vec<UnaccountedRange>,
+    /// Unfinished writes ignored at the end of unsealed packs (information:
+    /// a crash leaves these, and they cost nothing).
+    pub torn_tails: Vec<TornTail>,
     /// Problems that cost no file.
     pub warnings: Vec<String>,
     /// Snapshots the old catalog held that were not recovered (filled by
@@ -84,9 +116,10 @@ pub struct RecoverReport {
 }
 
 impl RecoverReport {
-    /// Every recovered snapshot is intact and no snapshot record was lost.
+    /// Every recovered snapshot is intact, no snapshot record was lost, and
+    /// no damaged bytes could have held one.
     pub fn intact(&self) -> bool {
-        self.damaged.is_empty() && self.lost.is_empty()
+        self.damaged.is_empty() && self.lost.is_empty() && self.unaccounted.is_empty()
     }
 }
 
@@ -106,6 +139,17 @@ const MEDIA_FORMATS: [Format; 5] = [
 /// On `Err`, `dest` may exist, partly written and unchecked: the caller
 /// must delete it (and its `-wal` / `-shm`) and must not use it.
 pub fn build(repo: &Repo, dest: &Path, opts: &RecoverOptions) -> Result<RecoverReport> {
+    build_with(repo, dest, opts, &HashMap::new())
+}
+
+/// `build`, knowing each pack's size in the previous catalog (`old_sizes`,
+/// possibly empty): an unsealed pack's bytes below it were committed.
+fn build_with(
+    repo: &Repo,
+    dest: &Path,
+    opts: &RecoverOptions,
+    old_sizes: &HashMap<Id, u64>,
+) -> Result<RecoverReport> {
     let start = Instant::now();
     check_dest(repo, dest)?;
     let mut report = RecoverReport::default();
@@ -116,11 +160,14 @@ pub fn build(repo: &Repo, dest: &Path, opts: &RecoverOptions) -> Result<RecoverR
         &cat,
         &packs,
         worker_count(opts.workers),
+        old_sizes,
         &mut report.warnings,
     )?;
     report.packs = scanned.packs;
     report.units = scanned.units;
     report.bytes_read = scanned.bytes_read;
+    report.unaccounted = scanned.unaccounted;
+    report.torn_tails = scanned.torn_tails;
     for (unit, why) in scanned.lost_records {
         report.lost.push(LostRecord {
             unit,
@@ -161,16 +208,16 @@ pub fn run(repo: &Repo, opts: &RecoverOptions) -> Result<RecoverReport> {
     repo.sweep_tmp()?;
     let tmp_dir = repo.tmp_dir();
     sweep_stale_catalogs(&tmp_dir)?;
-    let old_ids = old_snapshot_ids(&repo.catalog_path());
+    let (old_ids, old_sizes) = read_old(&repo.catalog_path());
 
     std::fs::create_dir_all(&tmp_dir).map_err(|e| Error::io(&tmp_dir, e))?;
     let tmp = tmp_dir.join(format!("recover-{}.sqlite", uuid::Uuid::now_v7()));
-    let built = build(repo, &tmp, opts).and_then(|report| {
+    let built = build_with(repo, &tmp, opts, &old_sizes).and_then(|report| {
         // Only now: a failed build must not have touched the old catalog.
         checkpoint_old(&repo.catalog_path());
         Ok((swap_in(repo, &tmp)?, report))
     });
-    let ((old_catalog, warning), mut report) = match built {
+    let ((old_catalog, warnings), mut report) = match built {
         Ok(v) => v,
         Err(e) => {
             remove_sqlite_files(&tmp);
@@ -178,7 +225,7 @@ pub fn run(repo: &Repo, opts: &RecoverOptions) -> Result<RecoverReport> {
         }
     };
     report.old_catalog = old_catalog;
-    report.warnings.extend(warning);
+    report.warnings.extend(warnings);
     report.not_recovered = old_ids
         .into_iter()
         .filter(|id| !report.snapshots.contains(id))
@@ -196,7 +243,8 @@ pub fn run(repo: &Repo, opts: &RecoverOptions) -> Result<RecoverReport> {
 }
 
 /// Delete `recover-*.sqlite` (and sidecars) left in `tmp/` by a crashed run.
-fn sweep_stale_catalogs(dir: &Path) -> Result<()> {
+/// The caller must hold the writer lock.
+pub(crate) fn sweep_stale_catalogs(dir: &Path) -> Result<()> {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -217,15 +265,31 @@ fn sweep_stale_catalogs(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Snapshot ids in the old catalog, or none when it cannot be read.
-fn old_snapshot_ids(path: &Path) -> Vec<Id> {
+/// Snapshot ids and pack sizes in the old catalog, best effort: each is
+/// empty when it cannot be read.
+fn read_old(path: &Path) -> (Vec<Id>, HashMap<Id, u64>) {
     if !path.exists() {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     }
-    match Catalog::open_readonly(path).and_then(|c| c.snapshots()) {
+    let Ok(cat) = Catalog::open_readonly(path) else {
+        return (Vec::new(), HashMap::new());
+    };
+    let ids = match cat.snapshots() {
         Ok(rows) => rows.into_iter().map(|r| r.id).collect(),
         Err(_) => Vec::new(),
-    }
+    };
+    let sizes = (|| -> Result<HashMap<Id, u64>> {
+        let mut stmt = cat.conn.prepare("SELECT id, size FROM pack")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (id, size) = row?;
+            out.insert(id, u64::try_from(size).unwrap_or(0));
+        }
+        Ok(out)
+    })()
+    .unwrap_or_default();
+    (ids, sizes)
 }
 
 /// Fold the old catalog's WAL into it, best effort; never creates the file.
@@ -257,12 +321,13 @@ const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 /// Preserve whatever is left of the old catalog and rename `tmp` over
 /// `catalog.sqlite`. Returns the backup path (`None` when there was no
-/// `catalog.sqlite`) and a warning if the directory fsync failed.
+/// `catalog.sqlite`) and warnings: sidecars kept aside without a main file,
+/// and a failed directory fsync.
 ///
 /// Every old sidecar is moved aside, even with no main file: a stale `-wal`
 /// beside the new catalog would be replayed into it. On error before the
 /// rename, everything is put back.
-fn swap_in(repo: &Repo, tmp: &Path) -> Result<(Option<PathBuf>, Option<String>)> {
+fn swap_in(repo: &Repo, tmp: &Path) -> Result<(Option<PathBuf>, Vec<String>)> {
     let cat = repo.catalog_path();
     let has_main = match std::fs::symlink_metadata(&cat) {
         Ok(_) => true,
@@ -316,19 +381,31 @@ fn swap_in(repo: &Repo, tmp: &Path) -> Result<(Option<PathBuf>, Option<String>)>
             ))
         });
     }
-    let warning = (|| -> Result<()> {
+    let mut warnings = Vec::new();
+    if let (Some(b), false) = (&base, has_main) {
+        let kept: Vec<String> = sidecars
+            .iter()
+            .map(|s| crate::display::display_path(&with_suffix(b, s)))
+            .collect();
+        warnings.push(format!(
+            "catalog.sqlite was missing but its leftover files were kept aside, unused: {}",
+            kept.join(", ")
+        ));
+    }
+    let synced = (|| -> Result<()> {
         fail::fail_point!("recover::after_rename", |_| Err(Error::io(
             &repo.root,
             std::io::Error::other("failpoint recover::after_rename")
         )));
         crate::pack::fsync_dir(&repo.root)
-    })()
-    .err()
-    .map(|e| {
-        format!("new catalog is in place but the repository directory could not be synced: {e}")
-    });
+    })();
+    if let Err(e) = synced {
+        warnings.push(format!(
+            "new catalog is in place but the repository directory could not be synced: {e}"
+        ));
+    }
     let backup = base.filter(|_| has_main);
-    Ok((backup, warning))
+    Ok((backup, warnings))
 }
 
 /// Pick the first `<cat>.pre-recover-<stamp>[-n]` whose name and sidecar

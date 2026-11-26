@@ -123,8 +123,11 @@ pub fn run(repo: &Repo, source: &Path, opts: &IngestOptions) -> Result<IngestRep
     let started = Instant::now();
     let _lock = repo.lock_writer()?;
     repo.sweep_tmp()?;
-    // Before anything opens or creates the catalog (including `mark_failed`).
-    if !repo.catalog_path().exists() && repo.has_packs()? {
+    crate::recover::sweep_stale_catalogs(&repo.tmp_dir())?;
+    // Before anything opens or creates the catalog (including `mark_failed`):
+    // a missing, empty or schema-less file would become a fresh catalog
+    // beside packs full of data.
+    if Catalog::is_blank(&repo.catalog_path())? && repo.has_packs()? {
         return Err(Error::CatalogMissing);
     }
     let source = canonical(source)?;

@@ -139,6 +139,90 @@ fn recover_json_lists_damaged_files() {
 }
 
 #[test]
+fn recover_with_a_broken_record_header_exits_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, _) = ingested(tmp.path());
+    std::fs::write(tmp.path().join("src/more.txt"), b"second ingest").unwrap();
+    wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .arg("ingest")
+        .arg(tmp.path().join("src"))
+        .assert()
+        .code(0);
+    // Break the header CRC of the newest snapshot's record (its only copy).
+    let conn = rusqlite::Connection::open(repo.join("catalog.sqlite")).unwrap();
+    let (pack_id, offset): (Vec<u8>, i64) = conn
+        .query_row(
+            "SELECT u.pack_id, u.pack_offset FROM snapshot s \
+             JOIN unit u ON u.hash = s.record_unit ORDER BY s.started_at DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    drop(conn);
+    let id = Id::from_bytes(pack_id.try_into().unwrap());
+    let path = pack_path(&repo.join("packs"), id);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[offset as usize + 54] ^= 0xFF;
+    std::fs::write(&path, bytes).unwrap();
+    remove_catalog(&repo);
+
+    wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .arg("recover")
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains(format!("bytes {offset}..")))
+        .stdout(predicate::str::contains("DAMAGED: 1 snapshots"));
+    remove_catalog(&repo);
+    let out = wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .args(["--json", "recover"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    let u = v["unaccounted"].as_array().unwrap();
+    assert_eq!(u.len(), 1, "{v}");
+    assert_eq!(u[0]["start"], offset);
+    assert_eq!(u[0]["pack_id"], id.to_string());
+}
+
+#[test]
+fn cat_of_a_damaged_content_exits_2_without_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, _) = ingested(tmp.path());
+    let hash: String = rusqlite::Connection::open(repo.join("catalog.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT lower(hex(content_hash)) FROM entry \
+             WHERE path = CAST('d/noise.bin' AS BLOB)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    damage_noise(&repo);
+    wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .arg("recover")
+        .assert()
+        .code(2);
+    wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .args(["cat", &hash])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("missing 1 of"));
+}
+
+#[test]
 fn ingest_without_catalog_suggests_recover() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, _) = ingested(tmp.path());
