@@ -530,3 +530,30 @@ fn reingest_heals_an_incomplete_content() {
     .unwrap();
     assert_eq!(manifest_dir(&dest, &mopts()).unwrap().core, live.core);
 }
+
+#[test]
+fn large_record_streams_across_chunks() {
+    use drmanhattan_core::ingest::record::{record_chunks, stream_record, RecordItem};
+    use drmanhattan_core::unitread::{UnitReader, DEFAULT_CACHE_BYTES};
+
+    let (_tmp, repo, src) = setup();
+    for i in 0..10_000 {
+        std::fs::write(src.join(format!("{i:05}-{}", "n".repeat(200))), b"x").unwrap();
+    }
+    let r = ingest(&repo, &src);
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    let unit = cat.snapshot(r.snapshot).unwrap().record_unit.unwrap();
+    let reader = UnitReader::new(&repo, DEFAULT_CACHE_BYTES);
+    assert!(record_chunks(&reader, &cat, &unit).unwrap().len() > 1);
+
+    let mut entries = 0;
+    let header = stream_record(&reader, &cat, &unit, |item| {
+        if matches!(item, RecordItem::Entry(_)) {
+            entries += 1;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(header.id, r.snapshot);
+    assert_eq!(entries, 10_001);
+}
