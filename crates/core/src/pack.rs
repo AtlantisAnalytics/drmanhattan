@@ -390,21 +390,57 @@ impl PackReader {
         pos: u64,
         limit: u64,
     ) -> Result<std::result::Result<RecordHeader, String>> {
+        match self.parse_record_classified(pos, limit)? {
+            Ok(h) => Ok(Ok(h)),
+            Err(HeaderError::Invalid(why)) => Ok(Err(why)),
+            Err(HeaderError::Unsupported(why)) => Err(self.corrupt(pos, why)),
+        }
+    }
+
+    /// Like `parse_record_at`, but an unsupported kind or compression is
+    /// reported in the inner `Err` rather than as an outer error.
+    fn parse_record_classified(
+        &self,
+        pos: u64,
+        limit: u64,
+    ) -> Result<std::result::Result<RecordHeader, HeaderError>> {
         let body = pos + RECORD_HEADER_LEN as u64;
         if body > limit {
-            return Ok(Err("truncated record header".into()));
+            return Ok(Err(HeaderError::Invalid("truncated record header".into())));
         }
         let mut hb = [0u8; RECORD_HEADER_LEN];
         self.read_exact_at(&mut hb, pos)?;
         let h = match decode_record_header(&hb) {
             Ok(h) => h,
-            Err(HeaderError::Invalid(why)) => return Ok(Err(why)),
-            Err(HeaderError::Unsupported(why)) => return Err(self.corrupt(pos, why)),
+            Err(e) => return Ok(Err(e)),
         };
         if body.checked_add(h.stored_len).is_none_or(|end| end > limit) {
-            return Ok(Err("payload extends past end of data".into()));
+            return Ok(Err(HeaderError::Invalid(
+                "payload extends past end of data".into(),
+            )));
         }
         Ok(Ok(h))
+    }
+
+    /// Offset of the first record marker in `[from, limit)`, reading in
+    /// `SCAN_BLOCK` blocks that overlap by the marker length minus one so a
+    /// marker straddling a block edge is still found.
+    fn find_marker(&self, from: u64, limit: u64) -> Result<Option<u64>> {
+        let marker = RECORD_MARKER.to_le_bytes();
+        let mut buf = vec![0u8; SCAN_BLOCK];
+        let mut at = from;
+        while at + marker.len() as u64 <= limit {
+            let want = buf.len().min((limit - at) as usize);
+            self.read_exact_at(&mut buf[..want], at)?;
+            if let Some(i) = buf[..want].windows(marker.len()).position(|w| w == marker) {
+                return Ok(Some(at + i as u64));
+            }
+            if at + want as u64 >= limit {
+                break;
+            }
+            at += (want - (marker.len() - 1)) as u64;
+        }
+        Ok(None)
     }
 
     /// Read and validate the record header at `offset`, without reading its
@@ -512,6 +548,134 @@ impl PackReader {
     }
 }
 
+/// Block size for the salvage resync search.
+const SCAN_BLOCK: usize = 1 << 20;
+
+/// Result of `salvage`: every record of a pack whose header still validates.
+#[derive(Debug)]
+pub struct Salvage {
+    /// From the file header; None if the header is unreadable (file skipped).
+    pub id: Option<Id>,
+    /// (offset, header) of every record whose header validates, in offset order.
+    pub records: Vec<(u64, RecordHeader)>,
+    /// Consistent end-anchored footer whose BLAKE3 matches the bytes before it.
+    pub sealed_blake3: Option<Hash32>,
+    /// End of the last valid record (the pack row's size when not sealed).
+    pub valid_end: u64,
+    /// Human-readable problems: bad magic/format, id/name mismatch,
+    /// damaged ranges, unsupported kinds, failing index entries, footer mismatch.
+    pub problems: Vec<String>,
+}
+
+/// Find every record in a pack that still validates, resynchronising on the
+/// record marker after damage. Headers (marker, CRC, size invariants, payload
+/// fits) are validated, payloads are not read. Errs only on I/O errors.
+pub fn salvage(path: &Path) -> Result<Salvage> {
+    let shown = display_path(path);
+    let r = PackReader::open(path)?;
+    let mut out = Salvage {
+        id: None,
+        records: Vec::new(),
+        sealed_blake3: None,
+        valid_end: FILE_HEADER_LEN,
+        problems: Vec::new(),
+    };
+    let unreadable = |out: &mut Salvage, why: String| {
+        out.problems
+            .push(format!("pack {shown}: {why}; skipping file"));
+    };
+    if r.len < FILE_HEADER_LEN {
+        unreadable(&mut out, "file shorter than pack header".into());
+        return Ok(out);
+    }
+    let mut fh = [0u8; FILE_HEADER_LEN as usize];
+    r.read_exact_at(&mut fh, 0)?;
+    if &fh[0..8] != FILE_MAGIC {
+        unreadable(&mut out, "bad pack magic".into());
+        return Ok(out);
+    }
+    let format = u16::from_le_bytes([fh[8], fh[9]]);
+    if format != FORMAT {
+        unreadable(&mut out, format!("unsupported pack format {format}"));
+        return Ok(out);
+    }
+    let mut idb = [0u8; 16];
+    idb.copy_from_slice(&fh[10..26]);
+    let id = Id::from_bytes(idb);
+    out.id = Some(id);
+    if path.file_stem().and_then(|s| s.to_str()) != Some(id.to_string().as_str()) {
+        out.problems.push(format!(
+            "pack {shown}: header id {id} does not match the file name"
+        ));
+    }
+
+    let footer = r.find_footer()?;
+    let data_end = footer.map_or(r.len, |(off, _)| off);
+
+    let mut pos = FILE_HEADER_LEN;
+    // Start of the damaged range being skipped, if any.
+    let mut damage: Option<u64> = None;
+    let close_damage = |damage: &mut Option<u64>, end: u64, problems: &mut Vec<String>| {
+        if let Some(start) = damage.take() {
+            problems.push(format!(
+                "pack {shown}: damaged range at offset {start}..{end}"
+            ));
+        }
+    };
+    while pos < data_end {
+        match r.parse_record_classified(pos, data_end)? {
+            Ok(h) => {
+                close_damage(&mut damage, pos, &mut out.problems);
+                out.records.push((pos, h));
+                pos += RECORD_HEADER_LEN as u64 + h.stored_len;
+                out.valid_end = pos;
+            }
+            Err(HeaderError::Unsupported(why)) => {
+                close_damage(&mut damage, pos, &mut out.problems);
+                out.problems
+                    .push(format!("pack {shown} at offset {pos}: {why}; skipped"));
+                pos = r
+                    .find_marker(pos + RECORD_HEADER_LEN as u64, data_end)?
+                    .unwrap_or(data_end);
+            }
+            Err(HeaderError::Invalid(_)) => {
+                damage.get_or_insert(pos);
+                pos = r.find_marker(pos + 1, data_end)?.unwrap_or(data_end);
+            }
+        }
+    }
+    close_damage(&mut damage, data_end, &mut out.problems);
+
+    if let Some((footer_offset, count)) = footer {
+        let mut index = vec![0u8; (r.len - footer_offset) as usize];
+        r.read_exact_at(&mut index, footer_offset)?;
+        for i in 0..count as usize {
+            let e = &index[8 + 40 * i..8 + 40 * (i + 1)];
+            let off = u64_at(e, 32);
+            let ok = out
+                .records
+                .binary_search_by_key(&off, |(o, _)| *o)
+                .is_ok_and(|k| out.records[k].1.unit_hash.0[..] == e[..32]);
+            if !ok {
+                out.problems.push(format!(
+                    "pack {shown}: index entry for offset {off} has no valid record"
+                ));
+            }
+        }
+        let at = 8 + 40 * count as usize;
+        let mut stored = [0u8; 32];
+        stored.copy_from_slice(&index[at..at + 32]);
+        if r.hash_prefix(footer_offset)?.0 == stored {
+            out.sealed_blake3 = Some(Hash32(stored));
+        } else {
+            out.problems.push(format!(
+                "pack {shown}: footer BLAKE3 does not match the pack contents"
+            ));
+        }
+    }
+    Ok(out)
+}
+
 /// Scan a pack. A pack ending in a consistent end-anchored footer is sealed:
 /// each indexed record is validated individually and damage is reported in
 /// `damaged`. Otherwise it is unsealed and parsing stops at the first torn or
@@ -596,4 +760,180 @@ pub fn scan(path: &Path) -> Result<PackScan> {
         damaged,
         index_ok,
     })
+}
+
+#[cfg(test)]
+mod salvage_tests {
+    use super::*;
+
+    fn raw(payload: &[u8]) -> (RecordHeader, Vec<u8>) {
+        (
+            RecordHeader {
+                kind: UnitKind::RawChunk,
+                compression: Compression::None,
+                unit_hash: Hash32::of(payload),
+                raw_len: payload.len() as u64,
+                stored_len: payload.len() as u64,
+            },
+            payload.to_vec(),
+        )
+    }
+
+    /// A pack of five records; returns its path, id and record offsets.
+    fn build(dir: &Path, seal: bool) -> (PathBuf, Id, Vec<u64>) {
+        let id = Id::new_v7();
+        let mut w = PackWriter::create(dir, id).unwrap();
+        let mut offs = Vec::new();
+        for i in 0..5u8 {
+            let (h, p) = raw(&vec![i + 1; 100 + i as usize]);
+            offs.push(w.append(&h, &p).unwrap());
+        }
+        if seal {
+            w.seal().unwrap();
+        } else {
+            w.sync().unwrap();
+        }
+        (pack_path(dir, id), id, offs)
+    }
+
+    fn corrupt_crc(path: &Path, record_offset: u64) {
+        let mut b = std::fs::read(path).unwrap();
+        b[record_offset as usize + 54] ^= 0xFF;
+        std::fs::write(path, b).unwrap();
+    }
+
+    fn found(s: &Salvage) -> Vec<u64> {
+        s.records.iter().map(|(o, _)| *o).collect()
+    }
+
+    #[test]
+    fn salvage_intact_sealed_pack_matches_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, id, _) = build(tmp.path(), true);
+        let s = salvage(&path).unwrap();
+        let sc = scan(&path).unwrap();
+        assert_eq!(s.id, Some(id));
+        assert_eq!(s.records, sc.records);
+        let bytes = std::fs::read(&path).unwrap();
+        let stored = Hash32(
+            bytes[bytes.len() - 48..bytes.len() - 16]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(s.sealed_blake3, Some(stored));
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+    }
+
+    #[test]
+    fn salvage_finds_records_after_mid_pack_damage_unsealed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, _, offs) = build(tmp.path(), false);
+        corrupt_crc(&path, offs[2]);
+        let s = salvage(&path).unwrap();
+        assert_eq!(found(&s), vec![offs[0], offs[1], offs[3], offs[4]]);
+        assert_eq!(s.problems.len(), 1, "{:?}", s.problems);
+        assert_eq!(s.sealed_blake3, None);
+    }
+
+    #[test]
+    fn salvage_finds_records_after_mid_pack_damage_sealed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, _, offs) = build(tmp.path(), true);
+        corrupt_crc(&path, offs[2]);
+        let s = salvage(&path).unwrap();
+        assert_eq!(found(&s), vec![offs[0], offs[1], offs[3], offs[4]]);
+        assert_eq!(s.sealed_blake3, None);
+        assert!(!s.problems.is_empty());
+    }
+
+    #[test]
+    fn salvage_skips_unknown_kind_with_valid_crc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Id::new_v7();
+        let mut w = PackWriter::create(tmp.path(), id).unwrap();
+        let (h, p) = raw(b"first");
+        let o1 = w.append(&h, &p).unwrap();
+        w.sync().unwrap();
+        let path = pack_path(tmp.path(), id);
+        drop(w);
+        let (h2, p2) = raw(b"second");
+        let mut bad = encode_record_header(&h2);
+        bad[4] = 9;
+        let crc = crc32c::crc32c(&bad[4..4 + CRC_SPAN]);
+        bad[54..58].copy_from_slice(&crc.to_le_bytes());
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&bad).unwrap();
+        f.write_all(&p2).unwrap();
+        let o3 = std::fs::metadata(&path).unwrap().len();
+        f.write_all(&encode_record_header(&h2)).unwrap();
+        f.write_all(&p2).unwrap();
+        let s = salvage(&path).unwrap();
+        assert_eq!(found(&s), vec![o1, o3]);
+        assert_eq!(s.problems.len(), 1, "{:?}", s.problems);
+        assert!(s.problems[0].contains("kind 9"), "{:?}", s.problems);
+    }
+
+    #[test]
+    fn salvage_torn_tail_sets_valid_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, _, offs) = build(tmp.path(), false);
+        let end = std::fs::metadata(&path).unwrap().len();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&[0xAB; 30]).unwrap();
+        let s = salvage(&path).unwrap();
+        assert_eq!(found(&s).len(), offs.len());
+        assert_eq!(s.valid_end, end);
+    }
+
+    #[test]
+    fn salvage_reports_id_name_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, id, offs) = build(tmp.path(), true);
+        let other = tmp.path().join(format!("{}.pack", Id::new_v7()));
+        std::fs::rename(&path, &other).unwrap();
+        let s = salvage(&other).unwrap();
+        assert_eq!(s.id, Some(id));
+        assert_eq!(found(&s).len(), offs.len());
+        assert!(
+            s.problems.iter().any(|p| p.contains("name")),
+            "{:?}",
+            s.problems
+        );
+    }
+
+    #[test]
+    fn salvage_bad_magic_skips_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, _, _) = build(tmp.path(), false);
+        let mut b = std::fs::read(&path).unwrap();
+        b[0] ^= 0xFF;
+        std::fs::write(&path, b).unwrap();
+        let s = salvage(&path).unwrap();
+        assert_eq!(s.id, None);
+        assert!(s.records.is_empty());
+        assert_eq!(s.problems.len(), 1);
+    }
+
+    #[test]
+    fn salvage_resyncs_across_block_boundary() {
+        // A damaged record whose payload embeds a valid record whose marker
+        // straddles the end of the first SCAN_BLOCK-byte search block.
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Id::new_v7();
+        let mut w = PackWriter::create(tmp.path(), id).unwrap();
+        let (h, p) = raw(b"a");
+        let oa = w.append(&h, &p).unwrap();
+        let damaged_at = w.len();
+        let (hz, pz) = raw(b"z");
+        let mut payload = vec![0u8; SCAN_BLOCK - 59];
+        payload.extend_from_slice(&encode_record_header(&hz));
+        payload.extend_from_slice(&pz);
+        let (ho, po) = raw(&payload);
+        w.append(&ho, &po).unwrap();
+        w.sync().unwrap();
+        let path = pack_path(tmp.path(), id);
+        corrupt_crc(&path, damaged_at);
+        let s = salvage(&path).unwrap();
+        assert_eq!(found(&s), vec![oa, damaged_at + SCAN_BLOCK as u64 - 1]);
+    }
 }
