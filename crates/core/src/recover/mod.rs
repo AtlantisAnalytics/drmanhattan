@@ -104,10 +104,10 @@ const MEDIA_FORMATS: [Format; 5] = [
 pub fn build(repo: &Repo, dest: &Path, opts: &RecoverOptions) -> Result<RecoverReport> {
     let start = Instant::now();
     check_dest(repo, dest)?;
-    let cat = Catalog::open(dest)?;
     let mut report = RecoverReport::default();
-
+    // Before `dest` is created: a misplaced pack stops recover outright.
     let packs = scan::list_packs(&repo.packs_dir(), &mut report.warnings)?;
+    let cat = Catalog::open(dest)?;
     let scanned = scan::scan(
         &cat,
         &packs,
@@ -282,11 +282,22 @@ fn insert_item(cat: &Catalog, unit: Hash32, item: RecordItem) -> Result<()> {
 /// another snapshot already inserted keeps that snapshot's unit list.
 fn insert_content(cat: &Catalog, c: ContentRow, units: &[Hash32]) -> Result<()> {
     let conn = &cat.conn;
-    let hash = c.hash;
-    apply(conn, CatalogOp::InsertContent(c, Vec::new()))?;
-    if conn.changes() == 0 {
+    let inserted = conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO content(hash, size, format, profile, unit_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?
+        .execute(rusqlite::params![
+            c.hash,
+            c.size,
+            c.format.map(|f| f.as_str()),
+            c.profile.as_str(),
+            c.unit_count,
+        ])?;
+    if inserted == 0 {
         return Ok(());
     }
+    let hash = c.hash;
     let mut stmt = conn.prepare_cached(
         "INSERT INTO content_unit(content_hash, seq, unit_hash) VALUES (?1, ?2, ?3)",
     )?;

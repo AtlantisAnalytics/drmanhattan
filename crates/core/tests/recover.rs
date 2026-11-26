@@ -494,16 +494,13 @@ fn corrupt_record_unit_is_reported_lost() {
     assert_eq!(report.snapshots, vec![s2]);
 }
 
-#[test]
-fn two_records_for_one_snapshot_are_both_lost() {
-    let (_tmp, repo, src) = setup();
-    TreeBuilder::new(&src).file(b"f", b"body");
-    let s1 = ingest(&repo, &src);
-    TreeBuilder::new(&src).file(b"g", b"more");
-    let s2 = ingest(&repo, &src);
-    // A second, different index unit naming the same snapshot.
-    let cat = catalog(&repo);
-    let record = cat.snapshot(s1).unwrap().record_unit.unwrap();
+/// Store, in a new sealed pack, a second index unit for `snapshot`'s record:
+/// the same chunks, but a `document_size` one byte too large, so replaying
+/// it inserts every row and then fails the final size check. Returns the
+/// original index unit and the variant's hash.
+fn store_size_variant(repo: &Repo, snapshot: Id) -> (Hash32, Hash32) {
+    let cat = catalog(repo);
+    let record = cat.snapshot(snapshot).unwrap().record_unit.unwrap();
     let row = cat.unit(&record).unwrap();
     drop(cat);
     let raw = PackReader::open(&pack_path(&repo.packs_dir(), row.pack_id))
@@ -532,11 +529,22 @@ fn two_records_for_one_snapshot_are_both_lost() {
     let mut w = PackWriter::create(&repo.packs_dir(), Id::new_v7()).unwrap();
     w.append(&header, &other).unwrap();
     w.seal().unwrap();
+    (record, header.unit_hash)
+}
+
+#[test]
+fn two_records_for_one_snapshot_are_both_lost() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"f", b"body");
+    let s1 = ingest(&repo, &src);
+    TreeBuilder::new(&src).file(b"g", b"more");
+    let s2 = ingest(&repo, &src);
+    let (record, variant) = store_size_variant(&repo, s1);
 
     let (dest, report) = build(&repo);
     let mut lost: Vec<_> = report.lost.iter().map(|l| (l.unit, l.snapshot)).collect();
     lost.sort();
-    let mut want = vec![(record, Some(s1)), (header.unit_hash, Some(s1))];
+    let mut want = vec![(record, Some(s1)), (variant, Some(s1))];
     want.sort();
     assert_eq!(lost, want, "{:?}", report.lost);
     assert!(report
@@ -545,4 +553,207 @@ fn two_records_for_one_snapshot_are_both_lost() {
         .all(|l| l.why.contains("different records")));
     assert_eq!(report.snapshots, vec![s2]);
     assert!(Catalog::open_readonly(&dest).unwrap().snapshot(s1).is_err());
+}
+
+/// `x'<hex>'` for an id or hash, for SQL in `table_rows`.
+fn sql_blob(bytes: &[u8]) -> String {
+    format!("x'{}'", hex::encode(bytes))
+}
+
+#[test]
+fn record_failing_after_its_rows_leaves_none_behind() {
+    let (_tmp, repo, src) = setup();
+    let mut t = TreeBuilder::new(&src);
+    t.file(b"unique.bin", &random(5, 120_000)).dir(b"d");
+    let has_xattr = match xattr::set(src.join("unique.bin"), XATTR, b"v") {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("xattrs unsupported here: {e}");
+            false
+        }
+    };
+    let s1 = ingest(&repo, &src);
+    fs::remove_file(src.join("unique.bin")).unwrap();
+    t.file(b"other", b"s2 only");
+    let s2 = ingest(&repo, &src);
+    let orig = repo.catalog_path();
+    let content = catalog(&repo)
+        .entry_by_path(s1, b"unique.bin")
+        .unwrap()
+        .content_hash
+        .unwrap();
+    let s1_entries = format!(
+        "SELECT id FROM entry WHERE snapshot_id = {}",
+        sql_blob(s1.as_bytes())
+    );
+    let s1_xattrs = format!("SELECT * FROM xattr WHERE entry_id IN ({s1_entries})");
+    if has_xattr {
+        assert!(!table_rows(&orig, &s1_xattrs).is_empty());
+    }
+    // Only the variant is replayed: it inserts all of s1's rows, then fails.
+    let (record, variant) = store_size_variant(&repo, s1);
+    flip_unit(&repo, &record);
+
+    let (dest, report) = build(&repo);
+    let mut lost: Vec<_> = report.lost.iter().map(|l| (l.unit, l.snapshot)).collect();
+    lost.sort();
+    // The corrupt original is reported too, by unit (its index is unreadable).
+    let mut want = vec![(record, None), (variant, Some(s1))];
+    want.sort();
+    assert_eq!(lost, want, "{:?}", report.lost);
+    let why = &report.lost.iter().find(|l| l.unit == variant).unwrap().why;
+    assert!(why.contains("index says"), "{why}");
+    assert_eq!(report.snapshots, vec![s2]);
+
+    let c = sql_blob(&content.0);
+    let mut s1_rows = vec![
+        format!(
+            "SELECT * FROM snapshot WHERE id = {}",
+            sql_blob(s1.as_bytes())
+        ),
+        s1_entries,
+        format!("SELECT * FROM content WHERE hash = {c}"),
+        format!("SELECT * FROM content_unit WHERE content_hash = {c}"),
+    ];
+    if has_xattr {
+        s1_rows.push(s1_xattrs);
+    }
+    for sql in s1_rows {
+        assert!(!table_rows(&orig, &sql).is_empty(), "no such rows: {sql}");
+        assert!(table_rows(&dest, &sql).is_empty(), "rows remain: {sql}");
+    }
+}
+
+#[test]
+fn records_embedded_in_a_payload_are_not_units() {
+    let (tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"f", b"body");
+    let s1 = ingest(&repo, &src);
+    let units_before = catalog(&repo).stats().unwrap().units;
+
+    // Another repository's sealed pack, holding its snapshot record.
+    let other = Repo::init(&tmp.path().join("other")).unwrap();
+    let other_src = tmp.path().join("other_src");
+    TreeBuilder::new(&other_src).file(b"g", b"foreign file");
+    let foreign = ingest(&other, &other_src);
+    let foreign_record = catalog(&other)
+        .snapshot(foreign)
+        .unwrap()
+        .record_unit
+        .unwrap();
+    let foreign_pack = catalog(&other).unit(&foreign_record).unwrap().pack_id;
+    let inner = fs::read(pack_path(&other.packs_dir(), foreign_pack)).unwrap();
+
+    // A record whose header is then damaged (breaking the sequential
+    // parse), followed by an intact record whose payload is that pack.
+    let unit = |raw: &[u8]| RecordHeader {
+        kind: UnitKind::RawChunk,
+        compression: Compression::None,
+        unit_hash: Hash32::of(raw),
+        raw_len: raw.len() as u64,
+        stored_len: raw.len() as u64,
+    };
+    let victim = b"victim".to_vec();
+    let id = Id::new_v7();
+    let mut w = PackWriter::create(&repo.packs_dir(), id).unwrap();
+    let victim_at = w.append(&unit(&victim), &victim).unwrap();
+    let outer_at = w.append(&unit(&inner), &inner).unwrap();
+    w.seal().unwrap();
+    flip(&repo, id, victim_at + 10);
+
+    let (dest, report) = build(&repo);
+    assert!(report.intact(), "{report:#?}");
+    assert_eq!(report.snapshots, vec![s1]);
+    assert_eq!(
+        report.units,
+        units_before + 1,
+        "only the outer record is new"
+    );
+    let cat = Catalog::open_readonly(&dest).unwrap();
+    assert!(!cat.has_unit(&foreign_record).unwrap());
+    assert_eq!(
+        cat.unit(&Hash32::of(&inner)).unwrap().pack_offset as u64,
+        outer_at
+    );
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("no intact copy")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn misplaced_pack_is_an_error() {
+    let (tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"f", b"body");
+    let s = ingest(&repo, &src);
+    let cat = catalog(&repo);
+    let record = cat.snapshot(s).unwrap().record_unit.unwrap();
+    let home = pack_path(&repo.packs_dir(), cat.unit(&record).unwrap().pack_id);
+    drop(cat);
+    let name = home.file_name().unwrap().to_owned();
+    let dest = tmp.path().join("x.sqlite");
+    for wrong in [
+        repo.packs_dir().join(&name),
+        repo.packs_dir().join("zz").join(&name),
+    ] {
+        fs::create_dir_all(wrong.parent().unwrap()).unwrap();
+        fs::rename(&home, &wrong).unwrap();
+        let err = recover::build(&repo, &dest, &RecoverOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&wrong.display().to_string()), "{err}");
+        assert!(
+            err.contains(&format!("move it to {}", home.display())),
+            "{err}"
+        );
+        assert!(!dest.exists(), "nothing is built");
+        fs::rename(&wrong, &home).unwrap();
+    }
+    let (_dest, report) = build(&repo);
+    assert_eq!(report.snapshots, vec![s]);
+}
+
+#[test]
+fn bad_footer_hash_is_a_warning() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"f", &random(6, 40_000));
+    let s = ingest(&repo, &src);
+    let cat = catalog(&repo);
+    let record = cat.snapshot(s).unwrap().record_unit.unwrap();
+    let id = cat.unit(&record).unwrap().pack_id;
+    let units = cat.stats().unwrap().units;
+    drop(cat);
+    // End of the pack's last record: where its footer starts.
+    let data_end: i64 = rusqlite::Connection::open(repo.catalog_path())
+        .unwrap()
+        .query_row(
+            &format!(
+                "SELECT max(pack_offset + {RECORD_HEADER_LEN} + stored_size) FROM unit \
+                 WHERE pack_id = ?1"
+            ),
+            [id.as_bytes().to_vec()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let len = fs::metadata(pack_path(&repo.packs_dir(), id))
+        .unwrap()
+        .len();
+    // The stored BLAKE3 sits just before footer_offset (8) and the magic (8).
+    flip(&repo, id, len - 16 - 5);
+
+    let (dest, report) = build(&repo);
+    assert!(report.intact(), "{report:#?}");
+    assert_eq!(report.snapshots, vec![s]);
+    assert_eq!(report.units, units);
+    assert!(
+        report.warnings.iter().any(|w| w.contains("footer BLAKE3")),
+        "{:?}",
+        report.warnings
+    );
+    let p = Catalog::open_readonly(&dest).unwrap().pack(id).unwrap();
+    assert!(!p.sealed);
+    assert_eq!(p.blake3, None);
+    assert_eq!(p.size, data_end);
+    assert_eq!(status(&dest, s), "complete");
 }

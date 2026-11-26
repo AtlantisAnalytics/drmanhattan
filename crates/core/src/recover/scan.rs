@@ -54,33 +54,52 @@ enum Msg {
     Done(PackRow, u64),
 }
 
-/// Every pack file under `packs_dir`, in path order. Anything else there
-/// (stray files, misplaced or misnamed packs, whose units could not be
-/// located by id) is reported in `warnings` and ignored.
+/// Every pack file under `packs_dir`, in path order. Files not named like
+/// packs are reported in `warnings` and ignored. A file named like a pack
+/// but not at `pack_path` of its id (wrong shard, directly in `packs/`, a
+/// non-canonical spelling) is an error: its units could not be read by id,
+/// so a snapshot record in it would vanish, and recover never moves files.
 pub(super) fn list_packs(packs_dir: &Path, warnings: &mut Vec<String>) -> Result<Vec<PackFile>> {
     let mut out = Vec::new();
     for shard in sorted_dir(packs_dir)? {
-        if !is_dir(&shard)? {
-            warnings.push(format!(
-                "{}: not a pack file; ignored",
-                display_path(&shard)
-            ));
-            continue;
-        }
-        for path in sorted_dir(&shard)? {
-            let id = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix(".pack"))
-                .and_then(|stem| Id::parse(stem).ok())
-                .filter(|id| pack_path(packs_dir, *id) == path);
-            match id {
-                Some(id) if !is_dir(&path)? => out.push(PackFile { path, id }),
-                _ => warnings.push(format!("{}: not a pack file; ignored", display_path(&path))),
+        if is_dir(&shard)? {
+            for path in sorted_dir(&shard)? {
+                classify(packs_dir, path, &mut out, warnings)?;
             }
+        } else {
+            classify(packs_dir, shard, &mut out, warnings)?;
         }
     }
     Ok(out)
+}
+
+fn classify(
+    packs_dir: &Path,
+    path: PathBuf,
+    out: &mut Vec<PackFile>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let id = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".pack"))
+        .and_then(|stem| Id::parse(stem).ok());
+    match id {
+        Some(id) if !is_dir(&path)? => {
+            let home = pack_path(packs_dir, id);
+            if home != path {
+                return Err(Error::Corrupt(format!(
+                    "pack file {} is not where its name places it; move it to {} and run \
+                     recover again",
+                    display_path(&path),
+                    display_path(&home)
+                )));
+            }
+            out.push(PackFile { path, id });
+        }
+        _ => warnings.push(format!("{}: not a pack file; ignored", display_path(&path))),
+    }
+    Ok(())
 }
 
 fn sorted_dir(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -253,13 +272,20 @@ fn scan_pack(p: &PackFile, tx: &Sender<Msg>) -> Result<()> {
 
     let reader = PackReader::open(&p.path)?;
     let mut verified: Vec<(u64, u64)> = Vec::new();
-    let mut end = PACK_HEADER_LEN;
+    // End of the verified spans so far. Genuine records never overlap and
+    // candidates come in offset order, so a candidate starting inside a
+    // verified record is a header embedded in its payload (a pack file
+    // stored uncompressed, say): never a unit of this pack, intact or not.
+    let mut covered_end = PACK_HEADER_LEN;
     for (offset, h) in &s.records {
+        if *offset < covered_end {
+            continue;
+        }
         match reader.read_unit(*offset, &h.unit_hash) {
             Ok(_) => {
                 let span = RECORD_HEADER_LEN as u64 + h.stored_len;
                 verified.push((*offset, span));
-                end = end.max(offset + span);
+                covered_end = offset + span;
                 let row = UnitRow {
                     hash: h.unit_hash,
                     kind: h.kind,
@@ -298,7 +324,7 @@ fn scan_pack(p: &PackFile, tx: &Sender<Msg>) -> Result<()> {
         },
         None => PackRow {
             id: p.id,
-            size: to_i64(end, "pack size")?,
+            size: to_i64(covered_end, "pack size")?,
             sealed: false,
             blake3: None,
         },
