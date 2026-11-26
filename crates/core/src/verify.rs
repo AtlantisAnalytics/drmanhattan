@@ -58,7 +58,7 @@ pub struct VerifyOptions {
 }
 
 /// Content-reading threads for `n`; 0 means one per available CPU.
-fn worker_count(n: usize) -> usize {
+pub(crate) fn worker_count(n: usize) -> usize {
     match n {
         0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
         n => n,

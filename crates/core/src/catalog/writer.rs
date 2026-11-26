@@ -99,7 +99,9 @@ fn run(path: PathBuf, rx: Receiver<CatalogOp>) -> Result<CatalogStats> {
     Ok(stats)
 }
 
-fn apply(conn: &Connection, op: CatalogOp) -> Result<()> {
+/// Apply one data op on `conn` (inside the caller's transaction). Also used
+/// by `recover`, which writes on its own connection.
+pub(crate) fn apply(conn: &Connection, op: CatalogOp) -> Result<()> {
     match op {
         CatalogOp::UpsertSnapshot(s) => upsert_snapshot(conn, &s)?,
         CatalogOp::InsertEntry(e) => {
@@ -196,7 +198,7 @@ fn apply(conn: &Connection, op: CatalogOp) -> Result<()> {
 
 /// Insert or fully replace a snapshot row. Shared by the writer thread's
 /// `UpsertSnapshot` op and `Catalog::upsert_snapshot`.
-pub(super) fn upsert_snapshot(conn: &Connection, s: &SnapshotRow) -> Result<()> {
+pub(crate) fn upsert_snapshot(conn: &Connection, s: &SnapshotRow) -> Result<()> {
     conn.prepare_cached(
         "INSERT INTO snapshot(id, status, source_root, host, tool_version, started_at, \
          completed_at, note, manifest_hash, ext_manifest_hash, source_manifest_hash, \

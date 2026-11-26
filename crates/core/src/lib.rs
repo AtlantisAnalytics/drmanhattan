@@ -10,6 +10,7 @@ pub mod ingest;
 pub mod manifest;
 pub mod model;
 pub mod pack;
+pub mod recover;
 pub mod repo;
 pub mod restore;
 pub(crate) mod snaptree;

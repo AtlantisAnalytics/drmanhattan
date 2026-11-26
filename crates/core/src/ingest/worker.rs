@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::model::{ContentRow, EntryStatus};
 use crate::pack::{RecordHeader, UnitKind};
-use crate::sniff::{detect, profile_kind, Format, ProfileKind};
+use crate::sniff::{detect, image_dims, profile_kind, Format, ProfileKind, SNIFF_LEN};
 use crate::walk::{mtime_ns, open_walked_file, WalkEntry};
 use crate::xattrs::read_file_xattrs;
 use crossbeam_channel::{Receiver, Sender};
@@ -32,9 +32,6 @@ use std::fs::{File, Metadata};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
-/// Bytes read up front for format sniffing and image dimensions.
-const SNIFF_LEN: u64 = 8192;
 
 pub(super) struct FileJob {
     pub id: Id,
@@ -279,16 +276,4 @@ fn compress_unit(
         stored_len: payload.len() as u64,
     };
     Ok((header, payload))
-}
-
-/// Width and height from the image header, without decoding.
-fn image_dims(format: Format, head: &[u8]) -> Option<(u32, u32)> {
-    if !matches!(
-        format,
-        Format::Jpeg | Format::Png | Format::Webp | Format::Gif | Format::Avif
-    ) {
-        return None;
-    }
-    let s = imagesize::blob_size(head).ok()?;
-    Some((u32::try_from(s.width).ok()?, u32::try_from(s.height).ok()?))
 }
