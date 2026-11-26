@@ -31,6 +31,8 @@ pub enum Command {
     Manifest(cmd::manifest::ManifestArgs),
     /// Rebuild a snapshot byte-exact in a new directory
     Restore(cmd::restore::RestoreArgs),
+    /// Rebuild the catalog from the pack files
+    Recover(cmd::recover::RecoverArgs),
     /// Check that stored data is intact
     Verify(cmd::verify::VerifyArgs),
     /// Show path-level differences between a snapshot and a live directory
@@ -98,6 +100,7 @@ fn main() {
         Command::Ingest(args) => cmd::ingest::run(&cli, args),
         Command::Manifest(args) => cmd::manifest::run(&cli, args).map(|()| 0),
         Command::Restore(args) => cmd::restore::run(&cli, args),
+        Command::Recover(args) => cmd::recover::run(&cli, args),
         Command::Verify(args) => cmd::verify::run(&cli, args),
         Command::Diff(args) => cmd::diff::run(&cli, args),
         Command::Ls(args) => cmd::ls::run(&cli, args).map(|()| 0),

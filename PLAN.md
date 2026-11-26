@@ -92,8 +92,9 @@ The design, plan and measurement details are in
 Expect about 40-90 minutes for the ingest and about 20 minutes for `verify`
 (0.1.2 or later; 0.1.1 took about an hour).
 
-Stopping an ingest partway means deleting the repository and starting over,
-because `recover` does not exist yet. The source is not affected.
+If an ingest is stopped partway, run `wmk recover` to rebuild the catalog from
+the packs, then ingest again; stored units are reused. The source is not
+affected.
 
 exFAT has no symlinks or xattrs and reports synthetic modes, so this test does
 not exercise those parts of the fidelity guarantee.
@@ -149,4 +150,4 @@ Found during this testing. None of them block the ingest.
 - **Format mapping.** `from_mime` in `crates/core/src/sniff.rs` does not know
   `.mov`, `.mkv` or camera RAW, so they get a zstd attempt. The measured cost
   was small on random bytes, so this is low priority.
-- **`recover`.** Still to be built (Plan 2).
+- **`recover`.** Built: `wmk recover` rebuilds the catalog from the packs.

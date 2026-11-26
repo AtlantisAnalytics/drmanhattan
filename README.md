@@ -71,6 +71,7 @@ machine-readable output.
 | `wmk manifest <dir>` | Compute the manifest hash of a live directory |
 | `wmk restore <snapshot> <dest>` | Rebuild a snapshot byte-exact in a new directory (`--path`, `--hardlinks`, `--xattrs`) |
 | `wmk verify [snapshot]` | Check that stored data is intact (`--quick` skips decompression; `--workers N` sets worker threads, 0 = one per CPU) |
+| `wmk recover` | Rebuild the catalog from the pack files (`--workers N`); the old catalog is kept beside the new one. Exit 2 if any file or snapshot record is damaged |
 | `wmk diff <snapshot> <dir>` | Show path-level differences between a snapshot and a live directory |
 | `wmk ls` | List snapshots |
 | `wmk show <snapshot> [path]` | Browse a snapshot's tree |
@@ -92,10 +93,16 @@ Exit codes: 0 success, 1 error, 2 verification failure or differences found,
   single file larger than the cap is read on its own while other workers
   wait, so it still needs that much RAM. Streaming large files comes later
   (Plan 3).
-- **No `recover` yet:** rebuilding the catalog from the packs alone is
-  Plan 2. The packs and snapshot records already carry everything it needs.
 - **No screening yet:** hash-list screening, provenance capture and `purge`
   are Plan 3.
+
+## Moving or backing up a repository
+
+Copy the whole repository folder while nothing is writing to it, then run
+`wmk verify` on the other side. `wmk.toml` plus `packs/` is a complete backup:
+if `catalog.sqlite` is lost or damaged, `wmk recover` rebuilds it from the
+packs, keeping the old catalog beside the new one. Never run `wmk` over a
+network file system.
 
 ## Design
 

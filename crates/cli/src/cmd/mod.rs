@@ -5,6 +5,7 @@ pub mod ingest;
 pub mod init;
 pub mod ls;
 pub mod manifest;
+pub mod recover;
 pub mod resolve;
 pub mod restore;
 pub mod show;
