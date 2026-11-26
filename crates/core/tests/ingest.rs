@@ -424,3 +424,213 @@ fn non_directory_source_is_refused_before_any_snapshot_row() {
         "a snapshot row was created"
     );
 }
+
+#[test]
+fn ingest_refuses_when_catalog_missing_but_packs_exist() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"a.txt", b"hello");
+    ingest(&repo, &src);
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = repo.catalog_path().into_os_string();
+        name.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(name));
+    }
+    let err = ingest::run(&repo, &src, &opts()).unwrap_err();
+    assert!(matches!(err, Error::CatalogMissing), "{err:?}");
+    assert!(!repo.catalog_path().exists());
+}
+
+#[test]
+fn ingest_refuses_an_empty_catalog_file_beside_packs() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"a.txt", b"hello");
+    ingest(&repo, &src);
+    let packs_before = pack_bytes(&repo);
+    for suffix in ["-wal", "-shm"] {
+        let mut name = repo.catalog_path().into_os_string();
+        name.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(name));
+    }
+    // A zero-length file, then a SQLite database with no schema.
+    std::fs::write(repo.catalog_path(), b"").unwrap();
+    let err = ingest::run(&repo, &src, &opts()).unwrap_err();
+    assert!(matches!(err, Error::CatalogMissing), "{err:?}");
+    assert_eq!(std::fs::metadata(repo.catalog_path()).unwrap().len(), 0);
+    std::fs::remove_file(repo.catalog_path()).unwrap();
+    rusqlite::Connection::open(repo.catalog_path())
+        .unwrap()
+        .execute_batch("CREATE TABLE t(x); DROP TABLE t;")
+        .unwrap();
+    let err = ingest::run(&repo, &src, &opts()).unwrap_err();
+    assert!(matches!(err, Error::CatalogMissing), "{err:?}");
+    assert_eq!(pack_bytes(&repo), packs_before);
+}
+
+/// Every pack file's path and bytes.
+fn pack_bytes(repo: &Repo) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for shard in std::fs::read_dir(repo.packs_dir()).unwrap() {
+        for f in std::fs::read_dir(shard.unwrap().path()).unwrap() {
+            let p = f.unwrap().path();
+            out.push((p.clone(), std::fs::read(&p).unwrap()));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn ingest_into_fresh_repo_without_catalog_file_still_works() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"a.txt", b"hello");
+    std::fs::remove_file(repo.catalog_path()).unwrap();
+    ingest(&repo, &src);
+    assert!(repo.catalog_path().exists());
+}
+
+#[test]
+fn ingest_sweeps_stale_record_temp_files() {
+    let (_tmp, repo, src) = setup();
+    TreeBuilder::new(&src).file(b"a.txt", b"hello");
+    std::fs::create_dir_all(repo.tmp_dir()).unwrap();
+    let stale = [
+        "record-stale.cbor",
+        "recover-stale.sqlite",
+        "recover-stale.sqlite-wal",
+    ]
+    .map(|n| repo.tmp_dir().join(n));
+    let keep = repo.tmp_dir().join("keep.txt");
+    for p in stale.iter().chain([&keep]) {
+        std::fs::write(p, b"x").unwrap();
+    }
+    ingest(&repo, &src);
+    for p in &stale {
+        assert!(!p.exists(), "{p:?} was not swept");
+    }
+    assert!(keep.exists());
+}
+
+#[test]
+fn reingest_heals_an_incomplete_content() {
+    let (tmp, repo, src) = setup();
+    let a = random(7, 3 << 20);
+    TreeBuilder::new(&src)
+        .file(b"a", &a)
+        .file(b"b", &random(8, 1000))
+        .finish();
+    let live = manifest_dir(&src, &mopts()).unwrap();
+    let r1 = ingest(&repo, &src);
+    let a_hash = drmanhattan_core::ids::Hash32::of(&a);
+
+    // Drop one unit of `a` (and the content_unit row that references it).
+    {
+        let conn = db(&repo);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM content_unit WHERE content_hash = ?1",
+                [&a_hash],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT unit_count FROM content WHERE hash = ?1",
+                [&a_hash],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+        );
+        let unit: Vec<u8> = conn
+            .query_row(
+                "SELECT unit_hash FROM content_unit WHERE content_hash = ?1 AND seq = 1",
+                [&a_hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute("DELETE FROM content_unit WHERE unit_hash = ?1", [&unit])
+            .unwrap();
+        conn.execute("DELETE FROM unit WHERE hash = ?1", [&unit])
+            .unwrap();
+    }
+
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    assert_eq!(
+        cat.incomplete_contents(r1.snapshot).unwrap(),
+        HashSet::from([a_hash])
+    );
+    assert!(!cat.content_complete(&a_hash).unwrap());
+    drop(cat);
+
+    let r2 = ingest(&repo, &src);
+    assert!(r2.new_units > 0);
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    assert!(cat.content_complete(&a_hash).unwrap());
+    assert!(cat.incomplete_contents(r1.snapshot).unwrap().is_empty());
+    assert!(cat.incomplete_contents(r2.snapshot).unwrap().is_empty());
+
+    let dest = tmp.path().join("out");
+    drmanhattan_core::restore::run(
+        &repo,
+        r1.snapshot,
+        &dest,
+        &drmanhattan_core::restore::RestoreOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(manifest_dir(&dest, &mopts()).unwrap().core, live.core);
+}
+
+#[test]
+fn large_record_streams_across_chunks() {
+    use drmanhattan_core::ingest::record::{record_chunks, stream_record, RecordItem};
+    use drmanhattan_core::unitread::{UnitReader, DEFAULT_CACHE_BYTES};
+
+    let (_tmp, repo, src) = setup();
+    for i in 0..10_000 {
+        std::fs::write(src.join(format!("{i:05}-{}", "n".repeat(200))), b"x").unwrap();
+    }
+    let r = ingest(&repo, &src);
+    let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+    let unit = cat.snapshot(r.snapshot).unwrap().record_unit.unwrap();
+    let reader = UnitReader::new(&repo, DEFAULT_CACHE_BYTES);
+    assert!(record_chunks(&reader, &cat, &unit).unwrap().len() > 1);
+
+    let mut entries = 0;
+    let header = stream_record(&reader, &cat, &unit, |item| {
+        if matches!(item, RecordItem::Entry(_)) {
+            entries += 1;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(header.id, r.snapshot);
+    assert_eq!(entries, 10_001);
+
+    // Recover replays the multi-chunk record into the same entry rows.
+    let dest = repo.root.parent().unwrap().join("rebuilt.sqlite");
+    let report = drmanhattan_core::recover::build(
+        &repo,
+        &dest,
+        &drmanhattan_core::recover::RecoverOptions::default(),
+    )
+    .unwrap();
+    assert!(report.intact(), "{report:#?}");
+    assert_eq!(report.snapshots, vec![r.snapshot]);
+    let rows = |path: &Path| -> Vec<Vec<String>> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let mut stmt = conn.prepare("SELECT * FROM entry ORDER BY id").unwrap();
+        let n = stmt.column_count();
+        let rows = stmt
+            .query_map([], |row| {
+                (0..n)
+                    .map(|i| {
+                        row.get::<_, rusqlite::types::Value>(i)
+                            .map(|v| format!("{v:?}"))
+                    })
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    };
+    let want = rows(&repo.catalog_path());
+    assert_eq!(want.len(), 10_001);
+    assert_eq!(rows(&dest), want);
+}

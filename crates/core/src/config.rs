@@ -44,7 +44,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            format_version: 1,
+            format_version: 2,
             chunking: Chunking {
                 text: Profile {
                     min: 2048,
@@ -88,7 +88,7 @@ impl Config {
     /// at a level zstd accepts, and a pack size from `MIN_PACK_SIZE` to
     /// `MAX_PACK_SIZE`.
     pub fn validate(&self) -> Result<()> {
-        if self.format_version != 1 {
+        if !matches!(self.format_version, 1 | 2) {
             return Err(Error::Config(format!(
                 "unsupported format_version {}",
                 self.format_version
@@ -122,7 +122,26 @@ impl Config {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = toml::to_string(self).map_err(|e| Error::Config(e.to_string()))?;
-        std::fs::write(path, text).map_err(|e| Error::io(path, e))
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tmp = dir.join(format!(".{name}.tmp{}", std::process::id()));
+        let write = || -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, text.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+            std::fs::File::open(dir)?.sync_all()
+        };
+        write().map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            Error::io(path, e)
+        })
     }
 }
 

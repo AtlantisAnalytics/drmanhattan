@@ -2,7 +2,7 @@
 //! `problems`, never as an `Err`; `Err` is reserved for failures to even
 //! look (e.g. the catalog will not open).
 //!
-//! `quick` checks, for every unit a selected complete snapshot references
+//! `quick` checks, for every unit a selected complete or damaged snapshot references
 //! (its contents' units, its record unit, and the chunks the record index
 //! names): the pack file exists, the record header at the unit's offset
 //! parses, and its hash, kind and lengths equal the unit row; plus the
@@ -17,7 +17,7 @@
 //! numbered job, and a merger emits the results in job order, so the
 //! report is the same for any worker count.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -25,12 +25,12 @@ use std::sync::Mutex;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::catalog::Catalog;
-use crate::display::display_path;
+use crate::display::{display_bytes, display_path};
 use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::ingest::record;
 use crate::manifest::{manifest_snapshot, ManifestOptions};
-use crate::model::{ContentRow, SnapshotRow, SnapshotStatus, UnitRow};
+use crate::model::{ContentRow, EntryKind, SnapshotRow, SnapshotStatus, UnitRow};
 use crate::pack::{pack_path, scan};
 use crate::repo::Repo;
 use crate::unitread::UnitReader;
@@ -58,7 +58,7 @@ pub struct VerifyOptions {
 }
 
 /// Content-reading threads for `n`; 0 means one per available CPU.
-fn worker_count(n: usize) -> usize {
+pub(crate) fn worker_count(n: usize) -> usize {
     match n {
         0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
         n => n,
@@ -431,6 +431,10 @@ impl Checker<'_> {
         for h in units {
             rows.push(self.unit(snap, h, false));
         }
+        // An incomplete content is reported per file by `snapshot`; its
+        // present units are still read, but there is no content hash to
+        // compare.
+        let incomplete = (units.len() as i64) < c.unit_count;
         if self.quick || !self.hashed.insert(c.hash) {
             return self.send(None);
         }
@@ -441,7 +445,7 @@ impl Checker<'_> {
                 _ => break,
             }
         }
-        let partial = prefix.len() < units.len();
+        let partial = prefix.len() < units.len() || incomplete;
         if partial && prefix.is_empty() {
             return self.send(None);
         }
@@ -483,7 +487,28 @@ impl Checker<'_> {
         }
 
         let cat = self.cat;
-        cat.for_each_snapshot_content(id, |content, units| self.content(id, content, &units))?;
+        // Contents with fewer units than they declare: hash -> (have, want).
+        let mut incomplete: HashMap<Hash32, (i64, i64)> = HashMap::new();
+        cat.for_each_snapshot_content(id, |content, units| {
+            let have = units.len() as i64;
+            if have < content.unit_count {
+                incomplete.insert(content.hash, (have, content.unit_count));
+            }
+            self.content(id, content, &units)
+        })?;
+        if !incomplete.is_empty() {
+            cat.for_each_entry(id, |e| {
+                let missing = e.content_hash.and_then(|h| incomplete.get(&h));
+                if let (EntryKind::File, Some(&(have, want))) = (e.kind, missing) {
+                    self.pending.push(format!(
+                        "snapshot {id}: {}: missing {} of {want} units",
+                        display_bytes(&e.path),
+                        want - have
+                    ));
+                }
+                Ok(())
+            })?;
+        }
 
         match &s.record_unit {
             None => self
@@ -516,7 +541,7 @@ impl Checker<'_> {
     fn walk(&mut self, selected: &[SnapshotRow]) -> Result<u64> {
         let mut snapshots = 0;
         for s in selected {
-            if s.status != SnapshotStatus::Complete {
+            if !matches!(s.status, SnapshotStatus::Complete | SnapshotStatus::Damaged) {
                 self.pending.push(format!(
                     "snapshot {}: status is {}, not complete",
                     s.id,
@@ -532,7 +557,7 @@ impl Checker<'_> {
     }
 }
 
-/// Verify `snapshot`, or every complete snapshot when `None`, reading
+/// Verify `snapshot`, or every complete or damaged snapshot when `None`, reading
 /// contents on one thread per CPU.
 pub fn run(repo: &Repo, snapshot: Option<Id>, quick: bool) -> Result<VerifyReport> {
     run_with(
@@ -546,7 +571,7 @@ pub fn run(repo: &Repo, snapshot: Option<Id>, quick: bool) -> Result<VerifyRepor
     )
 }
 
-/// Verify `snapshot`, or every complete snapshot when `None`. The report
+/// Verify `snapshot`, or every complete or damaged snapshot when `None`. The report
 /// does not depend on `opts.workers`.
 pub fn run_with(repo: &Repo, snapshot: Option<Id>, opts: &VerifyOptions) -> Result<VerifyReport> {
     let cat = Catalog::open_readonly(&repo.catalog_path())?;
@@ -555,7 +580,7 @@ pub fn run_with(repo: &Repo, snapshot: Option<Id>, opts: &VerifyOptions) -> Resu
         None => cat
             .snapshots()?
             .into_iter()
-            .filter(|s| s.status == SnapshotStatus::Complete)
+            .filter(|s| matches!(s.status, SnapshotStatus::Complete | SnapshotStatus::Damaged))
             .collect(),
     };
     let reader = UnitReader::new(repo, 64 << 20);

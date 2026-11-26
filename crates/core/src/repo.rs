@@ -78,6 +78,56 @@ impl Repo {
         self.root.join(TMP_DIR)
     }
 
+    /// Whether any `*.pack` file exists under `packs/<2 hex>/`.
+    pub fn has_packs(&self) -> Result<bool> {
+        let dir = self.packs_dir();
+        let top = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(Error::io(&dir, e)),
+        };
+        for shard in top {
+            let shard = shard.map_err(|e| Error::io(&dir, e))?.path();
+            if !shard.is_dir() {
+                continue;
+            }
+            for f in std::fs::read_dir(&shard).map_err(|e| Error::io(&shard, e))? {
+                let f = f.map_err(|e| Error::io(&shard, e))?.path();
+                if f.extension().is_some_and(|x| x == "pack") {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Delete stale `record-*.cbor` files directly in `tmp/`; returns how
+    /// many. The caller must hold the writer lock.
+    pub fn sweep_tmp(&self) -> Result<u64> {
+        let dir = self.tmp_dir();
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(Error::io(&dir, e)),
+        };
+        let mut n = 0;
+        for entry in rd {
+            let entry = entry.map_err(|e| Error::io(&dir, e))?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_file = entry
+                .file_type()
+                .map_err(|e| Error::io(&path, e))?
+                .is_file();
+            if is_file && name.starts_with("record-") && name.ends_with(".cbor") {
+                std::fs::remove_file(&path).map_err(|e| Error::io(&path, e))?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Take the non-blocking exclusive writer lock on `wmk.lock`.
     pub fn lock_writer(&self) -> Result<WriterLock> {
         let path = self.root.join(LOCK_FILE);

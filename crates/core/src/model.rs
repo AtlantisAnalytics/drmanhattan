@@ -75,6 +75,8 @@ pub enum SnapshotStatus {
     InProgress,
     Complete,
     Failed,
+    /// Set by `wmk recover` when content is lost; never stored in a record.
+    Damaged,
 }
 
 impl SnapshotStatus {
@@ -83,6 +85,7 @@ impl SnapshotStatus {
             SnapshotStatus::InProgress => "in_progress",
             SnapshotStatus::Complete => "complete",
             SnapshotStatus::Failed => "failed",
+            SnapshotStatus::Damaged => "damaged",
         }
     }
 
@@ -91,6 +94,7 @@ impl SnapshotStatus {
             "in_progress" => Some(SnapshotStatus::InProgress),
             "complete" => Some(SnapshotStatus::Complete),
             "failed" => Some(SnapshotStatus::Failed),
+            "damaged" => Some(SnapshotStatus::Damaged),
             _ => None,
         }
     }

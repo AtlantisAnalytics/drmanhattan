@@ -65,19 +65,11 @@ fn run(path: PathBuf, rx: Receiver<CatalogOp>) -> Result<CatalogStats> {
     let mut open = false;
     for op in rx {
         if let CatalogOp::Commit = op {
-            if open {
-                conn.execute_batch("COMMIT")?;
-                open = false;
-                stats.commits += 1;
-            }
+            commit(conn, &mut open, &mut stats)?;
             continue;
         }
         if let CatalogOp::Sync(ack) = op {
-            if open {
-                conn.execute_batch("COMMIT")?;
-                open = false;
-                stats.commits += 1;
-            }
+            commit(conn, &mut open, &mut stats)?;
             // The requester may have given up; nothing to do then.
             let _ = ack.send(());
             continue;
@@ -92,14 +84,24 @@ fn run(path: PathBuf, rx: Receiver<CatalogOp>) -> Result<CatalogStats> {
         }
         stats.ops += 1;
     }
-    if open {
-        conn.execute_batch("COMMIT")?;
-        stats.commits += 1;
-    }
+    commit(conn, &mut open, &mut stats)?;
     Ok(stats)
 }
 
-fn apply(conn: &Connection, op: CatalogOp) -> Result<()> {
+/// Commit the writer's transaction if one is open.
+fn commit(conn: &Connection, open: &mut bool, stats: &mut CatalogStats) -> Result<()> {
+    if *open {
+        conn.execute_batch("COMMIT")?;
+        *open = false;
+        stats.commits += 1;
+        fail::fail_point!("catalog::kill::after_commit", |_| crate::kill());
+    }
+    Ok(())
+}
+
+/// Apply one data op on `conn` (inside the caller's transaction). Also used
+/// by `recover`, which writes on its own connection.
+pub(crate) fn apply(conn: &Connection, op: CatalogOp) -> Result<()> {
     match op {
         CatalogOp::UpsertSnapshot(s) => upsert_snapshot(conn, &s)?,
         CatalogOp::InsertEntry(e) => {
@@ -196,7 +198,7 @@ fn apply(conn: &Connection, op: CatalogOp) -> Result<()> {
 
 /// Insert or fully replace a snapshot row. Shared by the writer thread's
 /// `UpsertSnapshot` op and `Catalog::upsert_snapshot`.
-pub(super) fn upsert_snapshot(conn: &Connection, s: &SnapshotRow) -> Result<()> {
+pub(crate) fn upsert_snapshot(conn: &Connection, s: &SnapshotRow) -> Result<()> {
     conn.prepare_cached(
         "INSERT INTO snapshot(id, status, source_root, host, tool_version, started_at, \
          completed_at, note, manifest_hash, ext_manifest_hash, source_manifest_hash, \

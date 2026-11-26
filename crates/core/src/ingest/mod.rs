@@ -122,6 +122,14 @@ pub fn run(repo: &Repo, source: &Path, opts: &IngestOptions) -> Result<IngestRep
     }
     let started = Instant::now();
     let _lock = repo.lock_writer()?;
+    repo.sweep_tmp()?;
+    crate::recover::sweep_stale_catalogs(&repo.tmp_dir())?;
+    // Before anything opens or creates the catalog (including `mark_failed`):
+    // a missing, empty or schema-less file would become a fresh catalog
+    // beside packs full of data.
+    if Catalog::is_blank(&repo.catalog_path())? && repo.has_packs()? {
+        return Err(Error::CatalogMissing);
+    }
     let source = canonical(source)?;
     let root = canonical(&repo.root)?;
     // Component-wise, so `/x/r2` is not inside `/x/r`.
@@ -136,6 +144,9 @@ pub fn run(repo: &Repo, source: &Path, opts: &IngestOptions) -> Result<IngestRep
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a directory"),
         ));
     }
+    // A fresh repository may lack the file (no packs, guard passed); the
+    // readers below open it read-only, so create it first.
+    drop(Catalog::open(&repo.catalog_path())?);
     let (host, source_root) = recorded_identity(opts, &source);
     let snap = SnapshotRow {
         id: Id::new_v7(),
@@ -352,6 +363,7 @@ fn pipeline(
             drop(job_rx);
 
             walk_source(source, opts, snap.id, &job_tx, &st_tx, shared, &mut skipped);
+            fail::fail_point!("ingest::kill::after_walk", |_| crate::kill());
             drop(job_tx);
 
             for h in pool {
@@ -461,10 +473,13 @@ fn seal_snapshot(
         |header, payload| {
             storage
                 .send(StorageMsg::Unit(header, payload))
-                .map_err(|_| Halt::Aborted)
+                .map_err(|_| Halt::Aborted)?;
+            fail::fail_point!("ingest::kill::during_record", |_| crate::kill());
+            Ok(())
         },
     )?;
     flush(storage)?;
+    fail::fail_point!("ingest::kill::record_durable", |_| crate::kill());
     Ok(Sealed {
         stats,
         row: SnapshotRow {
@@ -628,8 +643,11 @@ fn finish(repo: &Repo, out: PipelineOutput, started: Instant) -> Result<IngestRe
         manifest_hash,
         peak_buffered,
     } = out;
+    // Storage is closed by now: the last pack is sealed.
+    fail::fail_point!("ingest::kill::before_upsert", |_| crate::kill());
     // The one commit that must survive power loss: after it, wmk exits 0.
     Catalog::open(&repo.catalog_path())?.upsert_snapshot_durable(&row)?;
+    fail::fail_point!("ingest::kill::after_upsert", |_| crate::kill());
     let dedup_ratio = if stats.new_bytes_stored == 0 {
         0.0
     } else {

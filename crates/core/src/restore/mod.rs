@@ -52,6 +52,10 @@ pub struct RestoreReport {
     /// Entries skipped because their status is neither `ok` nor `unstable`,
     /// counting every entry beneath a withheld directory.
     pub withheld: u64,
+    /// Paths (relative to the restored root, sorted) of file entries left
+    /// out because their content is missing units. Every member of a
+    /// hard-link group is listed, since all share the damaged content.
+    pub damaged: Vec<Vec<u8>>,
     /// The destination's mtime granularity; mtimes finer than this were
     /// floored by the filesystem.
     pub mtime_precision_ns: u64,
@@ -77,9 +81,12 @@ pub fn run_with_probe(
     let started = Instant::now();
     let cat = Catalog::open_readonly(&repo.catalog_path())?;
     let snap = cat.snapshot(snapshot)?;
-    if snap.status != SnapshotStatus::Complete {
+    if !matches!(
+        snap.status,
+        SnapshotStatus::Complete | SnapshotStatus::Damaged
+    ) {
         return Err(Error::NotFound(format!(
-            "complete snapshot {snapshot} (it is {})",
+            "complete or damaged snapshot {snapshot} (it is {})",
             snap.status.as_str()
         )));
     }
@@ -100,6 +107,7 @@ pub fn run_with_probe(
         )]));
     }
     let (entries, withheld) = collect(&cat, snapshot, &opts.path)?;
+    let (entries, damaged) = withhold_damaged(&cat, snapshot, &opts.path, entries)?;
     check_xattr_names(&cat, snapshot, &entries)?;
     let probe = match probe {
         Some(p) => p,
@@ -177,6 +185,7 @@ pub fn run_with_probe(
         symlinks: count(EntryKind::Symlink),
         bytes: plan.bytes,
         withheld,
+        damaged,
         mtime_precision_ns: probe.mtime_precision_ns,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
@@ -238,6 +247,42 @@ fn collect(cat: &Catalog, snapshot: Id, root_path: &[u8]) -> Result<(Vec<EntryRo
         Ok(())
     })?;
     Ok((out, withheld))
+}
+
+/// Drop file entries whose content lacks units from the restored set and
+/// return their paths, sorted. Separate from `included` screening, which
+/// feeds the manifest. The root entry is never dropped: a damaged root file
+/// is `Error::Damaged`, since nothing could be restored.
+fn withhold_damaged(
+    cat: &Catalog,
+    snapshot: Id,
+    path: &[u8],
+    entries: Vec<EntryRow>,
+) -> Result<(Vec<EntryRow>, Vec<Vec<u8>>)> {
+    let incomplete = cat.incomplete_contents(snapshot)?;
+    if incomplete.is_empty() {
+        return Ok((entries, Vec::new()));
+    }
+    let is_damaged = |e: &EntryRow| {
+        e.kind == EntryKind::File && e.content_hash.is_some_and(|h| incomplete.contains(&h))
+    };
+    if let Some(hash) = entries
+        .first()
+        .filter(|e| is_damaged(e))
+        .and_then(|e| e.content_hash)
+    {
+        let total = cat.content(&hash)?.unit_count;
+        let have = cat.content_units(&hash)?.len() as i64;
+        return Err(Error::Damaged {
+            path: display_bytes(path),
+            missing: total - have,
+            total,
+        });
+    }
+    let (bad, kept): (Vec<_>, Vec<_>) = entries.into_iter().partition(is_damaged);
+    let mut damaged: Vec<Vec<u8>> = bad.into_iter().map(|e| e.path).collect();
+    damaged.sort();
+    Ok((kept, damaged))
 }
 
 /// Reject rows the restore cannot reproduce exactly.

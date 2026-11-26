@@ -4,6 +4,7 @@ use crate::Cli;
 use anyhow::{anyhow, Result};
 use clap::Args;
 use drmanhattan_core::catalog::Catalog;
+use drmanhattan_core::display::display_bytes;
 use drmanhattan_core::error::Error;
 use drmanhattan_core::restore::{self, RestoreOptions, RestoreReport};
 use serde::Serialize;
@@ -38,6 +39,8 @@ struct Report {
     symlinks: u64,
     bytes: u64,
     withheld: u64,
+    /// Files left out because their content is missing units.
+    damaged: Vec<String>,
     mtime_precision_ns: u64,
     elapsed_ms: u64,
 }
@@ -52,6 +55,7 @@ impl Report {
             symlinks: r.symlinks,
             bytes: r.bytes,
             withheld: r.withheld,
+            damaged: r.damaged.iter().map(|p| display_bytes(p)).collect(),
             mtime_precision_ns: r.mtime_precision_ns,
             elapsed_ms: r.elapsed_ms,
         }
@@ -76,6 +80,9 @@ impl fmt::Display for Report {
         if self.withheld > 0 {
             write!(f, "\nwithheld: {}", self.withheld)?;
         }
+        for p in &self.damaged {
+            write!(f, "\ndamaged (missing units, not restored): {p}")?;
+        }
         Ok(())
     }
 }
@@ -92,7 +99,8 @@ fn snapshot_path(p: &Option<OsString>) -> Vec<u8> {
     v
 }
 
-/// Returns the exit code: 3 when entries were withheld by screening, else 0.
+/// Returns the exit code: 2 when files were left out for missing units, 3
+/// when entries were withheld by screening, else 0.
 /// Each preflight problem is printed on its own line before failing.
 pub fn run(cli: &Cli, args: &RestoreArgs) -> Result<i32> {
     let repo = open_repo(cli)?;
@@ -120,5 +128,11 @@ pub fn run(cli: &Cli, args: &RestoreArgs) -> Result<i32> {
         cli.json,
         &Report::new(snapshot.to_string(), display_path(&args.dest), &report),
     )?;
-    Ok(if report.withheld > 0 { 3 } else { 0 })
+    Ok(if !report.damaged.is_empty() {
+        2
+    } else if report.withheld > 0 {
+        3
+    } else {
+        0
+    })
 }

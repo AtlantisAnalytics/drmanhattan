@@ -14,6 +14,7 @@ use crate::pack::UnitKind;
 use crate::sniff::{Format, ProfileKind};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -171,7 +172,7 @@ impl Catalog {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let cat = Catalog { conn };
         match cat.user_version()? {
-            schema::USER_VERSION => {}
+            v if schema::SUPPORTED_VERSIONS.contains(&v) => {}
             0 => {
                 let tables: i64 = cat.conn.query_row(
                     "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
@@ -191,6 +192,31 @@ impl Catalog {
         Ok(cat)
     }
 
+    /// Whether `path` holds no catalog that `open` would keep: the file is
+    /// missing, empty, or a SQLite database with no schema (user_version 0
+    /// and no tables), where `open` would create a fresh, empty catalog.
+    /// A file that cannot be read as SQLite is not blank: `open` fails on it.
+    pub fn is_blank(path: &Path) -> Result<bool> {
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => return Err(Error::io(path, e)),
+            Ok(m) if m.len() == 0 => return Ok(true),
+            Ok(_) => {}
+        }
+        let blank = (|| -> rusqlite::Result<bool> {
+            let conn = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            conn.busy_timeout(BUSY_TIMEOUT)?;
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            let tables: i64 =
+                conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+            Ok(version == 0 && tables == 0)
+        })();
+        Ok(blank.unwrap_or(false))
+    }
+
     /// Open an existing catalog read-only.
     pub fn open_readonly(path: &Path) -> Result<Catalog> {
         let conn = Connection::open_with_flags(
@@ -201,7 +227,7 @@ impl Catalog {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let cat = Catalog { conn };
         let v = cat.user_version()?;
-        if v != schema::USER_VERSION {
+        if !schema::SUPPORTED_VERSIONS.contains(&v) {
             return Err(unsupported_version(v));
         }
         Ok(cat)
@@ -249,6 +275,32 @@ impl Catalog {
 
     pub fn has_content(&self, h: &Hash32) -> Result<bool> {
         self.exists("SELECT 1 FROM content WHERE hash = ?1", h)
+    }
+
+    /// The content row exists and every one of its units is listed. A
+    /// content of zero units (an empty file) is complete.
+    pub fn content_complete(&self, h: &Hash32) -> Result<bool> {
+        self.exists(
+            "SELECT 1 FROM content c WHERE c.hash = ?1 AND \
+             (SELECT COUNT(*) FROM content_unit cu WHERE cu.content_hash = c.hash) \
+             >= c.unit_count",
+            h,
+        )
+    }
+
+    /// Contents referenced by the snapshot's entries that list fewer units
+    /// than their `unit_count`.
+    pub fn incomplete_contents(&self, snapshot: Id) -> Result<HashSet<Hash32>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT c.hash FROM content c \
+             JOIN (SELECT DISTINCT content_hash FROM entry \
+                   WHERE snapshot_id = ?1 AND content_hash IS NOT NULL) e \
+               ON e.content_hash = c.hash \
+             LEFT JOIN content_unit cu ON cu.content_hash = c.hash \
+             GROUP BY c.hash HAVING COUNT(cu.seq) < c.unit_count",
+        )?;
+        let rows = stmt.query_map([snapshot], |r| r.get::<_, Hash32>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     pub fn has_unit(&self, h: &Hash32) -> Result<bool> {
@@ -542,8 +594,8 @@ impl Catalog {
 
 fn unsupported_version(v: i64) -> Error {
     Error::Corrupt(format!(
-        "unsupported catalog user_version {v} (this build supports {})",
-        schema::USER_VERSION
+        "unsupported catalog user_version {v} (this build supports {:?})",
+        schema::SUPPORTED_VERSIONS
     ))
 }
 

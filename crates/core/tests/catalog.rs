@@ -133,6 +133,7 @@ fn enum_strings_round_trip() {
         SnapshotStatus::InProgress,
         SnapshotStatus::Complete,
         SnapshotStatus::Failed,
+        SnapshotStatus::Damaged,
     ] {
         assert_eq!(SnapshotStatus::parse(s.as_str()), Some(s));
     }
@@ -209,7 +210,7 @@ fn schema_has_all_tables() {
     let v: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 1);
+    assert_eq!(v, 2);
     let mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .unwrap();
@@ -274,14 +275,20 @@ fn writer_commits_only_on_commit() {
     tx.send(CatalogOp::InsertEntry(entry(sid, None, b"", b"")))
         .unwrap();
     // The writer holds SQLite's write lock exactly while a transaction is
-    // open, so wait until a competing BEGIN IMMEDIATE is refused. That proves
-    // the writer applied the entry op without committing it.
-    wait_until(|| writer_holds_lock(&path));
+    // open. The snapshot row being visible proves the first transaction
+    // committed, so a held lock after that can only be the second transaction,
+    // which has applied the entry op without committing it.
+    let snapshots = |p: &std::path::Path| -> i64 {
+        let c = rusqlite::Connection::open(p).unwrap();
+        c.query_row("SELECT count(*) FROM snapshot", [], |r| r.get(0))
+            .unwrap()
+    };
+    wait_until(|| snapshots(&path) == 1 && writer_holds_lock(&path));
     assert_eq!(count(&path), 0);
     tx.send(CatalogOp::Commit).unwrap();
-    // Once the lock is free again the transaction has been committed.
-    wait_until(|| !writer_holds_lock(&path));
-    assert_eq!(count(&path), 1);
+    // Wait for the entry itself to become visible rather than for the lock to
+    // be free, which is also true in the gap between the two transactions.
+    wait_until(|| count(&path) == 1);
     drop(tx);
     assert_eq!(h.join().unwrap().unwrap().commits, 2);
 }
@@ -530,7 +537,7 @@ fn future_user_version_rejected() {
     let (_t, path) = setup();
     {
         let c = rusqlite::Connection::open(&path).unwrap();
-        c.pragma_update(None, "user_version", 2).unwrap();
+        c.pragma_update(None, "user_version", 3).unwrap();
     }
     assert!(matches!(Catalog::open(&path), Err(Error::Corrupt(_))));
     assert!(matches!(
@@ -548,4 +555,64 @@ fn readonly_connection_cannot_write() {
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
     assert!(c.execute("DELETE FROM snapshot", []).is_err());
+}
+
+fn set_user_version(path: &std::path::Path, v: i64) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.pragma_update(None, "user_version", v).unwrap();
+}
+
+fn user_version(path: &std::path::Path) -> i64 {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn new_catalog_is_version_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("r");
+    let repo = drmanhattan_core::repo::Repo::init(&root).unwrap();
+    assert_eq!(user_version(&repo.catalog_path()), 2);
+    let cfg = drmanhattan_core::config::Config::load(&root.join("wmk.toml")).unwrap();
+    assert_eq!(cfg.format_version, 2);
+}
+
+#[test]
+fn version_1_repository_opens_and_stays_1() {
+    use drmanhattan_core::ingest::{self, IngestOptions};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("r");
+    let repo = drmanhattan_core::repo::Repo::init(&root).unwrap();
+    set_user_version(&repo.catalog_path(), 1);
+    let cfg = drmanhattan_core::config::Config {
+        format_version: 1,
+        ..Default::default()
+    };
+    cfg.save(&root.join("wmk.toml")).unwrap();
+    let repo = drmanhattan_core::repo::Repo::open(&root).unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a"), b"hello").unwrap();
+    ingest::run(&repo, &src, &IngestOptions::default()).unwrap();
+    assert_eq!(user_version(&repo.catalog_path()), 1);
+    let cfg = drmanhattan_core::config::Config::load(&root.join("wmk.toml")).unwrap();
+    assert_eq!(cfg.format_version, 1);
+}
+
+#[test]
+fn version_3_is_refused() {
+    let (_tmp, path) = setup();
+    set_user_version(&path, 3);
+    assert!(Catalog::open(&path).is_err());
+    assert!(Catalog::open_readonly(&path).is_err());
+}
+
+#[test]
+fn damaged_status_round_trips() {
+    let (_tmp, path) = setup();
+    let cat = Catalog::open(&path).unwrap();
+    let s = snap(Id::new_v7(), SnapshotStatus::Damaged, 5);
+    cat.upsert_snapshot(&s).unwrap();
+    assert_eq!(cat.snapshot(s.id).unwrap(), s);
 }

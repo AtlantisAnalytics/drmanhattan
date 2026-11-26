@@ -31,6 +31,8 @@ pub enum Command {
     Manifest(cmd::manifest::ManifestArgs),
     /// Rebuild a snapshot byte-exact in a new directory
     Restore(cmd::restore::RestoreArgs),
+    /// Rebuild the catalog from the pack files
+    Recover(cmd::recover::RecoverArgs),
     /// Check that stored data is intact
     Verify(cmd::verify::VerifyArgs),
     /// Show path-level differences between a snapshot and a live directory
@@ -80,7 +82,11 @@ impl std::error::Error for DiffFound {}
 /// Map an error to a process exit code: 2 for verification failure or
 /// differences found, otherwise 1. (3, entries withheld, is a success-path code.)
 pub fn exit_code(err: &anyhow::Error) -> i32 {
-    if err.is::<VerifyFailed>() || err.is::<DiffFound>() {
+    let damaged = matches!(
+        err.downcast_ref::<drmanhattan_core::error::Error>(),
+        Some(drmanhattan_core::error::Error::Damaged { .. })
+    );
+    if damaged || err.is::<VerifyFailed>() || err.is::<DiffFound>() {
         2
     } else {
         1
@@ -88,12 +94,16 @@ pub fn exit_code(err: &anyhow::Error) -> i32 {
 }
 
 fn main() {
+    // Crash tests set failpoints through the FAILPOINTS environment variable.
+    #[cfg(feature = "failpoints")]
+    let _scenario = fail::FailScenario::setup();
     let cli = Cli::parse();
     let result = match &cli.command {
         Command::Init(args) => cmd::init::run(&cli, args).map(|()| 0),
         Command::Ingest(args) => cmd::ingest::run(&cli, args),
         Command::Manifest(args) => cmd::manifest::run(&cli, args).map(|()| 0),
         Command::Restore(args) => cmd::restore::run(&cli, args),
+        Command::Recover(args) => cmd::recover::run(&cli, args),
         Command::Verify(args) => cmd::verify::run(&cli, args),
         Command::Diff(args) => cmd::diff::run(&cli, args),
         Command::Ls(args) => cmd::ls::run(&cli, args).map(|()| 0),

@@ -279,6 +279,17 @@ impl Item {
     }
 }
 
+/// One decoded item of a snapshot record document, in document order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordItem {
+    Header(SnapshotRow),
+    Entry(EntryRow),
+    Content(ContentRow, Vec<Hash32>),
+    Xattr(Id, Vec<u8>, Vec<u8>),
+    Provenance(ProvenanceRecord),
+    ScreenHit(ScreenHitRecord),
+}
+
 /// Payload of the `snapshot_record` unit.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -323,6 +334,7 @@ impl TryFrom<WireSnapshot> for SnapshotRow {
         Ok(SnapshotRow {
             id: s.id.0,
             status: SnapshotStatus::parse(&s.status)
+                .filter(|st| *st != SnapshotStatus::Damaged)
                 .ok_or_else(|| corrupt(format!("unknown snapshot status {:?}", s.status)))?,
             source_root: s.source_root.0,
             host: s.host,
@@ -681,14 +693,13 @@ fn from_cbor<T: serde::de::DeserializeOwned>(r: impl Read) -> Result<T> {
     })
 }
 
-/// Parse a whole document from `r`, enforcing the section order.
-fn parse_document(r: &mut impl BufRead) -> Result<SnapshotRecord> {
-    let mut snapshot = None;
-    let mut entries = Vec::new();
-    let mut contents = Vec::new();
-    let mut xattrs = Vec::new();
-    let mut provenance = Vec::new();
-    let mut screen_hits = Vec::new();
+/// Parse a document from `r`, enforcing the section order and handing each
+/// item to `visit` as it is decoded. Only one item is held at a time.
+fn parse_document(
+    r: &mut impl BufRead,
+    visit: &mut impl FnMut(RecordItem) -> Result<()>,
+) -> Result<SnapshotRow> {
+    let mut snapshot: Option<SnapshotRow> = None;
     let mut section = 0u8;
     loop {
         if r.fill_buf().map_err(from_io)?.is_empty() {
@@ -700,7 +711,7 @@ fn parse_document(r: &mut impl BufRead) -> Result<SnapshotRecord> {
             return Err(corrupt("items out of order"));
         }
         section = s;
-        match item {
+        let out = match item {
             Item::Header {
                 version,
                 snapshot: w,
@@ -708,9 +719,20 @@ fn parse_document(r: &mut impl BufRead) -> Result<SnapshotRecord> {
                 if version != VERSION {
                     return Err(corrupt(format!("unsupported version {version}")));
                 }
-                snapshot = Some(SnapshotRow::try_from(w)?);
+                let row = SnapshotRow::try_from(w)?;
+                snapshot = Some(row.clone());
+                RecordItem::Header(row)
             }
-            Item::Entry(w) => entries.push(EntryRow::try_from(w)?),
+            Item::Entry(w) => {
+                let e = EntryRow::try_from(w)?;
+                if snapshot.as_ref().is_some_and(|s| e.snapshot_id != s.id) {
+                    return Err(corrupt(format!(
+                        "entry {} belongs to snapshot {}",
+                        e.id, e.snapshot_id
+                    )));
+                }
+                RecordItem::Entry(e)
+            }
             Item::Content {
                 hash,
                 size,
@@ -718,59 +740,59 @@ fn parse_document(r: &mut impl BufRead) -> Result<SnapshotRecord> {
                 profile,
                 unit_count,
                 units,
-            } => contents.push(content_row(hash, size, format, profile, unit_count, units)?),
+            } => {
+                let (row, units) = content_row(hash, size, format, profile, unit_count, units)?;
+                RecordItem::Content(row, units)
+            }
             Item::Xattr {
                 entry_id,
                 name,
                 value,
-            } => xattrs.push((entry_id.0, name.0, value.0)),
-            Item::Provenance(p) => provenance.push(ProvenanceRecord::try_from(p)?),
-            Item::ScreenHit(h) => screen_hits.push(ScreenHitRecord::try_from(h)?),
-        }
+            } => RecordItem::Xattr(entry_id.0, name.0, value.0),
+            Item::Provenance(p) => RecordItem::Provenance(ProvenanceRecord::try_from(p)?),
+            Item::ScreenHit(h) => RecordItem::ScreenHit(ScreenHitRecord::try_from(h)?),
+        };
+        visit(out)?;
     }
-    let snapshot = snapshot.ok_or_else(|| corrupt("empty document"))?;
-    if let Some(e) = entries.iter().find(|e| e.snapshot_id != snapshot.id) {
+    snapshot.ok_or_else(|| corrupt("empty document"))
+}
+
+/// The `snapshot_record` index at `unit`.
+fn read_index(reader: &UnitReader, cat: &Catalog, unit: &Hash32) -> Result<RecordIndex> {
+    let row = cat.unit(unit)?;
+    if row.kind != UnitKind::SnapshotRecord {
         return Err(corrupt(format!(
-            "entry {} belongs to snapshot {}",
-            e.id, e.snapshot_id
+            "unit {unit} is a {} unit",
+            row.kind.as_str()
         )));
     }
-    Ok(SnapshotRecord {
-        snapshot,
-        entries,
-        contents,
-        xattrs,
-        provenance,
-        screen_hits,
-    })
+    from_cbor(&reader.read_unit(&row)?[..])
 }
 
 /// The chunk unit hashes named by the index of the `snapshot_record` unit
 /// `unit`, in document order. Reads only the small index unit.
 pub fn record_chunks(reader: &UnitReader, cat: &Catalog, unit: &Hash32) -> Result<Vec<Hash32>> {
-    let row = cat.unit(unit)?;
-    if row.kind != UnitKind::SnapshotRecord {
-        return Err(corrupt(format!(
-            "unit {unit} is a {} unit",
-            row.kind.as_str()
-        )));
-    }
-    let index: RecordIndex = from_cbor(&reader.read_unit(&row)?[..])?;
+    let index = read_index(reader, cat, unit)?;
     Ok(index.chunks.into_iter().map(|c| c.0).collect())
 }
 
-/// Read back the snapshot record whose `snapshot_record` unit is `unit`,
-/// verifying every chunk, the document's BLAKE3 and size, and that the
-/// document describes the snapshot the index names.
-pub fn read_record(reader: &UnitReader, cat: &Catalog, unit: &Hash32) -> Result<SnapshotRecord> {
-    let row = cat.unit(unit)?;
-    if row.kind != UnitKind::SnapshotRecord {
-        return Err(corrupt(format!(
-            "unit {unit} is a {} unit",
-            row.kind.as_str()
-        )));
-    }
-    let index: RecordIndex = from_cbor(&reader.read_unit(&row)?[..])?;
+/// The snapshot id named by a record's index unit, without reading chunks.
+pub fn record_snapshot_id(reader: &UnitReader, cat: &Catalog, unit: &Hash32) -> Result<Id> {
+    Ok(read_index(reader, cat, unit)?.snapshot_id.0)
+}
+
+/// Stream the record whose `snapshot_record` unit is `unit`, calling `visit`
+/// for each item in document order with the same strict checks as
+/// `read_record`. Returns the header row only after the document's BLAKE3,
+/// size and snapshot id have verified; on any error the caller must discard
+/// everything `visit` saw.
+pub fn stream_record(
+    reader: &UnitReader,
+    cat: &Catalog,
+    unit: &Hash32,
+    mut visit: impl FnMut(RecordItem) -> Result<()>,
+) -> Result<SnapshotRow> {
+    let index = read_index(reader, cat, unit)?;
     let doc = DocReader {
         reader,
         cat,
@@ -781,7 +803,7 @@ pub fn read_record(reader: &UnitReader, cat: &Catalog, unit: &Hash32) -> Result<
         size: 0,
     };
     let mut buf = BufReader::with_capacity(1 << 16, doc);
-    let rec = parse_document(&mut buf)?;
+    let snapshot = parse_document(&mut buf, &mut visit)?;
     // `parse_document` stops only at end of input: every chunk was read.
     let doc = buf.into_inner();
     let hash = Hash32(*doc.hasher.finalize().as_bytes());
@@ -791,13 +813,50 @@ pub fn read_record(reader: &UnitReader, cat: &Catalog, unit: &Hash32) -> Result<
             doc.size, index.document_size, index.document_blake3.0
         )));
     }
-    if rec.snapshot.id != index.snapshot_id.0 {
+    if snapshot.id != index.snapshot_id.0 {
         return Err(corrupt(format!(
             "index names snapshot {}, document holds {}",
-            index.snapshot_id.0, rec.snapshot.id
+            index.snapshot_id.0, snapshot.id
         )));
     }
-    Ok(rec)
+    Ok(snapshot)
+}
+
+/// Collect the items `run` streams into a `SnapshotRecord`.
+fn collect_record(
+    run: impl FnOnce(&mut dyn FnMut(RecordItem) -> Result<()>) -> Result<SnapshotRow>,
+) -> Result<SnapshotRecord> {
+    let mut entries = Vec::new();
+    let mut contents = Vec::new();
+    let mut xattrs = Vec::new();
+    let mut provenance = Vec::new();
+    let mut screen_hits = Vec::new();
+    let snapshot = run(&mut |item| {
+        match item {
+            RecordItem::Header(_) => {}
+            RecordItem::Entry(e) => entries.push(e),
+            RecordItem::Content(c, u) => contents.push((c, u)),
+            RecordItem::Xattr(id, n, v) => xattrs.push((id, n, v)),
+            RecordItem::Provenance(p) => provenance.push(p),
+            RecordItem::ScreenHit(h) => screen_hits.push(h),
+        }
+        Ok(())
+    })?;
+    Ok(SnapshotRecord {
+        snapshot,
+        entries,
+        contents,
+        xattrs,
+        provenance,
+        screen_hits,
+    })
+}
+
+/// Read back the snapshot record whose `snapshot_record` unit is `unit`,
+/// verifying every chunk, the document's BLAKE3 and size, and that the
+/// document describes the snapshot the index names.
+pub fn read_record(reader: &UnitReader, cat: &Catalog, unit: &Hash32) -> Result<SnapshotRecord> {
+    collect_record(|visit| stream_record(reader, cat, unit, visit))
 }
 
 #[cfg(test)]
@@ -844,6 +903,10 @@ mod tests {
         }
     }
 
+    fn parse_all(mut doc: &[u8]) -> Result<SnapshotRecord> {
+        collect_record(|visit| parse_document(&mut doc, &mut |i| visit(i)))
+    }
+
     fn encode_items(items: &[Item]) -> Vec<u8> {
         let mut out = Vec::new();
         for i in items {
@@ -885,7 +948,7 @@ mod tests {
                 value: Bin(big.clone()),
             },
         ]);
-        let rec = parse_document(&mut &doc[..]).unwrap();
+        let rec = parse_all(&doc[..]).unwrap();
         assert_eq!(rec.snapshot, s);
         assert_eq!(rec.entries, vec![e.clone()]);
         assert_eq!(rec.contents, vec![content(&[b"u1", b"u2"])]);
@@ -924,7 +987,7 @@ mod tests {
                 detected_at: 42,
             }),
         ]);
-        let rec = parse_document(&mut &doc[..]).unwrap();
+        let rec = parse_all(&doc[..]).unwrap();
         assert_eq!(
             rec.provenance,
             vec![ProvenanceRecord {
@@ -957,6 +1020,16 @@ mod tests {
     }
 
     #[test]
+    fn damaged_status_is_rejected_in_records() {
+        let s = SnapshotRow {
+            status: SnapshotStatus::Damaged,
+            ..snapshot()
+        };
+        let doc = encode_items(&[header(&s)]);
+        assert!(matches!(parse_all(&doc[..]), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
     fn content_unit_count_must_match() {
         let s = snapshot();
         let (row, units) = content(&[b"u1", b"u2"]);
@@ -979,7 +1052,7 @@ mod tests {
             units: units.into_iter().map(B32).collect(),
         };
         let doc = encode_items(&[header(&s), item]);
-        let err = parse_document(&mut &doc[..]).unwrap_err();
+        let err = parse_all(&doc[..]).unwrap_err();
         assert!(
             matches!(&err, Error::Corrupt(m) if m.contains("unit_count")),
             "{err:?}"
@@ -999,7 +1072,7 @@ mod tests {
             header(&s),
             content_item(row.clone(), units.clone()).unwrap(),
         ]);
-        let rec = parse_document(&mut &doc[..]).unwrap();
+        let rec = parse_all(&doc[..]).unwrap();
         assert_eq!(rec.contents, vec![(row, units)]);
     }
 
@@ -1026,10 +1099,7 @@ mod tests {
         let doc = edited(&s, &content_value(), |m| {
             m.push((Value::Text("extra".into()), Value::Integer(1.into())))
         });
-        assert!(matches!(
-            parse_document(&mut &doc[..]),
-            Err(Error::Corrupt(_))
-        ));
+        assert!(matches!(parse_all(&doc[..]), Err(Error::Corrupt(_))));
         let mut snap = Value::serialized(&header(&s)).unwrap();
         if let Value::Map(m) = &mut snap {
             for (k, v) in m.iter_mut() {
@@ -1042,10 +1112,7 @@ mod tests {
         }
         let mut doc = Vec::new();
         ciborium::into_writer(&snap, &mut doc).unwrap();
-        assert!(matches!(
-            parse_document(&mut &doc[..]),
-            Err(Error::Corrupt(_))
-        ));
+        assert!(matches!(parse_all(&doc[..]), Err(Error::Corrupt(_))));
     }
 
     /// The xattr item's id key is `entry_id`, the §6.1 column name.
@@ -1066,10 +1133,10 @@ mod tests {
             ciborium::into_writer(&xattr(id_key), &mut out).unwrap();
             out
         };
-        let rec = parse_document(&mut &doc("entry_id")[..]).unwrap();
+        let rec = parse_all(&doc("entry_id")[..]).unwrap();
         assert_eq!(rec.xattrs, vec![(e.id, b"user.k".to_vec(), b"v".to_vec())]);
         assert!(matches!(
-            parse_document(&mut &doc("entry")[..]),
+            parse_all(&doc("entry")[..]),
             Err(Error::Corrupt(_))
         ));
     }
@@ -1080,16 +1147,13 @@ mod tests {
         let doc = edited(&s, &content_value(), |m| {
             m.retain(|(k, _)| k.as_text() != Some("format"))
         });
-        let rec = parse_document(&mut &doc[..]).unwrap();
+        let rec = parse_all(&doc[..]).unwrap();
         assert_eq!(rec.contents[0].0.format, None);
         // A required field may not be left out.
         let doc = edited(&s, &content_value(), |m| {
             m.retain(|(k, _)| k.as_text() != Some("profile"))
         });
-        assert!(matches!(
-            parse_document(&mut &doc[..]),
-            Err(Error::Corrupt(_))
-        ));
+        assert!(matches!(parse_all(&doc[..]), Err(Error::Corrupt(_))));
     }
 
     #[test]
@@ -1130,7 +1194,7 @@ mod tests {
         };
         for item in [prov, hit, bad_format] {
             let doc = encode_items(&[header(&s), item]);
-            let err = parse_document(&mut &doc[..]).unwrap_err();
+            let err = parse_all(&doc[..]).unwrap_err();
             assert!(
                 matches!(&err, Error::Corrupt(m) if m.contains("unknown")),
                 "{err:?}"
@@ -1182,18 +1246,78 @@ mod tests {
             Vec::new(),
         ];
         for doc in bad {
-            assert!(matches!(
-                parse_document(&mut &doc[..]),
-                Err(Error::Corrupt(_))
-            ));
+            assert!(matches!(parse_all(&doc[..]), Err(Error::Corrupt(_))));
         }
         // Truncated mid-item.
         let doc = encode_items(&[header(&s), Item::Entry(e.into())]);
         let cut = &doc[..doc.len() - 3];
-        assert!(matches!(
-            parse_document(&mut &cut[..]),
-            Err(Error::Corrupt(_))
-        ));
+        assert!(matches!(parse_all(cut), Err(Error::Corrupt(_))));
+    }
+
+    /// A repo holding one snapshot of `n` tiny files, with its catalog.
+    fn ingested(n: usize) -> (tempfile::TempDir, crate::repo::Repo, Catalog, Hash32) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::repo::Repo::init(&tmp.path().join("r")).unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        for i in 0..n {
+            std::fs::write(src.join(format!("{i:05}-{}", "n".repeat(200))), b"x").unwrap();
+        }
+        let r = crate::ingest::run(&repo, &src, &crate::ingest::IngestOptions::default()).unwrap();
+        let cat = Catalog::open_readonly(&repo.catalog_path()).unwrap();
+        let unit = cat.snapshot(r.snapshot).unwrap().record_unit.unwrap();
+        (tmp, repo, cat, unit)
+    }
+
+    #[test]
+    fn stream_record_yields_read_record_items() {
+        let (_tmp, repo, cat, unit) = ingested(20);
+        let reader = UnitReader::new(&repo, 1 << 20);
+        let expected = read_record(&reader, &cat, &unit).unwrap();
+        assert_eq!(expected.entries.len(), 21);
+        let mut items = Vec::new();
+        let header = stream_record(&reader, &cat, &unit, |i| {
+            items.push(i);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(header, expected.snapshot);
+        assert_eq!(items[0], RecordItem::Header(expected.snapshot.clone()));
+        let rec = collect_record(|visit| {
+            for i in items {
+                visit(i)?;
+            }
+            Ok(header)
+        })
+        .unwrap();
+        assert_eq!(rec, expected);
+        assert_eq!(
+            record_snapshot_id(&reader, &cat, &unit).unwrap(),
+            expected.snapshot.id
+        );
+    }
+
+    #[test]
+    fn stream_record_errors_after_items_when_last_chunk_corrupt() {
+        let (_tmp, repo, cat, unit) = ingested(10_000);
+        let reader = UnitReader::new(&repo, 1 << 20);
+        let chunks = record_chunks(&reader, &cat, &unit).unwrap();
+        assert!(chunks.len() > 1);
+        let last = cat.unit(chunks.last().unwrap()).unwrap();
+        let path = crate::pack::pack_path(&repo.packs_dir(), last.pack_id);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[last.pack_offset as usize + crate::pack::RECORD_HEADER_LEN] ^= 0xFF;
+        std::fs::write(&path, bytes).unwrap();
+
+        // A fresh reader: the earlier one may have cached the good bytes.
+        let reader = UnitReader::new(&repo, 1 << 20);
+        let mut seen = 0;
+        let r = stream_record(&reader, &cat, &unit, |_| {
+            seen += 1;
+            Ok(())
+        });
+        assert!(r.is_err());
+        assert!(seen >= 1, "items must reach the visitor before the error");
     }
 
     #[test]

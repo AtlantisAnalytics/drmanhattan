@@ -224,12 +224,30 @@ fn from_extension(name: &[u8]) -> Option<Format> {
     })
 }
 
-/// Detect a file's format. `head` is at most the first 8192 bytes.
+/// Bytes read from the start of a file for format sniffing and image
+/// dimensions (by ingest, and by recover when it recomputes media rows).
+pub(crate) const SNIFF_LEN: u64 = 8192;
+
+/// Detect a file's format. `head` is at most the first `SNIFF_LEN` bytes.
 /// Magic bytes win; the extension is the fallback.
 pub fn detect(name: &[u8], head: &[u8]) -> Format {
-    let head = &head[..head.len().min(8192)];
+    let head = &head[..head.len().min(SNIFF_LEN as usize)];
     infer::get(head)
         .and_then(|t| from_mime(t.mime_type()))
         .or_else(|| from_extension(name))
         .unwrap_or(Format::Other)
+}
+
+/// Width and height from the image header in `head` (the first `SNIFF_LEN`
+/// bytes, or the whole file if shorter), without decoding. `None` for
+/// formats that are not measured and for headers that do not parse.
+pub(crate) fn image_dims(format: Format, head: &[u8]) -> Option<(u32, u32)> {
+    if !matches!(
+        format,
+        Format::Jpeg | Format::Png | Format::Webp | Format::Gif | Format::Avif
+    ) {
+        return None;
+    }
+    let s = imagesize::blob_size(head).ok()?;
+    Some((u32::try_from(s.width).ok()?, u32::try_from(s.height).ok()?))
 }
