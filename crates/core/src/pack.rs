@@ -626,31 +626,44 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
     // of the last record accepted since that search's hit.
     let mut resynced = false;
     let mut chain_last: Option<u64> = None;
-    let close_damage =
-        |damage: &mut Option<(u64, String)>, end: u64, problems: &mut Vec<String>| {
-            // A restart can accept a record behind the open range's start; that
-            // range is already covered, so it is dropped.
-            if let Some((start, why)) = damage.take().filter(|(start, _)| *start < end) {
+    // Offsets of records with a valid CRC but an unsupported kind (already reported).
+    let mut unsupported: Vec<u64> = Vec::new();
+    // `covered_to` is the greatest end of any accepted record. A range that
+    // starts inside an accepted record (a chain overshoot, then a restart
+    // behind it) is not damage; any other opened range is always reported.
+    let close_damage = |damage: &mut Option<(u64, String)>,
+                        end: u64,
+                        covered_to: u64,
+                        problems: &mut Vec<String>| {
+        if let Some((start, why)) = damage.take() {
+            if start < end {
                 problems.push(format!(
                     "pack {shown}: damaged range at offset {start}..{end}: {why}"
                 ));
+            } else if start >= covered_to {
+                problems.push(format!(
+                    "pack {shown}: damaged record at offset {start}: {why}"
+                ));
             }
-        };
+        }
+    };
     while pos < data_end {
         match r.parse_record_classified(pos, data_end)? {
             Ok(h) => {
-                close_damage(&mut damage, pos, &mut out.problems);
                 out.records.push((pos, h));
                 if resynced {
                     chain_last = Some(pos);
                 }
-                pos += RECORD_HEADER_LEN as u64 + h.stored_len;
-                out.valid_end = out.valid_end.max(pos);
+                let end = pos + RECORD_HEADER_LEN as u64 + h.stored_len;
+                out.valid_end = out.valid_end.max(end);
+                close_damage(&mut damage, pos, out.valid_end, &mut out.problems);
+                pos = end;
             }
             Err(HeaderError::Unsupported(why)) => {
-                close_damage(&mut damage, pos, &mut out.problems);
+                close_damage(&mut damage, pos, out.valid_end, &mut out.problems);
                 out.problems
                     .push(format!("pack {shown} at offset {pos}: {why}; skipped"));
+                unsupported.push(pos);
                 pos = r
                     .find_marker(pos + RECORD_HEADER_LEN as u64, data_end, &mut buf)?
                     .unwrap_or(data_end);
@@ -673,7 +686,16 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
         // Trailing bytes with no valid record after them are a torn tail.
         out.torn_tail = damage.take().map(|(start, _)| start);
     }
-    close_damage(&mut damage, data_end, &mut out.problems);
+    close_damage(&mut damage, data_end, out.valid_end, &mut out.problems);
+    if footer.is_none() && r.len >= FILE_HEADER_LEN + 8 {
+        let mut tail = [0u8; 8];
+        r.read_exact_at(&mut tail, r.len - 8)?;
+        if &tail == FOOTER_MAGIC {
+            out.problems.push(format!(
+                "pack {shown}: footer at end of pack is inconsistent"
+            ));
+        }
+    }
 
     if let Some((footer_offset, count)) = footer {
         let mut index = vec![0u8; (r.len - footer_offset) as usize];
@@ -687,11 +709,19 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
                 && off < footer_offset
                 && out.records.binary_search_by_key(&off, |(o, _)| *o).is_err()
             {
-                if let Ok(h) = r.parse_record_at(off, footer_offset)? {
-                    extra.push((off, h));
-                    out.valid_end = out
-                        .valid_end
-                        .max(off + RECORD_HEADER_LEN as u64 + h.stored_len);
+                match r.parse_record_classified(off, footer_offset)? {
+                    Ok(h) => {
+                        extra.push((off, h));
+                        out.valid_end = out
+                            .valid_end
+                            .max(off + RECORD_HEADER_LEN as u64 + h.stored_len);
+                    }
+                    Err(HeaderError::Unsupported(why)) if !unsupported.contains(&off) => {
+                        out.problems
+                            .push(format!("pack {shown} at offset {off}: {why}; skipped"));
+                        unsupported.push(off);
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -707,7 +737,7 @@ pub fn salvage(path: &Path) -> Result<Salvage> {
                 .records
                 .binary_search_by_key(&off, |(o, _)| *o)
                 .is_ok_and(|k| out.records[k].1.unit_hash.0[..] == e[..32]);
-            if !ok {
+            if !ok && !unsupported.contains(&off) {
                 out.problems.push(format!(
                     "pack {shown}: index entry for offset {off} has no valid record"
                 ));
@@ -924,6 +954,88 @@ mod salvage_tests {
         assert_eq!(found(&s), vec![o1, o3]);
         assert_eq!(s.problems.len(), 1, "{:?}", s.problems);
         assert!(s.problems[0].contains("kind 9"), "{:?}", s.problems);
+    }
+
+    #[test]
+    fn salvage_sealed_pack_with_unknown_kind_still_salvages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Id::new_v7();
+        let mut w = PackWriter::create(tmp.path(), id).unwrap();
+        let (h, p) = raw(b"first");
+        let o1 = w.append(&h, &p).unwrap();
+        // A valid-CRC record of an unknown kind, listed in the index.
+        let (h2, p2) = raw(b"second");
+        let mut bad = encode_record_header(&h2);
+        bad[4] = 9;
+        let crc = crc32c::crc32c(&bad[4..4 + CRC_SPAN]);
+        bad[54..58].copy_from_slice(&crc.to_le_bytes());
+        let ob = w.len();
+        w.write_hashed(&bad).unwrap();
+        w.write_hashed(&p2).unwrap();
+        w.entries.push((h2.unit_hash, ob));
+        let o3 = w.append(&h2, &p2).unwrap();
+        w.seal().unwrap();
+        let s = salvage(&pack_path(tmp.path(), id)).unwrap();
+        assert_eq!(found(&s), vec![o1, o3]);
+        assert_eq!(s.problems.len(), 1, "{:?}", s.problems);
+        assert!(s.problems[0].contains("kind 9"), "{:?}", s.problems);
+        assert!(s.sealed_blake3.is_some());
+    }
+
+    #[test]
+    fn salvage_footer_index_rescues_record_skipped_by_resync() {
+        // The damaged record embeds a valid header whose payload ends exactly at
+        // the record after the next real one, so the resync chain steps over the
+        // real record R1 without ever failing; only the footer index finds it.
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Id::new_v7();
+        let mut w = PackWriter::create(tmp.path(), id).unwrap();
+        let (h, p) = raw(b"a");
+        w.append(&h, &p).unwrap();
+        let damaged_at = w.len();
+        let r1_total = RECORD_HEADER_LEN as u64 + 100;
+        let stored = 40 + r1_total;
+        let embedded = RecordHeader {
+            kind: UnitKind::RawChunk,
+            compression: Compression::None,
+            unit_hash: Hash32::of(b"embedded"),
+            raw_len: stored,
+            stored_len: stored,
+        };
+        let mut payload = vec![0u8; 10];
+        payload.extend_from_slice(&encode_record_header(&embedded));
+        payload.extend_from_slice(&[0u8; 40]);
+        let (hd, pd) = raw(&payload);
+        w.append(&hd, &pd).unwrap();
+        let (h1, p1) = raw(&[7u8; 100]);
+        let o1 = w.append(&h1, &p1).unwrap();
+        let (h2, p2) = raw(&[8u8; 50]);
+        let o2 = w.append(&h2, &p2).unwrap();
+        w.seal().unwrap();
+        let path = pack_path(tmp.path(), id);
+        corrupt_crc(&path, damaged_at);
+        let s = salvage(&path).unwrap();
+        let offs = found(&s);
+        assert!(offs.contains(&o1) && offs.contains(&o2), "{offs:?}");
+        assert!(offs.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn salvage_inconsistent_footer_is_a_problem_not_a_torn_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, _, offs) = build(tmp.path(), true);
+        let mut b = std::fs::read(&path).unwrap();
+        let footer_offset = u64::from_le_bytes(b[b.len() - 16..b.len() - 8].try_into().unwrap());
+        b[footer_offset as usize] ^= 0xFF; // footer count
+        std::fs::write(&path, b).unwrap();
+        let s = salvage(&path).unwrap();
+        assert_eq!(found(&s).len(), offs.len());
+        assert!(
+            s.problems.iter().any(|p| p.contains("footer")),
+            "{:?}",
+            s.problems
+        );
+        assert_eq!(s.sealed_blake3, None);
     }
 
     #[test]
