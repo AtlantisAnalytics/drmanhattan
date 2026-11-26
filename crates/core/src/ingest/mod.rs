@@ -360,6 +360,7 @@ fn pipeline(
             drop(job_rx);
 
             walk_source(source, opts, snap.id, &job_tx, &st_tx, shared, &mut skipped);
+            fail::fail_point!("ingest::kill::after_walk", |_| crate::kill());
             drop(job_tx);
 
             for h in pool {
@@ -469,10 +470,13 @@ fn seal_snapshot(
         |header, payload| {
             storage
                 .send(StorageMsg::Unit(header, payload))
-                .map_err(|_| Halt::Aborted)
+                .map_err(|_| Halt::Aborted)?;
+            fail::fail_point!("ingest::kill::during_record", |_| crate::kill());
+            Ok(())
         },
     )?;
     flush(storage)?;
+    fail::fail_point!("ingest::kill::record_durable", |_| crate::kill());
     Ok(Sealed {
         stats,
         row: SnapshotRow {
@@ -636,8 +640,11 @@ fn finish(repo: &Repo, out: PipelineOutput, started: Instant) -> Result<IngestRe
         manifest_hash,
         peak_buffered,
     } = out;
+    // Storage is closed by now: the last pack is sealed.
+    fail::fail_point!("ingest::kill::before_upsert", |_| crate::kill());
     // The one commit that must survive power loss: after it, wmk exits 0.
     Catalog::open(&repo.catalog_path())?.upsert_snapshot_durable(&row)?;
+    fail::fail_point!("ingest::kill::after_upsert", |_| crate::kill());
     let dedup_ratio = if stats.new_bytes_stored == 0 {
         0.0
     } else {

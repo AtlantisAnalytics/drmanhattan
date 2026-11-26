@@ -336,7 +336,9 @@ impl Storage {
                 fail::fail_point!("ingest::storage_before_sync", |_| Err(Halt::Failed(
                     Error::Corrupt("failpoint ingest::storage_before_sync".into())
                 )));
+                fail::fail_point!("ingest::kill::before_sync", |_| crate::kill());
                 p.writer.sync()?;
+                fail::fail_point!("ingest::kill::after_sync", |_| crate::kill());
                 p.dirty = false;
                 let size = super::to_i64(p.writer.len(), "pack size")?;
                 // Appended after the buffered ops, which may hold this pack's

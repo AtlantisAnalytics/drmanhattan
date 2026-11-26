@@ -382,6 +382,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "drmanhattan-core",
+ "fail",
  "humantime",
  "predicates",
  "rusqlite",

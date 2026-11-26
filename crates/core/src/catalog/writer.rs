@@ -65,19 +65,11 @@ fn run(path: PathBuf, rx: Receiver<CatalogOp>) -> Result<CatalogStats> {
     let mut open = false;
     for op in rx {
         if let CatalogOp::Commit = op {
-            if open {
-                conn.execute_batch("COMMIT")?;
-                open = false;
-                stats.commits += 1;
-            }
+            commit(conn, &mut open, &mut stats)?;
             continue;
         }
         if let CatalogOp::Sync(ack) = op {
-            if open {
-                conn.execute_batch("COMMIT")?;
-                open = false;
-                stats.commits += 1;
-            }
+            commit(conn, &mut open, &mut stats)?;
             // The requester may have given up; nothing to do then.
             let _ = ack.send(());
             continue;
@@ -92,11 +84,19 @@ fn run(path: PathBuf, rx: Receiver<CatalogOp>) -> Result<CatalogStats> {
         }
         stats.ops += 1;
     }
-    if open {
-        conn.execute_batch("COMMIT")?;
-        stats.commits += 1;
-    }
+    commit(conn, &mut open, &mut stats)?;
     Ok(stats)
+}
+
+/// Commit the writer's transaction if one is open.
+fn commit(conn: &Connection, open: &mut bool, stats: &mut CatalogStats) -> Result<()> {
+    if *open {
+        conn.execute_batch("COMMIT")?;
+        *open = false;
+        stats.commits += 1;
+        fail::fail_point!("catalog::kill::after_commit", |_| crate::kill());
+    }
+    Ok(())
 }
 
 /// Apply one data op on `conn` (inside the caller's transaction). Also used

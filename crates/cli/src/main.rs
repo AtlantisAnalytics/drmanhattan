@@ -94,6 +94,9 @@ pub fn exit_code(err: &anyhow::Error) -> i32 {
 }
 
 fn main() {
+    // Crash tests set failpoints through the FAILPOINTS environment variable.
+    #[cfg(feature = "failpoints")]
+    let _scenario = fail::FailScenario::setup();
     let cli = Cli::parse();
     let result = match &cli.command {
         Command::Init(args) => cmd::init::run(&cli, args).map(|()| 0),
