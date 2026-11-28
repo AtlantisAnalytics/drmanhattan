@@ -332,18 +332,27 @@ fn read_old(repo: &Repo) -> (Vec<Id>, HashMap<Id, u64>) {
 }
 
 /// Open a kept catalog read-only without creating files beside it: as
-/// immutable, unless it has a non-empty `-wal` of its own, whose rows count
-/// (an ordinary read-only open then adds a `-shm` beside them).
+/// immutable, unless it has a non-empty `-wal` of its own, whose rows count,
+/// or its path is not UTF-8, which a URI cannot carry. An ordinary read-only
+/// open then adds a `-shm` beside it.
 fn open_backup(path: &Path) -> Result<Connection> {
     use rusqlite::OpenFlags;
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let has_wal = std::fs::metadata(with_suffix(path, "-wal")).is_ok_and(|m| m.len() > 0);
-    if has_wal {
-        return Ok(Connection::open_with_flags(path, flags)?);
+    match immutable_uri(path) {
+        Some(uri) if !has_wal => Ok(Connection::open_with_flags(
+            uri,
+            flags | OpenFlags::SQLITE_OPEN_URI,
+        )?),
+        _ => Ok(Connection::open_with_flags(path, flags)?),
     }
-    // Percent-encode what a URI path would misread.
+}
+
+/// `file:<path>?immutable=1`, percent-encoding what a URI path would
+/// misread; `None` when `path` is not UTF-8.
+fn immutable_uri(path: &Path) -> Option<String> {
     let mut uri = String::from("file:");
-    for c in path.to_string_lossy().chars() {
+    for c in path.to_str()?.chars() {
         match c {
             '%' => uri.push_str("%25"),
             '?' => uri.push_str("%3f"),
@@ -352,10 +361,7 @@ fn open_backup(path: &Path) -> Result<Connection> {
         }
     }
     uri.push_str("?immutable=1");
-    Ok(Connection::open_with_flags(
-        uri,
-        flags | OpenFlags::SQLITE_OPEN_URI,
-    )?)
+    Some(uri)
 }
 
 /// Raise each pack's entry in `sizes` to the size `conn`'s catalog records,
@@ -395,8 +401,10 @@ fn backup_catalogs(repo: &Repo) -> Vec<PathBuf> {
 }
 
 /// Fold the old catalog's WAL into it, best effort; never creates the file.
+/// An empty file is left alone: SQLite deletes the `-wal` of an empty
+/// database it opens read-write, and `swap_in` keeps that `-wal` aside.
 fn checkpoint_old(path: &Path) {
-    if !path.exists() {
+    if !std::fs::metadata(path).is_ok_and(|m| m.len() > 0) {
         return;
     }
     if let Ok(conn) = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -494,20 +502,22 @@ fn swap_in(repo: &Repo, tmp: &Path) -> Result<(Option<PathBuf>, Vec<String>)> {
             kept.join(", ")
         ));
     }
-    let synced = (|| -> Result<()> {
-        fail::fail_point!("recover::after_rename", |_| Err(Error::io(
-            &repo.root,
-            std::io::Error::other("failpoint recover::after_rename")
-        )));
-        crate::pack::fsync_dir(&repo.root)
-    })();
-    if let Err(e) = synced {
+    if let Err(e) = sync_root(repo) {
         warnings.push(format!(
             "new catalog is in place but the repository directory could not be synced: {e}"
         ));
     }
     let backup = base.filter(|_| has_main);
     Ok((backup, warnings))
+}
+
+/// Make the rename of the new catalog durable.
+fn sync_root(repo: &Repo) -> Result<()> {
+    fail::fail_point!("recover::after_rename", |_| Err(Error::io(
+        &repo.root,
+        std::io::Error::other("failpoint recover::after_rename")
+    )));
+    crate::pack::fsync_dir(&repo.root)
 }
 
 /// Pick the first `<cat>.pre-recover-<stamp>[-n]` whose name and sidecar
@@ -953,6 +963,17 @@ fn column_strings(conn: &Connection, sql: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_uri_encodes_specials_and_refuses_non_utf8() {
+        assert_eq!(
+            immutable_uri(Path::new("/r/a%b?c#d/catalog.sqlite.pre-recover-x")).as_deref(),
+            Some("file:/r/a%25b%3fc%23d/catalog.sqlite.pre-recover-x?immutable=1")
+        );
+        use std::os::unix::ffi::OsStrExt;
+        let odd = Path::new(std::ffi::OsStr::from_bytes(b"/r/\xff/catalog.sqlite"));
+        assert_eq!(immutable_uri(odd), None);
+    }
 
     #[test]
     fn same_stamp_gets_distinct_backups_and_skips_taken_sidecars() {

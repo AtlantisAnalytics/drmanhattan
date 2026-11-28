@@ -162,9 +162,25 @@ pub struct Catalog {
     pub(crate) conn: Connection,
 }
 
+/// Opening an empty database file makes SQLite delete its `-wal`, which
+/// may hold the only copy of committed rows: refuse instead.
+fn refuse_empty_with_wal(path: &Path) -> Result<()> {
+    let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    if len(path) == Some(0) && len(Path::new(&wal)).is_some_and(|n| n > 0) {
+        return Err(Error::Corrupt(format!(
+            "{} is empty but its -wal is not; run `wmk recover`, which keeps the -wal aside",
+            crate::display::display_path(path)
+        )));
+    }
+    Ok(())
+}
+
 impl Catalog {
     /// Open read-write, creating the schema in a fresh database.
     pub fn open(path: &Path) -> Result<Catalog> {
+        refuse_empty_with_wal(path)?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -219,6 +235,7 @@ impl Catalog {
 
     /// Open an existing catalog read-only.
     pub fn open_readonly(path: &Path) -> Result<Catalog> {
+        refuse_empty_with_wal(path)?;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -602,6 +619,26 @@ fn unsupported_version(v: i64) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SQLite deletes the `-wal` of an empty database file on any open, so
+    /// both opens refuse one rather than lose rows that may exist only there.
+    #[test]
+    fn empty_file_with_a_wal_is_refused_and_the_wal_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("catalog.sqlite");
+        let wal = tmp.path().join("catalog.sqlite-wal");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::write(&wal, b"wal bytes").unwrap();
+        assert!(matches!(
+            Catalog::open_readonly(&path),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(Catalog::open(&path), Err(Error::Corrupt(_))));
+        assert_eq!(std::fs::read(&wal).unwrap(), b"wal bytes");
+        // An empty -wal is nothing to lose: the file is a new catalog.
+        std::fs::write(&wal, b"").unwrap();
+        Catalog::open(&path).unwrap();
+    }
 
     #[test]
     fn durable_upsert_commits_with_synchronous_full() {

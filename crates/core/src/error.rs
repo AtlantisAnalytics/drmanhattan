@@ -19,7 +19,7 @@ pub enum Error {
     CatalogMissing,
     #[error("repository is corrupt: {0}")]
     Corrupt(String),
-    #[error("{path}: missing {missing} of {total} units; nothing was restored")]
+    #[error("{path}: missing {missing} of {total} units; nothing was written")]
     Damaged {
         path: String,
         missing: i64,
