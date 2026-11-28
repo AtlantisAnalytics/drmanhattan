@@ -98,6 +98,34 @@ fn recover_rebuilds_deleted_catalog() {
 }
 
 #[test]
+fn recover_reports_time_per_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, _) = ingested(tmp.path());
+    let out = wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .args(["--json", "recover"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let steps = v["steps_ms"].as_object().expect("steps_ms object");
+    let names: Vec<&str> = steps.keys().map(|k| k.as_str()).collect();
+    for step in ["scan", "replay", "media", "damage", "check"] {
+        assert!(names.contains(&step), "missing {step} in {names:?}");
+    }
+    let sum: u64 = steps.values().map(|t| t.as_u64().unwrap()).sum();
+    assert!(sum <= v["elapsed_ms"].as_u64().unwrap());
+    wmk()
+        .arg("--repo")
+        .arg(&repo)
+        .arg("recover")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("steps: scan "));
+}
+
+#[test]
 fn recover_reports_damage_with_exit_2() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, _) = ingested(tmp.path());
