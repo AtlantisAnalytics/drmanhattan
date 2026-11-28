@@ -53,7 +53,33 @@ struct Report {
     warnings: Vec<String>,
     not_recovered: Vec<String>,
     old_catalog: Option<String>,
+    steps_ms: Steps,
     elapsed_ms: u64,
+}
+
+/// Milliseconds per rebuild step, in the order they run.
+#[derive(Serialize)]
+struct Steps {
+    scan: u64,
+    replay: u64,
+    media: u64,
+    damage: u64,
+    check: u64,
+}
+
+impl fmt::Display for Steps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = |ms: u64| ms as f64 / 1000.0;
+        write!(
+            f,
+            "steps: scan {:.1}s, replay {:.1}s, media {:.1}s, damage {:.1}s, check {:.1}s",
+            s(self.scan),
+            s(self.replay),
+            s(self.media),
+            s(self.damage),
+            s(self.check)
+        )
+    }
 }
 
 impl Report {
@@ -104,6 +130,13 @@ impl Report {
             warnings: r.warnings.clone(),
             not_recovered: r.not_recovered.iter().map(|s| s.to_string()).collect(),
             old_catalog: r.old_catalog.as_deref().map(display_path),
+            steps_ms: Steps {
+                scan: r.steps.scan_ms,
+                replay: r.steps.replay_ms,
+                media: r.steps.media_ms,
+                damage: r.steps.damage_ms,
+                check: r.steps.check_ms,
+            },
             elapsed_ms: r.elapsed_ms,
         }
     }
@@ -154,6 +187,7 @@ impl fmt::Display for Report {
         if let Some(p) = &self.old_catalog {
             writeln!(f, "previous catalog kept at {p}")?;
         }
+        writeln!(f, "{}", self.steps_ms)?;
         write!(
             f,
             "{}: {} snapshots, {} units, {} packs, {:.2} GiB read in {:.1}s",

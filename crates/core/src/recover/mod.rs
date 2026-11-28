@@ -112,7 +112,35 @@ pub struct RecoverReport {
     pub not_recovered: Vec<Id>,
     /// Where the old catalog was preserved (filled by the same caller).
     pub old_catalog: Option<PathBuf>,
+    /// Wall-clock time of each step of the rebuild.
+    pub steps: StepTimes,
     pub elapsed_ms: u64,
+}
+
+/// Wall-clock milliseconds of each step of the rebuild, in order. The
+/// total (`RecoverReport::elapsed_ms`) also covers setup and the final
+/// checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StepTimes {
+    /// Salvaging and verifying every pack (parallel).
+    pub scan_ms: u64,
+    /// Rebuilding snapshots from their records.
+    pub replay_ms: u64,
+    /// Measuring image dimensions.
+    pub media_ms: u64,
+    /// Marking damaged snapshots.
+    pub damage_ms: u64,
+    /// Integrity, foreign-key and manifest checks of the new catalog.
+    pub check_ms: u64,
+}
+
+/// Milliseconds since `*mark`, moving `*mark` to now.
+fn lap(mark: &mut Instant) -> u64 {
+    let now = Instant::now();
+    let ms = now.duration_since(*mark).as_millis() as u64;
+    *mark = now;
+    ms
 }
 
 impl RecoverReport {
@@ -156,6 +184,7 @@ fn build_with(
     // Before `dest` is created: a misplaced pack stops recover outright.
     let packs = scan::list_packs(&repo.packs_dir(), &mut report.warnings)?;
     let cat = Catalog::open(dest)?;
+    let mut mark = Instant::now();
     let scanned = scan::scan(
         &cat,
         &packs,
@@ -177,11 +206,16 @@ fn build_with(
     }
 
     // No cache: each unit is read about once (a record's small index twice).
+    report.steps.scan_ms = lap(&mut mark);
     let reader = UnitReader::new(repo, 0);
     replay(&reader, &cat, &mut report)?;
+    report.steps.replay_ms = lap(&mut mark);
     media(&reader, &cat)?;
+    report.steps.media_ms = lap(&mut mark);
     mark_damage(&cat, &mut report)?;
+    report.steps.damage_ms = lap(&mut mark);
     check(&cat, &report.snapshots)?;
+    report.steps.check_ms = lap(&mut mark);
     let busy: i64 = cat
         .conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
