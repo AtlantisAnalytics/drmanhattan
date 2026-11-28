@@ -1134,6 +1134,28 @@ fn recover_after_deleting_catalog_restores_byte_exact() {
 }
 
 #[test]
+fn recover_keeps_the_wal_of_an_empty_catalog_file() {
+    let (_tmp, repo, src) = setup();
+    two_snapshots(&repo, &src);
+    let cat = repo.catalog_path();
+    let wal = PathBuf::from(format!("{}-wal", cat.display()));
+    let _ = fs::remove_file(PathBuf::from(format!("{}-shm", cat.display())));
+    fs::write(&cat, b"").unwrap();
+    let wal_bytes = random(7, 64);
+    fs::write(&wal, &wal_bytes).unwrap();
+
+    let report = recover::run(&repo, &RecoverOptions::default()).unwrap();
+    assert!(report.intact(), "{report:#?}");
+    let old = report.old_catalog.clone().unwrap();
+    let kept = PathBuf::from(format!("{}-wal", old.display()));
+    assert_eq!(
+        fs::read(&kept).ok(),
+        Some(wal_bytes),
+        "the old -wal was lost"
+    );
+}
+
+#[test]
 fn recover_over_healthy_catalog_keeps_old_one() {
     let (_tmp, repo, src) = setup();
     let (s1, s2) = two_snapshots(&repo, &src);

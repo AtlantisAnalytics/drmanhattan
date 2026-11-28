@@ -105,6 +105,12 @@ if `catalog.sqlite` is lost or damaged, `wmk recover` rebuilds it from the
 packs, keeping the old catalog beside the new one. Never run `wmk` over a
 network file system.
 
+Each `wmk recover` keeps the catalog it replaced as
+`catalog.sqlite.pre-recover-<UTC time>`, with any `-wal` beside it. Keep
+these files. A later recover reads them to tell bytes a pack once held
+from an unfinished write, so without them, data lost from a pack can be
+reported as a harmless torn tail. Each is about the size of the catalog.
+
 `wmk recover` upgrades a repository to format version 2, which wmk 0.2
 cannot open.
 

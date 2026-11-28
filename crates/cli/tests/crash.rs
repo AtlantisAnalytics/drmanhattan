@@ -253,13 +253,22 @@ fn every_kill_point_leaves_a_usable_repository() {
         }
     };
     let t1 = tree("t1", 0x1234_5678_9abc_def1, 1, 5, 100_000);
-    let t2 = tree("t2", 0x0fed_cba9_8765_4321, T2_DIRS, T2_FILES_PER_DIR, 256);
+    // Only the barrier-commit kill point needs T2's thousands of files; the
+    // others take a small T2 (the time is mostly filesystem). Both trees sit
+    // in a directory named `t2`, which `kill_case` checks for.
+    let seed = 0x0fed_cba9_8765_4321;
+    let big_t2 = tree("big/t2", seed, T2_DIRS, T2_FILES_PER_DIR, 256);
+    let small_t2 = tree("small/t2", seed, 3, 10, 256);
 
-    // Each case has its own repository; the trees are only read. (Running
-    // the cases on threads saves little: the time is mostly filesystem.)
+    // Each case has its own repository; the trees are only read.
     for (i, (point, record_durable)) in KILL_POINTS.into_iter().enumerate() {
         let case = tmp.path().join(format!("case{i}"));
         std::fs::create_dir(&case).unwrap();
-        kill_case(&case, point, record_durable, &t1, &t2);
+        let t2 = if point == "catalog::kill::after_commit" {
+            &big_t2
+        } else {
+            &small_t2
+        };
+        kill_case(&case, point, record_durable, &t1, t2);
     }
 }

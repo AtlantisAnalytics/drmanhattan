@@ -247,7 +247,8 @@ fn cat_of_a_damaged_content_exits_2_without_output() {
         .assert()
         .code(2)
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("missing 1 of"));
+        .stderr(predicate::str::contains("missing 1 of"))
+        .stderr(predicate::str::contains("nothing was written"));
 }
 
 #[test]
