@@ -67,9 +67,57 @@ per CPU). Released in 0.1.2. On the same 1.58 TB repository:
 The design, plan and measurement details are in
 `docs/superpowers/specs/2026-11-20-parallel-verify-design.md`.
 
-## Next
+## Recover on the real archive (2026-11-27)
 
-- Work on the code follow-ups below.
+`wmk recover` rebuilt the catalog of the same 1.58 TB repository (2
+snapshots, 327,610 entries, 1,309,171 units, 5,897 packs) from the packs
+alone, on the test server with a cold cache, one socket, default workers.
+
+| Run | Total | scan | replay | media | damage | check |
+|---|---|---|---|---|---|---|
+| 0.3.0 before fixes | 59:39 | ~9.5 min | ~50 min | not timed | | |
+| index on `entry.parent_id` (#6) | 14:01 | 546 s | 28 s | 241 s | 5 s | 21 s |
+| media on worker threads (#7) | 11:37 | 555 s | 28 s | 87 s | 6 s | 21 s |
+
+Every run exited 0 with no damage. Each rebuilt catalog's `ls --json` and
+`stats --json` were byte-identical to the original's, and `verify --quick`
+found 0 problems. Peak RSS stayed near 200 MB.
+
+- The scan reads at 2.8-3.2 GB/s and is limited by the disk; its threads
+  were about 40% busy.
+- Replay was quadratic: under deferred foreign keys, each entry insert
+  scanned `entry` for children, because no index led with `parent_id`. A
+  `perf` profile of the single busy thread found it; a test now checks that
+  every foreign-key column leads an index.
+- Media now mostly re-reads each image's first unit in full to verify it.
+- The repository is now format version 2, which needs wmk 0.3.0 or later.
+  The original catalog is kept beside it.
+
+## Next steps (as of 2026-11-27)
+
+0.3.0 is released (both crates, tag `v0.3.0`). Paused until the week of
+2026-11-30.
+
+- **Next session:** design combining two repositories into one (for
+  example, a repository moved or copied between machines). Known questions:
+  `screen_hit.id` is an integer key that two repositories will both use;
+  the same unit can be stored in both; snapshot and pack ids are UUIDs, so
+  they should not collide, but that needs checking. Start with a design
+  conversation; nothing is written yet.
+- **Then:** Plan 3 (large-file streaming, ingest-time screening, provenance,
+  `purge`), then Plan 4.
+- **Recover, small:**
+  - Footer-only damage on a pack the old catalog recorded as sealed still
+    exits 2, though no data is lost.
+  - An intact uncompressed pack stored inside a record whose header is
+    damaged is not recovered (known limitation).
+  - Measuring image dimensions during the scan, which already reads every
+    unit, would remove media's second pass (87 s on the test repository).
+  - The new indexes reach new and recovered catalogs only; existing
+    catalogs keep theirs. Nothing slow depends on them yet, but a future
+    `purge` will.
+- **Investigations:** see the code follow-ups below (`verify` header pass,
+  `verify` CPU use, new-data ingest throughput).
 - The test repository is kept for further tests.
 
 ## How the full ingest was run
@@ -129,9 +177,9 @@ queues stayed full. On the test server's slower cold reads, it was far lower.
 Found during this testing. None of them block the ingest.
 
 - **Whole-file buffering.** `crates/core/src/ingest/worker.rs` holds each file
-  in memory, and the storage queue can hold many more. The default of one worker
-  per core is unsafe for runs of multi-GB files on smaller machines. Streaming
-  large files, or a byte budget on the queue, would fix it.
+  in memory. Since 0.2.0 a byte budget caps the total held at once
+  (`--max-memory`, default a quarter of RAM), but a single file larger than
+  the cap still needs that much RAM. Streaming large files is Plan 3.
 - **New-data throughput.** Ingest of new data stops scaling at about 4 workers.
   The single thread in `crates/core/src/ingest/storage.rs` is the likely limit,
   but this has not been profiled.
@@ -151,4 +199,5 @@ Found during this testing. None of them block the ingest.
 - **Format mapping.** `from_mime` in `crates/core/src/sniff.rs` does not know
   `.mov`, `.mkv` or camera RAW, so they get a zstd attempt. The measured cost
   was small on random bytes, so this is low priority.
-- **`recover`.** Built: `wmk recover` rebuilds the catalog from the packs.
+- **`recover`.** Built and released in 0.3.0; see "Recover on the real
+  archive" above for its measurements and remaining items.
