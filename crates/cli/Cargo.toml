@@ -1,6 +1,6 @@
 [package]
 name = "drmanhattan"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.87"
 description = "watchmaker (wmk): disassemble directories into storage units and rebuild them exactly"
@@ -21,7 +21,7 @@ failpoints = ["drmanhattan-core/failpoints", "dep:fail"]
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
-drmanhattan-core = { version = "0.2.0", path = "../core" }
+drmanhattan-core = { version = "0.3.0", path = "../core" }
 fail = { version = "0.5.1", optional = true }
 humantime = "2.4.0"
 serde = { version = "1.0.229", features = ["derive"] }
