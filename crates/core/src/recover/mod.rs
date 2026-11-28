@@ -28,7 +28,7 @@ use crate::error::{Error, Result};
 use crate::ids::{Hash32, Id};
 use crate::ingest::record::{record_snapshot_id, stream_record, RecordItem};
 use crate::manifest::{manifest_snapshot, ManifestOptions};
-use crate::model::ContentRow;
+use crate::model::{ContentRow, UnitRow};
 use crate::repo::Repo;
 use crate::sniff::{image_dims, Format, SNIFF_LEN};
 use crate::unitread::UnitReader;
@@ -36,6 +36,7 @@ use crate::verify::worker_count;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Default)]
@@ -210,7 +211,7 @@ fn build_with(
     let reader = UnitReader::new(repo, 0);
     replay(&reader, &cat, &mut report)?;
     report.steps.replay_ms = lap(&mut mark);
-    media(&reader, &cat)?;
+    media(&reader, &cat, worker_count(opts.workers))?;
     report.steps.media_ms = lap(&mut mark);
     mark_damage(&cat, &mut report)?;
     report.steps.damage_ms = lap(&mut mark);
@@ -735,41 +736,31 @@ fn insert_content(cat: &Catalog, c: ContentRow, units: &[Hash32]) -> Result<()> 
     Ok(())
 }
 
+/// An image `media` measures, with the units holding its leading bytes.
+struct MediaJob {
+    content: Hash32,
+    format: Format,
+    units: Vec<UnitRow>,
+}
+
 /// Step 3: a `media` row for each image whose leading bytes are present,
-/// measured exactly as ingest measures it.
-fn media(reader: &UnitReader, cat: &Catalog) -> Result<()> {
+/// measured exactly as ingest measures it. The catalog is read and written
+/// on this thread; the units are read and measured on `workers` threads.
+fn media(reader: &UnitReader, cat: &Catalog, workers: usize) -> Result<()> {
+    let jobs = media_jobs(cat)?;
+    let measured = measure(reader, &jobs, workers)?;
     let conn = &cat.conn;
-    let formats: Vec<String> = MEDIA_FORMATS
-        .iter()
-        .map(|f| format!("'{}'", f.as_str()))
-        .collect();
     conn.execute_batch("BEGIN")?;
     let r = (|| {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT hash, format, unit_count FROM content WHERE format IN ({})",
-            formats.join(",")
-        ))?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let hash: Hash32 = row.get(0)?;
-            let format: String = row.get(1)?;
-            let unit_count: i64 = row.get(2)?;
-            let Some(format) = Format::from_str(&format) else {
-                continue;
-            };
-            let Some(head) = head(reader, cat, &hash, unit_count)? else {
-                continue;
-            };
-            if let Some((width, height)) = image_dims(format, &head) {
-                apply(
-                    conn,
-                    CatalogOp::InsertMedia {
-                        content: hash,
-                        width,
-                        height,
-                    },
-                )?;
-            }
+        for (content, width, height) in measured {
+            apply(
+                conn,
+                CatalogOp::InsertMedia {
+                    content,
+                    width,
+                    height,
+                },
+            )?;
         }
         Ok(conn.execute_batch("COMMIT")?)
     })();
@@ -779,33 +770,118 @@ fn media(reader: &UnitReader, cat: &Catalog) -> Result<()> {
     r
 }
 
-/// The first `SNIFF_LEN` bytes of `content` (all of it if shorter), or
-/// `None` if a unit they need is missing.
-fn head(
-    reader: &UnitReader,
-    cat: &Catalog,
-    content: &Hash32,
-    unit_count: i64,
-) -> Result<Option<Vec<u8>>> {
+/// Every image content whose leading units are all present.
+fn media_jobs(cat: &Catalog) -> Result<Vec<MediaJob>> {
+    let formats: Vec<String> = MEDIA_FORMATS
+        .iter()
+        .map(|f| format!("'{}'", f.as_str()))
+        .collect();
+    let mut stmt = cat.conn.prepare(&format!(
+        "SELECT hash, format, unit_count FROM content WHERE format IN ({})",
+        formats.join(",")
+    ))?;
+    let mut rows = stmt.query([])?;
+    let mut jobs = Vec::new();
+    while let Some(row) = rows.next()? {
+        let content: Hash32 = row.get(0)?;
+        let format: String = row.get(1)?;
+        let unit_count: i64 = row.get(2)?;
+        let Some(format) = Format::from_str(&format) else {
+            continue;
+        };
+        if let Some(units) = head_units(cat, &content, unit_count)? {
+            jobs.push(MediaJob {
+                content,
+                format,
+                units,
+            });
+        }
+    }
+    Ok(jobs)
+}
+
+/// The units holding the first `SNIFF_LEN` bytes of `content` (all of it
+/// if shorter), or `None` if one of them is missing.
+fn head_units(cat: &Catalog, content: &Hash32, unit_count: i64) -> Result<Option<Vec<UnitRow>>> {
     let mut stmt = cat.conn.prepare_cached(
         "SELECT seq, unit_hash FROM content_unit WHERE content_hash = ?1 ORDER BY seq",
     )?;
     let mut rows = stmt.query([content])?;
-    let mut head = Vec::new();
+    let mut units = Vec::new();
+    let mut len = 0u64;
     let mut seq = 0i64;
-    while (head.len() as u64) < SNIFF_LEN && seq < unit_count {
+    while len < SNIFF_LEN && seq < unit_count {
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
         if row.get::<_, i64>(0)? != seq {
             return Ok(None);
         }
-        let data = reader.read_unit(&cat.unit(&row.get(1)?)?)?;
-        let want = (SNIFF_LEN as usize - head.len()).min(data.len());
-        head.extend_from_slice(&data[..want]);
+        let unit = cat.unit(&row.get(1)?)?;
+        len += u64::try_from(unit.raw_size).unwrap_or(0);
+        units.push(unit);
         seq += 1;
     }
-    Ok(Some(head))
+    Ok(Some(units))
+}
+
+/// `(content, width, height)` of each job `image_dims` can measure, in
+/// content order. Stops at the first read error, which it returns.
+fn measure(
+    reader: &UnitReader,
+    jobs: &[MediaJob],
+    workers: usize,
+) -> Result<Vec<(Hash32, u32, u32)>> {
+    let next = AtomicUsize::new(0);
+    let abort = AtomicBool::new(false);
+    let per_worker: Vec<Result<Vec<(Hash32, u32, u32)>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers.clamp(1, jobs.len().max(1)))
+            .map(|_| {
+                let (next, abort) = (&next, &abort);
+                s.spawn(move || {
+                    let mut out = Vec::new();
+                    while !abort.load(Ordering::Relaxed) {
+                        let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                            break;
+                        };
+                        match head(reader, &job.units) {
+                            Ok(head) => {
+                                if let Some((w, h)) = image_dims(job.format, &head) {
+                                    out.push((job.content, w, h));
+                                }
+                            }
+                            Err(e) => {
+                                abort.store(true, Ordering::Relaxed);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
+    });
+    let mut all = Vec::new();
+    for r in per_worker {
+        all.extend(r?);
+    }
+    all.sort_unstable_by_key(|(content, _, _)| *content);
+    Ok(all)
+}
+
+/// The first `SNIFF_LEN` bytes held by `units`, each read and verified.
+fn head(reader: &UnitReader, units: &[UnitRow]) -> Result<Vec<u8>> {
+    let mut head = Vec::new();
+    for unit in units {
+        let data = reader.read_unit(unit)?;
+        let want = (SNIFF_LEN as usize - head.len()).min(data.len());
+        head.extend_from_slice(&data[..want]);
+    }
+    Ok(head)
 }
 
 /// Step 4: mark each snapshot with an incomplete content `damaged` and list
