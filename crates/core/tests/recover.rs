@@ -269,6 +269,45 @@ fn rebuilt_catalog_matches_original() {
 }
 
 #[test]
+fn image_with_a_damaged_head_gets_no_media_row() {
+    let (_tmp, repo, src) = setup();
+    let mut t = TreeBuilder::new(&src);
+    t.file(b"bad.png", &png(640, 480))
+        .file(b"good.jpg", &jpeg(320, 200));
+    for i in 0..20u32 {
+        t.file(format!("p{i}.png").as_bytes(), &png(100 + i, 50 + i));
+    }
+    let s = ingest(&repo, &src);
+    flip_unit(&repo, &first_unit(&repo, s, b"bad.png"));
+    // (width, height) of the image at `path`, if it has a media row.
+    let dims = |dest: &Path, path: &[u8]| -> Option<(i64, i64)> {
+        let hash = Catalog::open_readonly(dest)
+            .unwrap()
+            .entry_by_path(s, path)
+            .unwrap()
+            .content_hash
+            .unwrap();
+        let conn = rusqlite::Connection::open(dest).unwrap();
+        conn.query_row(
+            "SELECT width, height FROM media WHERE content_hash = ?1",
+            [hash],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+    };
+
+    for workers in [1, 8] {
+        let (dest, report) = build_with(&repo, &format!("w{workers}.sqlite"), workers);
+        assert_eq!(report.damaged.len(), 1, "{:?}", report.damaged);
+        let rows = table_rows(&dest, "SELECT content_hash FROM media");
+        assert_eq!(rows.len(), 21, "every intact image measured");
+        assert_eq!(dims(&dest, b"bad.png"), None, "damaged image measured");
+        assert_eq!(dims(&dest, b"good.jpg"), Some((320, 200)));
+        assert_eq!(dims(&dest, b"p7.png"), Some((107, 57)));
+    }
+}
+
+#[test]
 fn rebuilt_catalog_is_version_2_and_opens() {
     let (_tmp, repo, src) = setup();
     TreeBuilder::new(&src).file(b"f", b"body");
